@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Message bus, channels, and session management for crew-rs gateway"
 
+[features]
+default = []
+telegram = ["teloxide"]
+discord = ["serenity"]
+
 [dependencies]
 crew-core = { workspace = true }
 tokio = { workspace = true }
@@ -15,6 +20,11 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 eyre = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+
+# Optional: channel integrations
+teloxide = { workspace = true, optional = true }
+serenity = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

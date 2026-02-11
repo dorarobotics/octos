@@ -192,9 +192,31 @@ impl GatewayCommand {
                 "cli" => {
                     channel_mgr.register(Arc::new(CliChannel::new(shutdown.clone())));
                 }
+                #[cfg(feature = "telegram")]
+                "telegram" => {
+                    let env = settings_str(&entry.settings, "token_env", "TELEGRAM_BOT_TOKEN");
+                    let token = std::env::var(&env)
+                        .wrap_err_with(|| format!("{env} environment variable not set"))?;
+                    channel_mgr.register(Arc::new(crew_bus::TelegramChannel::new(
+                        &token,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
+                #[cfg(feature = "discord")]
+                "discord" => {
+                    let env = settings_str(&entry.settings, "token_env", "DISCORD_BOT_TOKEN");
+                    let token = std::env::var(&env)
+                        .wrap_err_with(|| format!("{env} environment variable not set"))?;
+                    channel_mgr.register(Arc::new(crew_bus::DiscordChannel::new(
+                        &token,
+                        entry.allowed_senders.clone(),
+                        shutdown.clone(),
+                    )));
+                }
                 other => {
                     println!(
-                        "{}: channel '{}' not yet supported, skipping",
+                        "{}: channel '{}' not supported, skipping",
                         "Warning".yellow(),
                         other
                     );
@@ -299,4 +321,14 @@ impl GatewayCommand {
         println!("{}", "Gateway stopped.".dimmed());
         Ok(())
     }
+}
+
+/// Extract a string value from channel settings JSON, with a default fallback.
+#[cfg(any(feature = "telegram", feature = "discord"))]
+fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> String {
+    settings
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or(default)
+        .to_string()
 }

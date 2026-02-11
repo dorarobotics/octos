@@ -67,6 +67,10 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # Async utilities
 futures = "0.3"
 
+# Channel integrations (optional, pulled in via feature flags)
+teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
+serenity = { version = "0.12", default-features = false, features = ["rustls_backend", "gateway", "client", "http", "model"] }
+
 # Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
