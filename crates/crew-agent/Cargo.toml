@@ -24,6 +24,8 @@ glob = { workspace = true }
 regex = { workspace = true }
 ignore = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+htmd = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

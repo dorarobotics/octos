@@ -16,7 +16,7 @@ pub use agent::{Agent, AgentConfig, ConversationResponse};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
 pub use tools::{
     EditFileTool, GlobTool, GrepTool, ReadFileTool, ShellTool, Tool, ToolRegistry, ToolResult,
-    WriteFileTool,
+    WebFetchTool, WebSearchTool, WriteFileTool,
 };
 
 #[cfg(test)]
@@ -165,6 +165,8 @@ mod tests {
         assert!(names.contains(&"edit_file"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"grep"));
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"web_fetch"));
     }
 
     #[tokio::test]

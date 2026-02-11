@@ -92,6 +92,8 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod read_file;
 pub mod shell;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write_file;
 
 pub use delegate::DelegateTaskTool;
@@ -101,6 +103,8 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use read_file::ReadFileTool;
 pub use shell::ShellTool;
+pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
 use std::path::Path;
@@ -119,6 +123,8 @@ impl ToolRegistry {
         registry.register(WriteFileTool::new(cwd));
         registry.register(GlobTool::new(cwd));
         registry.register(GrepTool::new(cwd));
+        registry.register(WebSearchTool::new());
+        registry.register(WebFetchTool::new());
         registry
     }
 
