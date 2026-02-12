@@ -32,6 +32,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rustyline = { workspace = true }
 reqwest = { workspace = true }
+sha2 = { workspace = true }
+open = { workspace = true }
+base64 = { workspace = true }
 
 [features]
 default = []
@@ -39,6 +42,7 @@ telegram = ["crew-bus/telegram"]
 discord = ["crew-bus/discord"]
 slack = ["crew-bus/slack"]
 whatsapp = ["crew-bus/whatsapp"]
+email = ["crew-bus/email"]
 feishu = ["crew-bus/feishu"]
 
 [dev-dependencies]

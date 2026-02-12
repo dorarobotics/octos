@@ -161,8 +161,18 @@ impl Config {
         result
     }
 
-    /// Get the API key from environment, using configured env var name or default.
+    /// Get the API key: auth store first, then environment variable.
     pub fn get_api_key(&self, provider: &str) -> Result<String> {
+        // Check auth store first.
+        if let Ok(store) = crate::auth::AuthStore::load() {
+            if let Some(cred) = store.get(provider) {
+                if !cred.is_expired() {
+                    return Ok(cred.access_token.clone());
+                }
+            }
+        }
+
+        // Fall back to environment variable.
         let env_var = self.api_key_env.clone().unwrap_or_else(|| match provider {
             "anthropic" => "ANTHROPIC_API_KEY".to_string(),
             "openai" => "OPENAI_API_KEY".to_string(),
@@ -172,7 +182,7 @@ impl Config {
         });
 
         std::env::var(&env_var)
-            .wrap_err_with(|| format!("{} environment variable not set", env_var))
+            .wrap_err_with(|| format!("{env_var} not set. Run `crew auth login -p {provider}` or set the env var"))
     }
 
     /// Validate the configuration.

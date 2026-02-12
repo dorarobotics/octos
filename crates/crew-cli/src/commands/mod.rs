@@ -1,5 +1,6 @@
 //! CLI commands for crew-rs.
 
+mod auth;
 mod channels;
 mod chat;
 mod clean;
@@ -13,6 +14,7 @@ mod status;
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
+pub use auth::AuthCommand;
 pub use channels::ChannelsCommand;
 pub use chat::ChatCommand;
 pub use clean::CleanCommand;
@@ -35,6 +37,8 @@ pub struct Args {
 /// Available commands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Manage authentication for LLM providers.
+    Auth(AuthCommand),
     /// Manage messaging channels.
     Channels(ChannelsCommand),
     /// Interactive multi-turn chat with an agent.
@@ -63,6 +67,7 @@ pub trait Executable {
 impl Executable for Command {
     fn execute(self) -> Result<()> {
         match self {
+            Self::Auth(cmd) => cmd.execute(),
             Self::Channels(cmd) => cmd.execute(),
             Self::Chat(cmd) => cmd.execute(),
             Self::Cron(cmd) => cmd.execute(),

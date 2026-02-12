@@ -17,6 +17,8 @@ pub mod discord_channel;
 pub mod slack_channel;
 #[cfg(feature = "whatsapp")]
 pub mod whatsapp_channel;
+#[cfg(feature = "email")]
+pub mod email_channel;
 #[cfg(feature = "feishu")]
 pub mod feishu_channel;
 
@@ -36,5 +38,7 @@ pub use discord_channel::DiscordChannel;
 pub use slack_channel::SlackChannel;
 #[cfg(feature = "whatsapp")]
 pub use whatsapp_channel::WhatsAppChannel;
+#[cfg(feature = "email")]
+pub use email_channel::EmailChannel;
 #[cfg(feature = "feishu")]
 pub use feishu_channel::FeishuChannel;
