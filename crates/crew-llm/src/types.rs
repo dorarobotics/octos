@@ -47,3 +47,26 @@ pub struct ToolSpec {
     /// JSON Schema for the tool's input parameters.
     pub input_schema: serde_json::Value,
 }
+
+/// Events from a streaming LLM response.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text chunk.
+    TextDelta(String),
+    /// Incremental tool call data.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: String,
+    },
+    /// Token usage (sent at stream end by most providers).
+    Usage(TokenUsage),
+    /// Stream finished with stop reason.
+    Done(StopReason),
+    /// Error during streaming.
+    Error(String),
+}
+
+/// A boxed stream of StreamEvents.
+pub type ChatStream = std::pin::Pin<Box<dyn futures::Stream<Item = StreamEvent> + Send>>;

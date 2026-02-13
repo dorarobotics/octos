@@ -53,6 +53,12 @@ pub enum ProgressEvent {
 
     /// Hit token budget limit.
     TokenBudgetExceeded { used: u32, limit: u32 },
+
+    /// Streaming text chunk from LLM.
+    StreamChunk { text: String, iteration: u32 },
+
+    /// Streaming completed.
+    StreamDone { iteration: u32 },
 }
 
 /// Trait for receiving progress updates.
@@ -294,6 +300,14 @@ impl ProgressReporter for ConsoleReporter {
                         used, limit
                     ))
                 );
+            }
+            ProgressEvent::StreamChunk { text, .. } => {
+                use std::io::Write;
+                print!("{}", text);
+                let _ = std::io::stdout().flush();
+            }
+            ProgressEvent::StreamDone { .. } => {
+                println!();
             }
         }
     }

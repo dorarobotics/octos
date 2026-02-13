@@ -329,6 +329,7 @@ impl GatewayCommand {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
+        let llm_for_compaction = llm.clone();
         let agent = Agent::new(
             AgentId::new("gateway"),
             llm,
@@ -599,6 +600,14 @@ impl GatewayCommand {
                         timestamp: Utc::now(),
                     };
                     let _ = session_mgr.add_message(&session_key, assistant_msg);
+
+                    // Compact session if it's grown too large
+                    if let Err(e) =
+                        crate::compaction::maybe_compact(&mut session_mgr, &session_key, &*llm_for_compaction)
+                            .await
+                    {
+                        warn!("session compaction failed: {e}");
+                    }
 
                     // Send response back through channel
                     let outbound = OutboundMessage {

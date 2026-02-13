@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crew_core::{AgentId, Message, MessageRole, Task, TaskResult, TokenUsage};
-use crew_llm::{ChatConfig, ChatResponse, LlmProvider, StopReason};
+use crew_llm::{ChatConfig, ChatResponse, ChatStream, LlmProvider, StopReason, StreamEvent};
+use futures::StreamExt;
 use crew_memory::{Episode, EpisodeOutcome, EpisodeStore};
 use eyre::Result;
 use tracing::{Instrument, debug, info, info_span, warn};
@@ -41,6 +42,7 @@ pub struct ConversationResponse {
     pub content: String,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
+    pub streamed: bool,
 }
 
 /// An agent that can execute tasks.
@@ -148,6 +150,7 @@ impl Agent {
                     content: "Interrupted.".into(),
                     token_usage: total_usage,
                     files_modified,
+                    streamed: false,
                 });
             }
 
@@ -156,6 +159,7 @@ impl Agent {
                     content: "Reached max iterations.".into(),
                     token_usage: total_usage,
                     files_modified,
+                    streamed: false,
                 });
             }
 
@@ -166,13 +170,16 @@ impl Agent {
                         content: "Token budget exceeded.".into(),
                         token_usage: total_usage,
                         files_modified,
+                        streamed: false,
                     });
                 }
             }
 
             iteration += 1;
             let tools_spec = self.tools.specs();
-            let response = self.llm.chat(&messages, &tools_spec, &config).await?;
+            self.trim_to_context_window(&mut messages);
+            let stream = self.llm.chat_stream(&messages, &tools_spec, &config).await?;
+            let (response, streamed) = self.consume_stream(stream, iteration).await?;
             total_usage.input_tokens += response.usage.input_tokens;
             total_usage.output_tokens += response.usage.output_tokens;
 
@@ -182,6 +189,7 @@ impl Agent {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
                         files_modified,
+                        streamed,
                     });
                 }
                 StopReason::ToolUse => {
@@ -198,6 +206,7 @@ impl Agent {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
                         files_modified,
+                        streamed,
                     });
                 }
             }
@@ -276,7 +285,9 @@ impl Agent {
                 self.reporter.report(ProgressEvent::Thinking { iteration });
 
                 let tools_spec = self.tools.specs();
-                let response = self.llm.chat(&messages, &tools_spec, &config).await?;
+                self.trim_to_context_window(&mut messages);
+                let stream = self.llm.chat_stream(&messages, &tools_spec, &config).await?;
+                let (response, _streamed) = self.consume_stream(stream, iteration).await?;
                 total_usage.input_tokens += response.usage.input_tokens;
                 total_usage.output_tokens += response.usage.output_tokens;
 
@@ -288,13 +299,6 @@ impl Agent {
                     duration_ms = iter_start.elapsed().as_millis() as u64,
                     "llm response"
                 );
-
-                if let Some(ref content) = response.content {
-                    self.reporter.report(ProgressEvent::Response {
-                        content: content.clone(),
-                        iteration,
-                    });
-                }
 
                 match response.stop_reason {
                     StopReason::EndTurn | StopReason::StopSequence => {
@@ -561,6 +565,135 @@ impl Agent {
         }
 
         Ok((messages, files_modified, tokens_used))
+    }
+
+    fn trim_to_context_window(&self, messages: &mut Vec<Message>) {
+        let window = self.llm.context_window();
+        let limit = (window as f64 * 0.8) as u32; // Reserve 20% for output
+
+        let total: u32 = messages
+            .iter()
+            .map(crew_llm::context::estimate_message_tokens)
+            .sum();
+
+        if total <= limit {
+            return;
+        }
+
+        if messages.is_empty() {
+            return;
+        }
+
+        // Keep system prompt (index 0) + walk backwards from end
+        let system_tokens = crew_llm::context::estimate_message_tokens(&messages[0]);
+        let mut kept_tokens = system_tokens;
+        let mut keep_from = messages.len();
+
+        for i in (1..messages.len()).rev() {
+            let msg_tokens = crew_llm::context::estimate_message_tokens(&messages[i]);
+            if kept_tokens + msg_tokens > limit {
+                break;
+            }
+            kept_tokens += msg_tokens;
+            keep_from = i;
+        }
+
+        if keep_from > 1 {
+            let original_count = messages.len();
+            let dropped = keep_from - 1;
+            messages.drain(1..keep_from);
+            warn!(
+                original_tokens = total,
+                trimmed_tokens = kept_tokens,
+                messages_dropped = dropped,
+                messages_kept = messages.len(),
+                original_messages = original_count,
+                "trimmed messages to fit context window ({} token limit)",
+                limit
+            );
+        }
+    }
+
+    async fn consume_stream(
+        &self,
+        mut stream: ChatStream,
+        iteration: u32,
+    ) -> Result<(ChatResponse, bool)> {
+        // Clear any pending status line (e.g., "Thinking...")
+        self.reporter.report(ProgressEvent::Response {
+            content: String::new(),
+            iteration,
+        });
+
+        let mut text = String::new();
+        let mut tool_calls: Vec<(String, String, String)> = Vec::new();
+        let mut usage = crew_llm::TokenUsage::default();
+        let mut stop_reason = StopReason::EndTurn;
+
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::TextDelta(delta) => {
+                    self.reporter.report(ProgressEvent::StreamChunk {
+                        text: delta.clone(),
+                        iteration,
+                    });
+                    text.push_str(&delta);
+                }
+                StreamEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_delta,
+                } => {
+                    while tool_calls.len() <= index {
+                        tool_calls.push((String::new(), String::new(), String::new()));
+                    }
+                    if let Some(id) = id {
+                        tool_calls[index].0 = id;
+                    }
+                    if let Some(name) = name {
+                        tool_calls[index].1 = name;
+                    }
+                    tool_calls[index].2.push_str(&arguments_delta);
+                }
+                StreamEvent::Usage(u) => {
+                    usage = u;
+                }
+                StreamEvent::Done(reason) => {
+                    stop_reason = reason;
+                }
+                StreamEvent::Error(err) => {
+                    eyre::bail!("Stream error: {}", err);
+                }
+            }
+        }
+
+        let streamed = !text.is_empty();
+        if streamed {
+            self.reporter
+                .report(ProgressEvent::StreamDone { iteration });
+        }
+
+        let content = if text.is_empty() { None } else { Some(text) };
+        let tool_calls = tool_calls
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, args)| crew_core::ToolCall {
+                id,
+                name,
+                arguments: serde_json::from_str(&args).unwrap_or_default(),
+            })
+            .collect();
+
+        Ok((
+            ChatResponse {
+                content,
+                tool_calls,
+                stop_reason,
+                usage,
+            },
+            streamed,
+        ))
     }
 
     fn build_result(

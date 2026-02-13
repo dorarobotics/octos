@@ -616,6 +616,7 @@ dependencies = [
  "base64",
  "crew-core",
  "eyre",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",

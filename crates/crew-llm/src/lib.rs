@@ -7,8 +7,10 @@
 //! - Ollama (local models)
 
 mod config;
+pub mod context;
 mod provider;
 mod retry;
+pub mod sse;
 mod types;
 pub mod vision;
 
@@ -22,4 +24,4 @@ pub use config::ChatConfig;
 pub use provider::LlmProvider;
 pub use retry::{RetryConfig, RetryProvider};
 pub use transcription::GroqTranscriber;
-pub use types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
+pub use types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};

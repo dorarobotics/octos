@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use crew_core::Message;
 use eyre::{Result, WrapErr};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +11,8 @@ use crate::vision;
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
+use crate::sse::SseEvent;
+use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
 
 /// OpenAI GPT provider.
 pub struct OpenAIProvider {
@@ -155,6 +157,88 @@ impl LlmProvider for OpenAIProvider {
         })
     }
 
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatStream> {
+        let openai_messages: Vec<OpenAIMessage> = messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    crew_core::MessageRole::System => "system",
+                    crew_core::MessageRole::User => "user",
+                    crew_core::MessageRole::Assistant => "assistant",
+                    crew_core::MessageRole::Tool => "tool",
+                };
+                OpenAIMessage {
+                    role,
+                    content: build_openai_content(m),
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    tool_calls: None,
+                }
+            })
+            .collect();
+
+        let openai_tools: Option<Vec<OpenAITool>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .map(|t| OpenAITool {
+                        r#type: "function",
+                        function: OpenAIFunction {
+                            name: &t.name,
+                            description: &t.description,
+                            parameters: &t.input_schema,
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        let request = OpenAIRequest {
+            model: &self.model,
+            messages: openai_messages,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            tools: openai_tools,
+        };
+
+        let mut body = serde_json::to_value(&request)
+            .wrap_err("failed to serialize OpenAI request")?;
+        let obj = body.as_object_mut().unwrap();
+        obj.insert("stream".into(), true.into());
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send streaming request to OpenAI")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eyre::bail!("OpenAI API error: {status} - {text}");
+        }
+
+        let sse_stream = crate::sse::parse_sse_response(response);
+        let event_stream =
+            sse_stream.flat_map(|event| futures::stream::iter(parse_openai_sse_events(&event)));
+
+        Ok(Box::pin(event_stream))
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -288,4 +372,61 @@ struct FunctionCall {
 struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
+}
+
+// --- Streaming SSE helpers (shared with OpenRouter) ---
+
+pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
+    if event.data == "[DONE]" {
+        return vec![];
+    }
+
+    let data: serde_json::Value = match serde_json::from_str(&event.data) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut events = Vec::new();
+
+    if let Some(choices) = data["choices"].as_array() {
+        for choice in choices {
+            if let Some(content) = choice["delta"]["content"].as_str() {
+                if !content.is_empty() {
+                    events.push(StreamEvent::TextDelta(content.to_string()));
+                }
+            }
+
+            if let Some(tool_calls) = choice["delta"]["tool_calls"].as_array() {
+                for tc in tool_calls {
+                    events.push(StreamEvent::ToolCallDelta {
+                        index: tc["index"].as_u64().unwrap_or(0) as usize,
+                        id: tc["id"].as_str().map(String::from),
+                        name: tc["function"]["name"].as_str().map(String::from),
+                        arguments_delta: tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                    });
+                }
+            }
+
+            if let Some(reason) = choice["finish_reason"].as_str() {
+                events.push(StreamEvent::Done(match reason {
+                    "stop" => StopReason::EndTurn,
+                    "tool_calls" => StopReason::ToolUse,
+                    "length" => StopReason::MaxTokens,
+                    _ => StopReason::EndTurn,
+                }));
+            }
+        }
+    }
+
+    if let Some(usage) = data.get("usage").filter(|u| !u.is_null()) {
+        events.push(StreamEvent::Usage(TokenUsage {
+            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+            output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+        }));
+    }
+
+    events
 }

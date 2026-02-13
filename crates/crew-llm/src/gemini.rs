@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use crew_core::Message;
 use eyre::{Result, WrapErr};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +11,7 @@ use crate::vision;
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
 
 /// Google Gemini provider.
 pub struct GeminiProvider {
@@ -185,6 +186,96 @@ impl LlmProvider for GeminiProvider {
         })
     }
 
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatStream> {
+        let mut contents: Vec<GeminiContent> = Vec::new();
+        let mut system_instruction: Option<String> = None;
+
+        for msg in messages {
+            match msg.role {
+                crew_core::MessageRole::System => {
+                    system_instruction = Some(msg.content.clone());
+                }
+                crew_core::MessageRole::User | crew_core::MessageRole::Tool => {
+                    contents.push(GeminiContent {
+                        role: "user".to_string(),
+                        parts: build_gemini_parts(msg),
+                    });
+                }
+                crew_core::MessageRole::Assistant => {
+                    contents.push(GeminiContent {
+                        role: "model".to_string(),
+                        parts: vec![GeminiPart::Text {
+                            text: msg.content.clone(),
+                        }],
+                    });
+                }
+            }
+        }
+
+        let gemini_tools: Option<Vec<GeminiTool>> = if tools.is_empty() {
+            None
+        } else {
+            Some(vec![GeminiTool {
+                function_declarations: tools
+                    .iter()
+                    .map(|t| GeminiFunctionDeclaration {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
+                    })
+                    .collect(),
+            }])
+        };
+
+        let request = GeminiRequest {
+            contents,
+            system_instruction: system_instruction.map(|text| GeminiSystemInstruction {
+                parts: vec![GeminiPart::Text { text }],
+            }),
+            tools: gemini_tools,
+            generation_config: Some(GeminiGenerationConfig {
+                max_output_tokens: config.max_tokens,
+                temperature: config.temperature,
+            }),
+        };
+
+        let url = format!(
+            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            self.base_url, self.model, self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .wrap_err("failed to send streaming request to Gemini")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eyre::bail!("Gemini API error: {status} - {text}");
+        }
+
+        let sse_stream = crate::sse::parse_sse_response(response);
+        let state = GeminiStreamState::default();
+        let event_stream = sse_stream
+            .scan(state, |state, event| {
+                let events = map_gemini_sse(state, &event);
+                futures::future::ready(Some(events))
+            })
+            .flat_map(futures::stream::iter);
+
+        Ok(Box::pin(event_stream))
+    }
+
     fn model_id(&self) -> &str {
         &self.model
     }
@@ -317,4 +408,77 @@ struct GeminiUsageMetadata {
     prompt_token_count: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: u32,
+}
+
+// --- Streaming SSE helpers ---
+
+#[derive(Default)]
+struct GeminiStreamState {
+    tool_count: usize,
+    has_tool_calls: bool,
+}
+
+fn map_gemini_sse(
+    state: &mut GeminiStreamState,
+    event: &crate::sse::SseEvent,
+) -> Vec<StreamEvent> {
+    let data: serde_json::Value = match serde_json::from_str(&event.data) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut events = Vec::new();
+
+    if let Some(candidates) = data["candidates"].as_array() {
+        if let Some(candidate) = candidates.first() {
+            if let Some(parts) = candidate["content"]["parts"].as_array() {
+                for part in parts {
+                    if let Some(text) = part["text"].as_str() {
+                        if !text.is_empty() {
+                            events.push(StreamEvent::TextDelta(text.to_string()));
+                        }
+                    }
+                    if let Some(fc) = part.get("functionCall") {
+                        state.has_tool_calls = true;
+                        let name = fc["name"].as_str().unwrap_or("").to_string();
+                        let args = fc
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        events.push(StreamEvent::ToolCallDelta {
+                            index: state.tool_count,
+                            id: Some(format!("call_{}", state.tool_count)),
+                            name: Some(name),
+                            arguments_delta: args.to_string(),
+                        });
+                        state.tool_count += 1;
+                    }
+                }
+            }
+
+            if let Some(reason) = candidate["finishReason"].as_str() {
+                let stop_reason = match reason {
+                    "STOP" if state.has_tool_calls => StopReason::ToolUse,
+                    "STOP" => StopReason::EndTurn,
+                    "MAX_TOKENS" => StopReason::MaxTokens,
+                    _ if state.has_tool_calls => StopReason::ToolUse,
+                    _ => StopReason::EndTurn,
+                };
+                events.push(StreamEvent::Done(stop_reason));
+            }
+        }
+    }
+
+    if let Some(usage) = data.get("usageMetadata").filter(|u| !u.is_null()) {
+        let input = usage["promptTokenCount"].as_u64().unwrap_or(0) as u32;
+        let output = usage["candidatesTokenCount"].as_u64().unwrap_or(0) as u32;
+        if input > 0 || output > 0 {
+            events.push(StreamEvent::Usage(TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+            }));
+        }
+    }
+
+    events
 }

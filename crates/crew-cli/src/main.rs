@@ -5,6 +5,7 @@ use color_eyre::eyre::Result;
 
 pub mod auth;
 mod commands;
+pub mod compaction;
 pub mod config;
 pub mod cron_tool;
 

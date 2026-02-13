@@ -142,6 +142,34 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Rewrite a session's JSONL file from the in-memory state.
+    /// This replaces the file entirely (meta + all current messages).
+    pub fn rewrite(&self, key: &SessionKey) -> Result<()> {
+        use std::io::Write;
+
+        let session = self
+            .cache
+            .get(&key.0)
+            .ok_or_else(|| eyre::eyre!("session not in cache: {}", key))?;
+
+        let path = self.session_path(key);
+        let mut file = std::fs::File::create(&path)?;
+
+        let meta = SessionMeta {
+            session_key: key.0.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        };
+        writeln!(file, "{}", serde_json::to_string(&meta)?)?;
+
+        for msg in &session.messages {
+            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+        }
+
+        debug!(key = %key, messages = session.messages.len(), "Rewrote session to disk");
+        Ok(())
+    }
+
     /// Clear a session's history (both in-memory and on disk).
     pub fn clear(&mut self, key: &SessionKey) -> Result<()> {
         self.cache.remove(&key.0);
@@ -269,5 +297,33 @@ mod tests {
         assert_eq!(mgr.get_or_create(&k2).messages.len(), 1);
         assert_eq!(mgr.get_or_create(&k1).messages[0].content, "from chat1");
         assert_eq!(mgr.get_or_create(&k2).messages[0].content, "from chat2");
+    }
+
+    #[test]
+    fn test_session_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("cli", "rewrite");
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Add 5 messages
+        for i in 0..5 {
+            mgr.add_message(&key, make_message(MessageRole::User, &format!("msg{i}")))
+                .unwrap();
+        }
+
+        // Mutate in-memory: keep only last 2
+        let session = mgr.get_or_create(&key);
+        session.messages.drain(0..3);
+        assert_eq!(session.messages.len(), 2);
+
+        // Rewrite to disk
+        mgr.rewrite(&key).unwrap();
+
+        // Load fresh from disk — should have only 2 messages
+        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
+        let session2 = mgr2.get_or_create(&key);
+        assert_eq!(session2.messages.len(), 2);
+        assert_eq!(session2.messages[0].content, "msg3");
+        assert_eq!(session2.messages[1].content, "msg4");
     }
 }

@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ToolSpec};
 
 /// Configuration for retry behavior.
 #[derive(Debug, Clone)]
@@ -142,6 +142,44 @@ impl LlmProvider for RetryProvider {
         }
 
         // Should only get here if we exhausted retries
+        Err(last_error.unwrap_or_else(|| eyre::eyre!("unknown error after retries")))
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatStream> {
+        let mut last_error = None;
+
+        for attempt in 0..=self.config.max_retries {
+            match self.inner.chat_stream(messages, tools, config).await {
+                Ok(stream) => {
+                    if attempt > 0 {
+                        debug!(attempt, "stream request succeeded after retry");
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    if attempt < self.config.max_retries && Self::is_retryable_error(&e) {
+                        let delay = self.calculate_delay(attempt);
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries = self.config.max_retries,
+                            delay_secs = delay.as_secs_f64(),
+                            error = %e,
+                            "retryable stream error, backing off"
+                        );
+                        tokio::time::sleep(delay).await;
+                        last_error = Some(e);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         Err(last_error.unwrap_or_else(|| eyre::eyre!("unknown error after retries")))
     }
 

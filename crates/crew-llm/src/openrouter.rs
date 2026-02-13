@@ -3,14 +3,16 @@
 use async_trait::async_trait;
 use crew_core::Message;
 use eyre::{Result, WrapErr};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use crate::vision;
 
 use crate::config::ChatConfig;
+use crate::openai::parse_openai_sse_events;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, StopReason, TokenUsage, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, StopReason, TokenUsage, ToolSpec};
 
 /// OpenRouter provider (routes to many LLM providers).
 pub struct OpenRouterProvider {
@@ -158,6 +160,93 @@ impl LlmProvider for OpenRouterProvider {
                 output_tokens: api_response.usage.completion_tokens,
             },
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatStream> {
+        let api_messages: Vec<ApiMessage> = messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    crew_core::MessageRole::System => "system",
+                    crew_core::MessageRole::User => "user",
+                    crew_core::MessageRole::Assistant => "assistant",
+                    crew_core::MessageRole::Tool => "tool",
+                };
+                ApiMessage {
+                    role,
+                    content: build_api_content(m),
+                    tool_call_id: m.tool_call_id.as_deref(),
+                    tool_calls: None,
+                }
+            })
+            .collect();
+
+        let api_tools: Option<Vec<ApiTool>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .map(|t| ApiTool {
+                        r#type: "function",
+                        function: ApiFunction {
+                            name: &t.name,
+                            description: &t.description,
+                            parameters: &t.input_schema,
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        let request = ApiRequest {
+            model: &self.model,
+            messages: api_messages,
+            max_tokens: config.max_tokens,
+            temperature: config.temperature,
+            tools: api_tools,
+        };
+
+        let mut body = serde_json::to_value(&request)
+            .wrap_err("failed to serialize OpenRouter request")?;
+        let obj = body.as_object_mut().unwrap();
+        obj.insert("stream".into(), true.into());
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": true}),
+        );
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .header(
+                "HTTP-Referer",
+                "https://github.com/heyong4725/crew-rs",
+            )
+            .header("X-Title", "crew-rs")
+            .json(&body)
+            .send()
+            .await
+            .wrap_err("failed to send streaming request to OpenRouter")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            eyre::bail!("OpenRouter API error: {status} - {text}");
+        }
+
+        let sse_stream = crate::sse::parse_sse_response(response);
+        let event_stream = sse_stream
+            .flat_map(|event| futures::stream::iter(parse_openai_sse_events(&event)));
+
+        Ok(Box::pin(event_stream))
     }
 
     fn model_id(&self) -> &str {

@@ -146,7 +146,9 @@ impl ChatCommand {
         // Single-message mode: send one message and exit
         if let Some(msg) = self.message {
             let response = agent.process_message(&msg, &[], vec![]).await?;
-            println!("{}", response.content);
+            if !response.streamed {
+                println!("{}", response.content);
+            }
             return Ok(());
         }
 
@@ -218,9 +220,11 @@ impl ChatCommand {
                 timestamp: chrono::Utc::now(),
             });
 
-            // Print response
-            println!();
-            println!("{}: {}", "assistant".blue().bold(), response.content);
+            // Print response (skip if already streamed to console)
+            if !response.streamed {
+                println!();
+                println!("{}: {}", "assistant".blue().bold(), response.content);
+            }
             println!();
         }
 
