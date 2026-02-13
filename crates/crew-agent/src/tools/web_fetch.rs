@@ -192,8 +192,14 @@ fn is_private_host(host: &str) -> bool {
                     || matches!(v6.segments()[0], 0xfc00..=0xfdff)
                     // Link-local fe80::/10
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
-                    // IPv4-mapped ::ffff:x.x.x.x — check wrapped IPv4
+                    // Site-local fec0::/10 (deprecated RFC 3879, still routable)
+                    || (v6.segments()[0] & 0xffc0) == 0xfec0
+                    // IPv4-mapped ::ffff:x.x.x.x
                     || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+                    })
+                    // IPv4-compatible ::x.x.x.x (deprecated RFC 4291)
+                    || v6.to_ipv4().is_some_and(|v4| {
                         v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
                     })
             }
@@ -291,6 +297,8 @@ mod tests {
         assert!(is_private_host("fe80::1"));           // link-local
         assert!(is_private_host("::ffff:127.0.0.1")); // IPv4-mapped loopback
         assert!(is_private_host("::ffff:192.168.1.1"));// IPv4-mapped private
+        assert!(is_private_host("fec0::1"));           // site-local (deprecated)
+        assert!(is_private_host("::192.168.1.1"));     // IPv4-compatible (deprecated)
     }
 
     #[test]
