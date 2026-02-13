@@ -177,11 +177,12 @@ impl Sandbox for MacosSandbox {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let cwd_str = cwd.to_string_lossy();
 
-        // Reject paths with control characters to prevent SBPL profile injection
+        // Reject paths with control characters to prevent SBPL profile injection.
+        // Fail closed: return a command that exits with error instead of running unsandboxed.
         if cwd_str.bytes().any(|b| b < 0x20 || b == 0x7F) {
-            tracing::warn!("cwd contains control characters, falling back to unsandboxed");
+            tracing::error!("cwd contains control characters, refusing to execute");
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(shell_command).current_dir(cwd);
+            cmd.arg("-c").arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
             return cmd;
         }
 
@@ -257,18 +258,27 @@ impl Sandbox for DockerSandbox {
             cmd.arg("--env").arg(format!("{var}="));
         }
 
-        // Workspace mount
+        // Workspace mount — validate path to prevent volume mount injection via ':'
         let cwd_str = cwd.to_string_lossy();
+        if cwd_str.contains(':') || cwd_str.contains('\0') {
+            tracing::error!("cwd contains invalid characters for Docker mount, refusing to execute");
+            let mut fail = Command::new("sh");
+            fail.arg("-c").arg("echo 'sandbox error: cwd contains invalid characters' >&2; exit 1");
+            return fail;
+        }
         match self.config.mount_mode {
             MountMode::ReadWrite => {
                 cmd.arg("-v").arg(format!("{cwd_str}:/workspace"));
+                cmd.arg("-w").arg("/workspace");
             }
             MountMode::ReadOnly => {
                 cmd.arg("-v").arg(format!("{cwd_str}:/workspace:ro"));
+                cmd.arg("-w").arg("/workspace");
             }
-            MountMode::None => {}
+            MountMode::None => {
+                cmd.arg("-w").arg("/tmp");
+            }
         }
-        cmd.arg("-w").arg("/workspace");
 
         cmd.arg(&self.config.image);
         cmd.arg("sh").arg("-c").arg(shell_command);
@@ -459,7 +469,7 @@ mod tests {
             .collect();
         assert!(args_ro.contains(&"/home/user/project:/workspace:ro".to_string()));
 
-        // No mount — no -v flag with :/workspace, but -w /workspace is still set
+        // No mount — uses /tmp as workdir instead of /workspace
         let sb_none = DockerSandbox {
             config: DockerConfig {
                 mount_mode: MountMode::None,
@@ -474,6 +484,42 @@ mod tests {
             .map(|a| a.to_string_lossy().to_string())
             .collect();
         assert!(!args_none.iter().any(|a| a.contains(":/workspace")));
+        assert!(args_none.contains(&"/tmp".to_string())); // -w /tmp
+    }
+
+    #[test]
+    fn test_docker_sandbox_rejects_colon_in_path() {
+        let sb = DockerSandbox {
+            config: DockerConfig::default(),
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp/evil:/host"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(prog, "sh"); // falls back to error command
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.iter().any(|a| a.contains("exit 1")));
+    }
+
+    #[test]
+    fn test_macos_sandbox_rejects_control_chars() {
+        let sb = MacosSandbox {
+            allow_network: false,
+        };
+        let cmd = sb.wrap_command("ls", Path::new("/tmp/\x01bad"));
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        assert_eq!(prog, "sh"); // error command, not sandbox-exec
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        // Must NOT execute the original command unsandboxed
+        assert!(args.iter().any(|a| a.contains("exit 1")));
+        assert!(!args.iter().any(|a| a.contains("ls")));
     }
 
     #[test]

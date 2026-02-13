@@ -89,11 +89,17 @@ impl ChannelManager {
                 if let Some(channel) = channels.get(&msg.channel) {
                     let config = ChunkConfig { max_chars: channel.max_message_length() };
                     let chunks = split_message(&msg.content, &config);
-                    for chunk in chunks {
+                    let total = chunks.len();
+                    for (i, chunk) in chunks.into_iter().enumerate() {
                         let mut chunk_msg = msg.clone();
                         chunk_msg.content = chunk;
                         if let Err(e) = channel.send(&chunk_msg).await {
-                            error!(channel = msg.channel, "Failed to send outbound: {e}");
+                            error!(
+                                channel = msg.channel,
+                                chunk = i + 1,
+                                total = total,
+                                "Failed to send outbound chunk: {e}",
+                            );
                             break;
                         }
                     }

@@ -109,16 +109,19 @@ impl SessionManager {
     }
 
     /// Get the JSONL file path for a session key.
+    ///
+    /// Uses percent-encoding for non-safe characters to ensure different keys
+    /// always produce different filenames (no collisions).
     fn session_path(&self, key: &SessionKey) -> PathBuf {
-        // Whitelist: keep only alphanumeric, dash, underscore, dot
         let safe_name: String = key
             .0
             .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                    c
+            .flat_map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    vec![c]
                 } else {
-                    '_'
+                    // Percent-encode: ':' -> '%3A', '.' -> '%2E', etc.
+                    format!("%{:02X}", c as u32).chars().collect()
                 }
             })
             .collect();

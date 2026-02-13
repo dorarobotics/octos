@@ -641,9 +641,13 @@ impl GatewayCommand {
 
             let session_key = inbound.session_key();
 
-            // Handle /new command: fork the current session
+            // Handle /new command: fork the current session.
+            // Namespace by sender_id so each user gets their own fork.
             if inbound.content.trim() == "/new" {
-                let new_id = format!("{}_{}", inbound.chat_id, chrono::Utc::now().timestamp());
+                let new_id = format!(
+                    "{}_{}_{}", inbound.sender_id, inbound.chat_id,
+                    chrono::Utc::now().timestamp_millis(),
+                );
                 match session_mgr.fork(&session_key, &new_id, 10) {
                     Ok(new_key) => {
                         let msg = OutboundMessage {
