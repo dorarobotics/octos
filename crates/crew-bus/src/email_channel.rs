@@ -184,7 +184,11 @@ async fn imap_poll(
             let subject = extract_header(&parsed, "Subject").unwrap_or_default();
             let mut text_body = extract_text_body(&parsed).unwrap_or_default();
             if text_body.len() > config.max_body_chars {
-                text_body.truncate(config.max_body_chars);
+                let mut limit = config.max_body_chars;
+                while limit > 0 && !text_body.is_char_boundary(limit) {
+                    limit -= 1;
+                }
+                text_body.truncate(limit);
                 text_body.push_str("...");
             }
 

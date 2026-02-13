@@ -143,7 +143,11 @@ impl Tool for ReadFileTool {
         // Truncate if too long
         const MAX_OUTPUT: usize = 100000;
         if output.len() > MAX_OUTPUT {
-            output.truncate(MAX_OUTPUT);
+            let mut limit = MAX_OUTPUT;
+            while limit > 0 && !output.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            output.truncate(limit);
             output.push_str("\n... (content truncated)");
         }
 

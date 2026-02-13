@@ -149,7 +149,11 @@ impl Tool for WebFetchTool {
         };
 
         if content.len() > input.max_chars {
-            content.truncate(input.max_chars);
+            let mut limit = input.max_chars;
+            while limit > 0 && !content.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            content.truncate(limit);
             content.push_str("\n\n... (content truncated)");
         }
 

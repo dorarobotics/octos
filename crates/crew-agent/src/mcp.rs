@@ -19,19 +19,7 @@ use crate::tools::{Tool, ToolRegistry, ToolResult};
 /// Maximum size for a single JSON-RPC response line (1MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
 
-/// Environment variable names blocked for MCP servers (code injection vectors).
-const BLOCKED_ENV_KEYS: &[&str] = &[
-    // Linux: shared library injection
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    // macOS: dylib injection
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "DYLD_VERSIONED_LIBRARY_PATH",
-];
+use crate::sandbox::BLOCKED_ENV_VARS;
 
 /// Configuration for a single MCP server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,7 +164,7 @@ impl McpClient {
             .stderr(Stdio::inherit()); // Forward stderr for debugging
 
         for (k, v) in &config.env {
-            if BLOCKED_ENV_KEYS.iter().any(|blocked| k.eq_ignore_ascii_case(blocked)) {
+            if BLOCKED_ENV_VARS.iter().any(|blocked| k.eq_ignore_ascii_case(blocked)) {
                 warn!(key = k, "blocked dangerous MCP environment variable, skipping");
                 continue;
             }

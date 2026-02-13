@@ -1,5 +1,7 @@
 //! Message coalescing: split long messages into channel-safe chunks.
 
+use tracing::warn;
+
 /// Configuration for message splitting.
 pub struct ChunkConfig {
     /// Maximum characters per chunk (platform limit).
@@ -39,7 +41,11 @@ pub fn split_message(text: &str, config: &ChunkConfig) -> Vec<String> {
 
     while !remaining.is_empty() {
         if chunks.len() >= MAX_CHUNKS {
-            chunks.push("[message truncated]".to_string());
+            warn!(
+                remaining_chars = remaining.len(),
+                "message exceeded {MAX_CHUNKS} chunks, truncating",
+            );
+            chunks.push(format!("[message truncated - {} chars omitted]", remaining.len()));
             break;
         }
 
@@ -181,6 +187,6 @@ mod tests {
         let text = "abcdefghij".repeat(100); // 1000 chars, 100 chunks at max_chars=10
         let chunks = split_message(&text, &config);
         assert_eq!(chunks.len(), 51); // 50 real + 1 truncation marker
-        assert_eq!(chunks[50], "[message truncated]");
+        assert!(chunks[50].starts_with("[message truncated"));
     }
 }

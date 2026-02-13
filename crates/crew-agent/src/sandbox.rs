@@ -8,6 +8,23 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+/// Environment variables blocked inside sandboxes (code injection vectors).
+///
+/// Shared between sandbox backends and MCP server spawning.
+pub const BLOCKED_ENV_VARS: &[&str] = &[
+    // Linux: shared library injection
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+    // macOS: dylib injection
+    "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_VERSIONED_LIBRARY_PATH",
+    // Runtime-specific code injection
+    "NODE_OPTIONS", "PYTHONSTARTUP", "PYTHONPATH",
+    "PERL5OPT", "RUBYOPT", "RUBYLIB",
+    "JAVA_TOOL_OPTIONS",
+    // Shell startup injection
+    "BASH_ENV", "ENV", "ZDOTDIR",
+];
+
 /// Sandbox configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxConfig {
@@ -137,6 +154,11 @@ impl Sandbox for BwrapSandbox {
     fn wrap_command(&self, shell_command: &str, cwd: &Path) -> Command {
         let mut cmd = Command::new("bwrap");
 
+        // Clear dangerous environment variables before entering sandbox
+        for var in BLOCKED_ENV_VARS {
+            cmd.env_remove(var);
+        }
+
         // Read-only bind system directories
         for dir in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
             if Path::new(dir).exists() {
@@ -212,6 +234,10 @@ impl Sandbox for MacosSandbox {
         );
 
         let mut cmd = Command::new("sandbox-exec");
+        // Clear dangerous environment variables (sandbox-exec inherits parent env)
+        for var in BLOCKED_ENV_VARS {
+            cmd.env_remove(var);
+        }
         cmd.arg("-p")
             .arg(profile)
             .arg("sh")
@@ -254,11 +280,7 @@ impl Sandbox for DockerSandbox {
         cmd.arg("--cap-drop").arg("ALL");
 
         // Clear dangerous environment variables (code injection vectors)
-        for var in &[
-            "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-            "NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
-            "JAVA_TOOL_OPTIONS", "BASH_ENV", "ENV", "ZDOTDIR",
-        ] {
+        for var in BLOCKED_ENV_VARS {
             cmd.arg("--env").arg(format!("{var}="));
         }
 
@@ -538,11 +560,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect();
-        for var in &[
-            "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
-            "NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
-            "JAVA_TOOL_OPTIONS", "BASH_ENV", "ENV", "ZDOTDIR",
-        ] {
+        for var in BLOCKED_ENV_VARS {
             assert!(args.contains(&format!("{var}=")), "missing env clear for {var}");
         }
     }
