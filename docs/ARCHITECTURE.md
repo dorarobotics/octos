@@ -463,7 +463,7 @@ pub struct ToolResult {
 | **message** | content, channel?, chat_id? | Cross-channel messaging via OutboundMessage |
 | **spawn** | task, label?, mode="background", allowed_tools, context? | Subagent with inherited provider policy. sync=inline, background=async |
 | **cron** | action, message, schedule params | Schedule add/list/remove/enable/disable |
-| **browser** | action, url?, selector?, text?, expression? | Feature-gated (`browser`). Headless Chrome via CDP. Actions: navigate (SSRF check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization |
+| **browser** | action, url?, selector?, text?, expression? | Feature-gated (`browser`). Headless Chrome via CDP. Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
 
 ### Tool Policies
 
@@ -1057,6 +1057,7 @@ crates/
 - Tool policies: allow/deny with deny-wins semantics, group support, provider-specific filtering
 - Path traversal prevention + symlink rejection in all file tools
 - SSRF protection in web_fetch and browser: blocks private IPs (10/8, 172.16/12, 192.168/16, 169.254/16, IPv6 ULA/link-local)
+- Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 
 ### Data Safety
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
