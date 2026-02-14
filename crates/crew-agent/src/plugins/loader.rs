@@ -89,11 +89,26 @@ impl PluginLoader {
                 )
             })?;
 
-        // SHA-256 hash verification.
-        // Read executable content once to avoid TOCTOU (file swap between
-        // hash check and later use).
+        // Reject oversized executables (100 MB limit) before reading into memory.
+        const MAX_EXECUTABLE_SIZE: u64 = 100_000_000;
+        let exe_meta = std::fs::metadata(&executable)
+            .map_err(|e| eyre::eyre!("cannot stat plugin executable: {e}"))?;
+        if exe_meta.len() > MAX_EXECUTABLE_SIZE {
+            eyre::bail!(
+                "plugin '{}' executable too large: {} bytes (max {})",
+                manifest.name,
+                exe_meta.len(),
+                MAX_EXECUTABLE_SIZE
+            );
+        }
+
+        // Read executable content once for hash verification AND to write a
+        // verified copy. This closes the TOCTOU gap: we hash the bytes we
+        // read, then write those same bytes to a verified path that PluginTool
+        // will execute. The original file can't be swapped after verification.
         let exe_bytes = std::fs::read(&executable)
             .map_err(|e| eyre::eyre!("cannot read plugin executable: {e}"))?;
+
         match &manifest.sha256 {
             Some(expected_hash) => {
                 let actual_hash = format!("{:x}", Sha256::digest(&exe_bytes));
@@ -118,6 +133,20 @@ impl PluginLoader {
             }
         }
 
+        // Write verified bytes to a sibling file so PluginTool executes
+        // exactly what we hashed (prevents TOCTOU file swap attacks).
+        let verified_exe = plugin_dir.join(format!(
+            ".{}_verified",
+            executable.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        std::fs::write(&verified_exe, &exe_bytes)
+            .map_err(|e| eyre::eyre!("cannot write verified executable: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&verified_exe, std::fs::Permissions::from_mode(0o500))?;
+        }
+
         // Collect env vars to filter out
         let blocked_env: Vec<String> = BLOCKED_ENV_VARS.iter().map(|s| s.to_string()).collect();
 
@@ -130,7 +159,7 @@ impl PluginLoader {
             .tools
             .into_iter()
             .map(|def| {
-                PluginTool::new(manifest.name.clone(), def, executable.clone())
+                PluginTool::new(manifest.name.clone(), def, verified_exe.clone())
                     .with_blocked_env(blocked_env.clone())
                     .with_timeout(timeout)
             })

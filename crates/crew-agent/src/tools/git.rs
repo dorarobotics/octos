@@ -39,6 +39,21 @@ fn default_count() -> usize {
     10
 }
 
+/// Whitelist safe revision formats to prevent arbitrary rev_parse_single input.
+/// Allows: hex commit hashes, HEAD, HEAD~N, HEAD^N, branch/tag names (alphanumeric + -_./).
+fn is_safe_revision(rev: &str) -> bool {
+    if rev.is_empty() || rev.len() > 256 {
+        return false;
+    }
+    // Reject known dangerous revision syntax: :/, @{, ..
+    if rev.contains(":/") || rev.contains("@{") || rev.contains("..") {
+        return false;
+    }
+    // Allow only safe characters: alphanumeric, -, _, ., /, ~, ^
+    rev.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./~^".contains(c))
+}
+
 #[async_trait]
 impl Tool for GitTool {
     fn name(&self) -> &str {
@@ -107,7 +122,19 @@ impl Tool for GitTool {
                 git_diff(&self.working_dir, args.path.as_deref())
             }
             "log" => git_log(&self.working_dir, args.count),
-            "show" => git_show(&self.working_dir, args.revision.as_deref().unwrap_or("HEAD")),
+            "show" => {
+                let rev = args.revision.as_deref().unwrap_or("HEAD");
+                if !is_safe_revision(rev) {
+                    return Ok(ToolResult {
+                        output: format!(
+                            "invalid revision: {rev}. Use a commit hash, HEAD, HEAD~N, or a branch/tag name"
+                        ),
+                        success: false,
+                        ..Default::default()
+                    });
+                }
+                git_show(&self.working_dir, rev)
+            }
             "blame" => {
                 let path = args
                     .path
@@ -557,6 +584,49 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn test_git_show_rejects_unsafe_revision() {
+        let dir = setup_git_repo();
+        let tool = GitTool::new(dir.path());
+
+        // Reject regex revision syntax
+        let result = tool
+            .execute(&serde_json::json!({"command": "show", "revision": ":/secret"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("invalid revision"));
+
+        // Reject reflog syntax
+        let result = tool
+            .execute(&serde_json::json!({"command": "show", "revision": "@{-1}"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("invalid revision"));
+
+        // Allow HEAD (safe)
+        let result = tool
+            .execute(&serde_json::json!({"command": "show", "revision": "HEAD"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_is_safe_revision() {
+        assert!(is_safe_revision("HEAD"));
+        assert!(is_safe_revision("HEAD~3"));
+        assert!(is_safe_revision("HEAD^2"));
+        assert!(is_safe_revision("abc123def"));
+        assert!(is_safe_revision("main"));
+        assert!(is_safe_revision("refs/tags/v1.0"));
+        assert!(!is_safe_revision(":/regex"));
+        assert!(!is_safe_revision("@{-1}"));
+        assert!(!is_safe_revision("HEAD..main"));
+        assert!(!is_safe_revision(""));
     }
 
     #[tokio::test]
