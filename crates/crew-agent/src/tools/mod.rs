@@ -138,6 +138,19 @@ impl ToolRegistry {
                 eyre::bail!("tool '{}' denied by provider policy", name);
             }
         }
+
+        // Reject oversized arguments (1 MB limit)
+        const MAX_ARGS_SIZE: usize = 1_048_576;
+        let args_str = args.to_string();
+        if args_str.len() > MAX_ARGS_SIZE {
+            eyre::bail!(
+                "tool '{}' arguments too large: {} bytes (max {})",
+                name,
+                args_str.len(),
+                MAX_ARGS_SIZE
+            );
+        }
+
         let tool = self
             .tools
             .get(name)

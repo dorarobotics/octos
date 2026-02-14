@@ -46,17 +46,15 @@ impl AnthropicProvider {
         self.base_url = base_url.into();
         self
     }
-}
 
-#[async_trait]
-impl LlmProvider for AnthropicProvider {
-    async fn chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSpec],
+    /// Build the shared request struct used by both chat() and chat_stream().
+    fn build_request<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
         config: &ChatConfig,
-    ) -> Result<ChatResponse> {
-        let request = AnthropicRequest {
+    ) -> AnthropicRequest<'a> {
+        AnthropicRequest {
             model: &self.model,
             max_tokens: config.max_tokens.unwrap_or(4096),
             messages: messages
@@ -69,8 +67,10 @@ impl LlmProvider for AnthropicProvider {
                         crew_core::MessageRole::Tool => "user",
                         crew_core::MessageRole::System => "user",
                     };
-                    let content = build_anthropic_content(m);
-                    AnthropicMessage { role, content }
+                    AnthropicMessage {
+                        role,
+                        content: build_anthropic_content(m),
+                    }
                 })
                 .collect(),
             system: messages
@@ -78,7 +78,19 @@ impl LlmProvider for AnthropicProvider {
                 .find(|m| m.role == crew_core::MessageRole::System)
                 .map(|m| m.content.as_str()),
             tools: if tools.is_empty() { None } else { Some(tools) },
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let request = self.build_request(messages, tools, config);
 
         let response = self
             .client
@@ -148,31 +160,7 @@ impl LlmProvider for AnthropicProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let request = AnthropicRequest {
-            model: &self.model,
-            max_tokens: config.max_tokens.unwrap_or(4096),
-            messages: messages
-                .iter()
-                .filter(|m| m.role != crew_core::MessageRole::System)
-                .map(|m| {
-                    let role = match m.role {
-                        crew_core::MessageRole::User => "user",
-                        crew_core::MessageRole::Assistant => "assistant",
-                        crew_core::MessageRole::Tool => "user",
-                        crew_core::MessageRole::System => "user",
-                    };
-                    AnthropicMessage {
-                        role,
-                        content: build_anthropic_content(m),
-                    }
-                })
-                .collect(),
-            system: messages
-                .iter()
-                .find(|m| m.role == crew_core::MessageRole::System)
-                .map(|m| m.content.as_str()),
-            tools: if tools.is_empty() { None } else { Some(tools) },
-        };
+        let request = self.build_request(messages, tools, config);
 
         let mut body =
             serde_json::to_value(&request).wrap_err("failed to serialize Anthropic request")?;

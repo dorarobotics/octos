@@ -47,16 +47,14 @@ impl OpenAIProvider {
         self.base_url = base_url.into();
         self
     }
-}
 
-#[async_trait]
-impl LlmProvider for OpenAIProvider {
-    async fn chat(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSpec],
+    /// Build the shared request struct used by both chat() and chat_stream().
+    fn build_request<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: &'a [ToolSpec],
         config: &ChatConfig,
-    ) -> Result<ChatResponse> {
+    ) -> OpenAIRequest<'a> {
         let openai_messages: Vec<OpenAIMessage> = messages
             .iter()
             .map(|m| {
@@ -66,10 +64,9 @@ impl LlmProvider for OpenAIProvider {
                     crew_core::MessageRole::Assistant => "assistant",
                     crew_core::MessageRole::Tool => "tool",
                 };
-                let content = build_openai_content(m);
                 OpenAIMessage {
                     role,
-                    content,
+                    content: build_openai_content(m),
                     tool_call_id: m.tool_call_id.as_deref(),
                     tool_calls: None,
                 }
@@ -94,13 +91,25 @@ impl LlmProvider for OpenAIProvider {
             )
         };
 
-        let request = OpenAIRequest {
+        OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
             max_tokens: config.max_tokens,
             temperature: config.temperature,
             tools: openai_tools,
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAIProvider {
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        config: &ChatConfig,
+    ) -> Result<ChatResponse> {
+        let request = self.build_request(messages, tools, config);
 
         let response = self
             .client
@@ -171,49 +180,7 @@ impl LlmProvider for OpenAIProvider {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        let openai_messages: Vec<OpenAIMessage> = messages
-            .iter()
-            .map(|m| {
-                let role = match m.role {
-                    crew_core::MessageRole::System => "system",
-                    crew_core::MessageRole::User => "user",
-                    crew_core::MessageRole::Assistant => "assistant",
-                    crew_core::MessageRole::Tool => "tool",
-                };
-                OpenAIMessage {
-                    role,
-                    content: build_openai_content(m),
-                    tool_call_id: m.tool_call_id.as_deref(),
-                    tool_calls: None,
-                }
-            })
-            .collect();
-
-        let openai_tools: Option<Vec<OpenAITool>> = if tools.is_empty() {
-            None
-        } else {
-            Some(
-                tools
-                    .iter()
-                    .map(|t| OpenAITool {
-                        r#type: "function",
-                        function: OpenAIFunction {
-                            name: &t.name,
-                            description: &t.description,
-                            parameters: &t.input_schema,
-                        },
-                    })
-                    .collect(),
-            )
-        };
-
-        let request = OpenAIRequest {
-            model: &self.model,
-            messages: openai_messages,
-            max_tokens: config.max_tokens,
-            temperature: config.temperature,
-            tools: openai_tools,
-        };
+        let request = self.build_request(messages, tools, config);
 
         let mut body =
             serde_json::to_value(&request).wrap_err("failed to serialize OpenAI request")?;
