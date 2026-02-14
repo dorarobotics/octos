@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-crew-rs is a Rust-native AI agent framework that provides both a coding automation CLI and a multi-channel messaging gateway. It supports 12+ LLM providers, 6 messaging channels, and a rich tool system for autonomous task execution.
+crew-rs is a Rust-native AI agent framework that provides both a coding automation CLI and a multi-channel messaging gateway. It supports 12+ LLM providers, 7 messaging channels (CLI + 6 platforms), and a rich tool system for autonomous task execution.
 
 ## Problem Statement
 
@@ -162,7 +162,7 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - [x] Core type system and task model
 - [x] 4 native LLM providers + 8 OpenAI-compatible
 - [x] 14 built-in tools (13 default + browser)
-- [x] 6 messaging channels
+- [x] 7 messaging channels (CLI + 6 platforms)
 - [x] Memory system (episodic + daily + long-term + bootstrap)
 - [x] Skills system
 - [x] Cron scheduler and heartbeat service
@@ -190,8 +190,17 @@ crew-rs is a Rust-native AI agent framework that provides both a coding automati
 - [x] Message coalescing (channel-aware chunking)
 - [x] Session forking (`/new` command)
 - [x] Docker sandbox (container isolation with resource limits)
-- [x] MCP server support (JSON-RPC stdio)
+- [x] MCP server support (JSON-RPC stdio + HTTP/SSE)
+- [x] Streaming responses (chat_stream + SSE)
+- [x] Hook/lifecycle system (4 events, circuit breaker)
+- [x] Provider failover chain (ProviderChain with circuit breaker)
+- [x] Built-in web UI (embedded SPA via rust-embed)
+- [x] Prometheus metrics endpoint (/metrics)
+- [x] Message queue modes (Followup vs Collect)
+- [x] Wall-clock agent timeout (600s default)
+- [x] Tool output sanitization (strip base64/hex)
+- [x] `secrecy::SecretString` for all API keys
+- [x] `#![deny(unsafe_code)]` workspace-wide
 
 ### Planned
-- [ ] Streaming responses
 - [ ] DingTalk, QQ channels

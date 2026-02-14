@@ -218,7 +218,7 @@ pub type ChatStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
 
 ### RetryProvider
 
-Wraps any `Arc<dyn LlmProvider>` with exponential backoff.
+Wraps any `Arc<dyn LlmProvider>` with exponential backoff. Wrapped by `ProviderChain` for multi-provider failover.
 
 ```rust
 pub struct RetryConfig {
@@ -235,6 +235,21 @@ pub struct RetryConfig {
 1. HTTP status: 429, 500, 502, 503, 504, 529
 2. reqwest: `is_connect()` or `is_timeout()`
 3. String fallback: "connection refused", "timed out", "overloaded"
+
+### Provider Failover Chain
+
+`ProviderChain` wraps multiple `Arc<dyn LlmProvider>` and transparently fails over on retriable errors. Configured via `fallback_models` in config.
+
+```rust
+pub struct ProviderChain {
+    slots: Vec<ProviderSlot>,       // provider + AtomicU32 failure count
+    failure_threshold: u32,         // default: 3
+}
+```
+
+**Behavior**: Tries providers in order, skipping degraded ones (failures >= threshold). On retriable error, moves to the next. On success, resets failure count. If all degraded, picks the one with fewest failures.
+
+**Retryable**: Same criteria as RetryProvider (429, 5xx, connect/timeout errors).
 
 ### Token Estimation
 
@@ -385,9 +400,10 @@ pub struct Agent {
 }
 
 pub struct AgentConfig {
-    pub max_iterations: u32,      // default: 50
-    pub max_tokens: Option<u32>,  // None = unlimited
-    pub save_episodes: bool,      // default: true
+    pub max_iterations: u32,          // default: 50 (CLI overrides to 20)
+    pub max_tokens: Option<u32>,      // None = unlimited
+    pub max_timeout: Option<Duration>,// default: 600s wall-clock timeout
+    pub save_episodes: bool,          // default: true
 }
 ```
 
@@ -409,6 +425,14 @@ pub struct AgentConfig {
 **ConversationResponse**: `content: String`, `token_usage: TokenUsage`, `files_modified: Vec<PathBuf>`, `streamed: bool`
 
 **Episode saving**: After task completion, fires-and-forgets embedding generation if embedder present.
+
+**Wall-clock timeout**: Agent aborts after `max_timeout` (default 600s) regardless of iteration count.
+
+### Tool Output Sanitization
+
+Before feeding tool results back to the LLM, `sanitize_tool_output()` (in `sanitize.rs`) strips noise:
+- **Base64 data URIs**: `data:...;base64,<payload>` → `[base64-data-redacted]`
+- **Long hex strings**: 64+ contiguous hex chars (SHA-256, raw keys) → `[hex-redacted]`
 
 ### Context Compaction
 
@@ -460,10 +484,12 @@ pub struct ToolResult {
 | **shell** | command, timeout_secs=120 | SafePolicy check, 50KB output truncation, sandbox-wrapped |
 | **web_search** | query, count=5 | Brave Search API (BRAVE_API_KEY) |
 | **web_fetch** | url, extract_mode="markdown", max_chars=50000 | SSRF protection, htmd HTML→markdown, 30s timeout |
-| **message** | content, channel?, chat_id? | Cross-channel messaging via OutboundMessage |
-| **spawn** | task, label?, mode="background", allowed_tools, context? | Subagent with inherited provider policy. sync=inline, background=async |
-| **cron** | action, message, schedule params | Schedule add/list/remove/enable/disable |
+| **message** | content, channel?, chat_id? | Cross-channel messaging via OutboundMessage. **Gateway-only** |
+| **spawn** | task, label?, mode="background", allowed_tools, context? | Subagent with inherited provider policy. sync=inline, background=async. **Gateway-only** |
+| **cron** | action, message, schedule params | Schedule add/list/remove/enable/disable. **Gateway-only** |
 | **browser** | action, url?, selector?, text?, expression? | Feature-gated (`browser`). Headless Chrome via CDP. Actions: navigate (SSRF + scheme check), get_text, get_html, click, type, screenshot, evaluate, close. 5min idle timeout, env sanitization, 10s JS timeout, early action validation |
+
+**Registration**: 10 core tools registered in `ToolRegistry::with_builtins()` (all modes). Browser is feature-gated. Message, spawn, and cron are registered only in gateway mode (`gateway.rs`).
 
 ### Tool Policies
 
@@ -505,11 +531,38 @@ pub enum SandboxMode { Auto, Bwrap, Macos, Docker, None }
 
 **Docker resource limits**: `--cpus`, `--memory`, `--pids-limit`. Mount modes: None (/tmp workdir), ReadOnly, ReadWrite.
 
+### Hooks System
+
+Lifecycle hooks run shell commands at agent events. Configured via `hooks` array in config.
+
+```rust
+pub enum HookEvent { BeforeToolCall, AfterToolCall, BeforeLlmCall, AfterLlmCall }
+
+pub struct HookConfig {
+    pub event: HookEvent,
+    pub command: Vec<String>,       // argv array (no shell interpretation)
+    pub timeout_ms: u64,            // default: 5000
+    pub tool_filter: Vec<String>,   // tool events only; empty = all
+}
+```
+
+**Shell protocol**: JSON payload on stdin. Exit code semantics: 0=allow, 1=deny (before-hooks only), 2+=error. Before-hooks can deny operations; after-hook exit codes only count as errors.
+
+**Circuit breaker**: `HookExecutor` auto-disables a hook after 3 consecutive failures (configurable via `with_threshold()`). Resets on success.
+
+**Environment**: Commands sanitized via `BLOCKED_ENV_VARS`. Tilde expansion supports `~/` and `~username/`.
+
+**Integration**: Wired into `chat.rs`, `gateway.rs`, `serve.rs`. Hook config changes trigger restart via config watcher.
+
 ### MCP Integration
 
-JSON-RPC stdio transport for Model Context Protocol servers.
+JSON-RPC transport for Model Context Protocol servers. Two transport modes:
 
-**Lifecycle**:
+**Transports**:
+1. **Stdio**: Spawns server as child process (command + args + env). Line limit: 1MB. Env sanitized via `BLOCKED_ENV_VARS`.
+2. **HTTP/SSE**: Connects to remote server via `url` field. POST JSON, SSE response handling.
+
+**Lifecycle** (stdio):
 1. Spawn server (command + args + env, filtering BLOCKED_ENV_VARS)
 2. Initialize: `protocolVersion: "2024-11-05"`
 3. Discover tools: `tools/list` RPC
@@ -800,6 +853,10 @@ Subscribers receive events via `SseBroadcaster::subscribe() -> broadcast::Receiv
 
 `create_bus() -> (AgentHandle, BusPublisher)` linked by mpsc channels (capacity 256). AgentHandle receives InboundMessages; BusPublisher dispatches OutboundMessages.
 
+**Queue Modes** (configured via `gateway.queue_mode`):
+- `Followup` (default): FIFO — process queued messages one at a time
+- `Collect`: Merge queued messages by session, concatenating content before processing
+
 ### Channel Trait
 
 ```rust
@@ -923,7 +980,7 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 
 **Hot-reloadable**: system_prompt, max_history (applied live).
 
-**Restart-required**: provider, model, base_url, api_key_env, sandbox, mcp_servers, channels.
+**Restart-required**: provider, model, base_url, api_key_env, sandbox, mcp_servers, hooks, gateway.queue_mode, channels.
 
 ### REST API (feature: `api`)
 
@@ -934,8 +991,14 @@ Polls every 5 seconds. SHA-256 hash comparison of file contents.
 | `/api/sessions` | GET | List all sessions |
 | `/api/sessions/{id}/messages` | GET | Paginated history (?limit=100&offset=0, max 500) |
 | `/api/status` | GET | Version, model, provider, uptime |
+| `/metrics` | GET | Prometheus text exposition format (unauthenticated) |
+| `/*` (fallback) | GET | Embedded web UI (static files via rust-embed) |
 
-**Auth**: Optional bearer token with constant-time comparison. **CORS**: localhost:3000/8080. **Max message**: 1MB.
+**Auth**: Optional bearer token with constant-time comparison (API routes only; `/metrics` and static files are public). **CORS**: localhost:3000/8080. **Max message**: 1MB.
+
+**Web UI**: Embedded SPA via `rust-embed` served as the fallback handler. Session sidebar, chat interface, SSE streaming, dark theme. Vanilla HTML/CSS/JS (no build tools).
+
+**Prometheus Metrics**: `crew_tool_calls_total` (counter, labels: tool, success), `crew_tool_call_duration_seconds` (histogram, label: tool), `crew_llm_tokens_total` (counter, label: direction). Powered by `metrics` + `metrics-exporter-prometheus` crates.
 
 ### Session Compaction (Gateway)
 
@@ -1011,13 +1074,13 @@ crates/
 ├── crew-core/src/
 │   ├── lib.rs, task.rs, types.rs, error.rs, gateway.rs, message.rs, utils.rs
 ├── crew-llm/src/
-│   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, sse.rs
+│   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, failover.rs, sse.rs
 │   ├── embedding.rs, pricing.rs, context.rs, transcription.rs, vision.rs
 │   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs
 ├── crew-memory/src/
 │   ├── lib.rs, episode.rs, store.rs, memory_store.rs, hybrid_search.rs
 ├── crew-agent/src/
-│   ├── lib.rs, agent.rs, progress.rs, policy.rs, compaction.rs
+│   ├── lib.rs, agent.rs, progress.rs, policy.rs, compaction.rs, sanitize.rs, hooks.rs
 │   ├── sandbox.rs, mcp.rs, skills.rs, builtin_skills.rs
 │   ├── plugins/ (mod.rs, loader.rs, manifest.rs, tool.rs)
 │   ├── skills/ (cron, github, skill-creator, summarize, tmux, weather SKILL.md)
@@ -1032,7 +1095,7 @@ crates/
 └── crew-cli/src/
     ├── main.rs, config.rs, config_watcher.rs, cron_tool.rs, compaction.rs
     ├── auth/ (mod.rs, store.rs, oauth.rs, token.rs)
-    ├── api/ (mod.rs, router.rs, handlers.rs, sse.rs)
+    ├── api/ (mod.rs, router.rs, handlers.rs, sse.rs, metrics.rs, static_files.rs)
     └── commands/ (mod, chat, init, status, gateway, clean,
                    completions, cron, channels, auth, skills, docs, serve)
 ```
@@ -1040,6 +1103,10 @@ crates/
 ---
 
 ## Security
+
+### Workspace-Level Safety
+- `#![deny(unsafe_code)]` — workspace-wide lint via `[workspace.lints.rust]`
+- `secrecy::SecretString` — all provider API keys are wrapped; prevents accidental logging/display
 
 ### Authentication & Credentials
 - API keys: auth store (`~/.crew/auth.json`, mode 0600) checked before env vars
@@ -1060,6 +1127,7 @@ crates/
 - Browser: URL scheme allowlist (http/https only), 10s JS execution timeout, zombie process reaping, secure tempfiles for screenshots
 
 ### Data Safety
+- Tool output sanitization: strips base64 data URIs and long hex strings (`sanitize.rs`)
 - UTF-8 safe truncation via `truncate_utf8()` across all tool outputs and email bodies
 - Session file collision prevention via percent-encoded filenames
 - Atomic write-then-rename for session persistence (crash safety)

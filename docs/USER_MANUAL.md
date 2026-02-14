@@ -11,7 +11,7 @@
 7. [Gateway Mode](#gateway-mode)
 8. [Memory & Skills](#memory--skills)
 9. [Advanced Usage](#advanced-usage)
-11. [Troubleshooting](#troubleshooting)
+10. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -281,6 +281,7 @@ Bootstrap Files
 ```bash
 crew clean [--all] [--dry-run] # Clean database files
 crew completions <shell>       # Generate completions (bash/zsh/fish/powershell)
+crew docs                      # Generate tool + provider documentation
 crew cron list [--all]         # List cron jobs
 crew cron add [OPTIONS]        # Add a cron job
 crew cron remove <job-id>      # Remove a cron job
@@ -352,13 +353,13 @@ crew chat --model qwen-max         # -> dashscope
 
 ```bash
 # Azure OpenAI
-crew run --provider openai --base-url "https://your.openai.azure.com/v1" "Task"
+crew chat --provider openai --base-url "https://your.openai.azure.com/v1" --message "Task"
 
 # Local Ollama
 crew chat --provider ollama --model llama3.2
 
 # vLLM server
-crew run --provider vllm --base-url "http://localhost:8000/v1" --model "meta-llama/Llama-3-70b" "Task"
+crew chat --provider vllm --base-url "http://localhost:8000/v1" --model "meta-llama/Llama-3-70b" --message "Task"
 ```
 
 ---
@@ -540,15 +541,19 @@ Place custom skills in `.crew/skills/{name}/SKILL.md`:
 
 ```markdown
 ---
+name: my-skill
 description: My custom skill
 always: true
-available: true
+requires_bins: curl
+requires_env: MY_API_KEY
 ---
 
 # Skill Instructions
 
 Your skill content here...
 ```
+
+Frontmatter fields: `name`, `description`, `always` (auto-load), `requires_bins` (comma-separated binaries checked via `which`), `requires_env` (comma-separated env vars). Availability is derived from requirement checks — not a frontmatter field.
 
 Skills with `always: true` are included in every prompt. Others are available for the agent to read on demand.
 
@@ -711,6 +716,56 @@ When the conversation exceeds the LLM's context window, older messages are autom
 - Messages are summarized to first lines
 - Recent tool call/result pairs are preserved intact
 - The agent continues seamlessly without losing critical context
+
+### Hooks (Lifecycle Events)
+
+Run shell commands before/after tool calls and LLM calls. Configure in `config.json`:
+
+```json
+{
+  "hooks": [
+    {
+      "event": "before_tool_call",
+      "command": ["python3", "~/.crew/hooks/audit.py"],
+      "timeout_ms": 3000,
+      "tool_filter": ["shell", "write_file"]
+    }
+  ]
+}
+```
+
+**Events**: `before_tool_call`, `after_tool_call`, `before_llm_call`, `after_llm_call`.
+
+**Protocol**: Command receives JSON payload on stdin. Exit code 0 = allow, 1 = deny (before-hooks only), 2+ = error. Before-hooks can block operations; after-hooks are informational.
+
+**Circuit breaker**: Hooks auto-disable after 3 consecutive failures. Commands use argv arrays (no shell interpretation). Environment sanitized via `BLOCKED_ENV_VARS`.
+
+### Message Queue Modes
+
+Control how messages arriving during an active agent run are handled:
+
+```json
+{
+  "gateway": {
+    "queue_mode": "followup"
+  }
+}
+```
+
+- **`followup`** (default): Process queued messages one at a time (FIFO)
+- **`collect`**: Merge queued messages by session, concatenating content before processing
+
+### Web UI (`crew serve`)
+
+The REST API server (feature: `api`) includes an embedded web UI:
+
+```bash
+cargo install --path crates/crew-cli --features api
+crew serve
+# Open http://localhost:8080
+```
+
+Features: session sidebar, chat interface, SSE streaming, dark theme. A `/metrics` endpoint provides Prometheus-format metrics (`crew_tool_calls_total`, `crew_tool_call_duration_seconds`, `crew_llm_tokens_total`).
 
 ### Hybrid Memory Search
 
