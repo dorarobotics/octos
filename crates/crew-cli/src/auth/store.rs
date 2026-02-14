@@ -82,14 +82,24 @@ impl AuthStore {
         std::fs::create_dir_all(dir)?;
 
         let json = serde_json::to_string_pretty(&self.data)?;
-        std::fs::write(&self.path, &json)?;
 
-        // Set file permissions to 0600 (owner read/write only)
+        // Create file with 0600 permissions atomically (no race window)
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.path, perms)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.path)?;
+            file.write_all(json.as_bytes())?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, &json)?;
         }
 
         Ok(())

@@ -3,7 +3,7 @@
 use crew_core::{InboundMessage, OutboundMessage};
 use tokio::sync::mpsc;
 
-const CHANNEL_SIZE: usize = 256;
+const CHANNEL_SIZE: usize = 4096;
 
 /// Handle given to the agent loop — receives inbound, sends outbound.
 pub struct AgentHandle {

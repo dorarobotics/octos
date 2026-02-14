@@ -191,12 +191,7 @@ impl fmt::Display for Error {
             } => {
                 write!(f, "{} API error ({})", provider, status)?;
                 if !body.is_empty() {
-                    let truncated = if body.len() > 200 {
-                        format!("{}...", &body[..200])
-                    } else {
-                        body.clone()
-                    };
-                    write!(f, ": {}", truncated)?;
+                    write!(f, ": {}", crate::truncated_utf8(body, 200, "..."))?;
                 }
             }
             ErrorKind::ToolError { tool, message } => {

@@ -134,7 +134,7 @@ impl Agent {
         *self
             .system_prompt
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = prompt;
+            .expect("system prompt lock poisoned") = prompt;
         self
     }
 
@@ -143,7 +143,7 @@ impl Agent {
         *self
             .system_prompt
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = prompt;
+            .expect("system prompt lock poisoned") = prompt;
     }
 
     /// The LLM model ID in use.
@@ -169,7 +169,7 @@ impl Agent {
             content: self
                 .system_prompt
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .expect("system prompt lock poisoned")
                 .clone(),
             media: vec![],
             tool_calls: None,
@@ -591,7 +591,7 @@ impl Agent {
             content: self
                 .system_prompt
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .expect("system prompt lock poisoned")
                 .clone(),
             media: vec![],
             tool_calls: None,
@@ -1077,8 +1077,13 @@ impl Agent {
             .filter(|(_, name, _)| !name.is_empty())
             .map(|(id, name, args)| {
                 let arguments = serde_json::from_str(&args).unwrap_or_else(|e| {
-                    tracing::warn!(tool = %name, error = %e, "malformed tool call JSON, using empty object");
-                    serde_json::Value::Object(Default::default())
+                    tracing::warn!(tool = %name, error = %e, raw = %args, "malformed tool call JSON");
+                    // Return a String value so the tool's deserialize step fails
+                    // and the error propagates back to the LLM for correction.
+                    serde_json::Value::String(format!(
+                        "MALFORMED_JSON: {e}. Raw input: {}",
+                        crew_core::truncated_utf8(&args, 200, "...")
+                    ))
                 });
                 crew_core::ToolCall {
                     id,

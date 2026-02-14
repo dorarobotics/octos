@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use ignore::WalkBuilder;
-use regex::Regex;
+use regex::RegexBuilder;
 use serde::Deserialize;
 
 use super::{Tool, ToolResult};
@@ -117,7 +117,9 @@ impl Tool for GrepTool {
                 pattern_str.clone()
             };
 
-            let regex = Regex::new(&regex_pattern)
+            let regex = RegexBuilder::new(&regex_pattern)
+                .size_limit(1 << 20) // 1 MB compiled regex limit (prevents ReDoS)
+                .build()
                 .wrap_err_with(|| format!("invalid regex: {}", pattern_str))?;
 
             let mut matches: Vec<String> = Vec::new();

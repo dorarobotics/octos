@@ -149,11 +149,16 @@ impl Tool for ShellTool {
                     result_text = "(no output)".to_string();
                 }
 
-                // Truncate if too long
+                // Truncate if too long (reserve space for exit code suffix)
+                let exit_suffix = format!("\n\nExit code: {exit_code}");
                 const MAX_OUTPUT: usize = 50000;
-                crew_core::truncate_utf8(&mut result_text, MAX_OUTPUT, "\n... (output truncated)");
+                crew_core::truncate_utf8(
+                    &mut result_text,
+                    MAX_OUTPUT - exit_suffix.len(),
+                    "\n... (output truncated)",
+                );
 
-                result_text.push_str(&format!("\n\nExit code: {exit_code}"));
+                result_text.push_str(&exit_suffix);
 
                 Ok(ToolResult {
                     output: result_text,

@@ -10,6 +10,8 @@ pub struct HybridIndex {
     inverted: HashMap<String, Vec<(usize, f32)>>,
     /// Document lengths (number of tokens per doc)
     doc_lengths: Vec<usize>,
+    /// Running total of all document lengths (avoids O(n) recomputation)
+    total_len: usize,
     /// Average document length
     avg_dl: f64,
     /// Episode IDs in insertion order
@@ -33,6 +35,7 @@ impl HybridIndex {
         Self {
             inverted: HashMap::new(),
             doc_lengths: Vec::new(),
+            total_len: 0,
             avg_dl: 0.0,
             ids: Vec::new(),
             texts: Vec::new(),
@@ -52,9 +55,9 @@ impl HybridIndex {
         let tokens = tokenize(text);
         self.doc_lengths.push(tokens.len());
 
-        // Recompute avg_dl
-        let total_len: usize = self.doc_lengths.iter().sum();
-        self.avg_dl = total_len as f64 / self.doc_lengths.len() as f64;
+        // Update avg_dl incrementally (O(1) instead of O(n))
+        self.total_len += tokens.len();
+        self.avg_dl = self.total_len as f64 / self.doc_lengths.len() as f64;
 
         // Count term frequencies
         let mut tf_map: HashMap<&str, u32> = HashMap::new();
