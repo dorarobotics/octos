@@ -45,7 +45,7 @@ Auth module (`crew-cli/src/auth/`): OAuth PKCE + device code for OpenAI, paste-t
 
 ### Tool System (`crew-agent/src/tools/`)
 
-All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> ToolResult`). Registered in `ToolRegistry` (HashMap). Tools: shell, read_file, write_file, edit_file, glob, grep, list_dir, web_search, web_fetch, message, spawn, cron, browser (feature-gated).
+All tools implement `Tool` trait (`spec() -> ToolSpec`, `execute(&Value) -> ToolResult`). Registered in `ToolRegistry` (HashMap). Tools: shell, read_file, write_file, edit_file, glob, grep, list_dir, web_search, web_fetch, message, spawn, cron, browser (feature-gated). Tool argument size limit: 1MB (non-allocating `estimate_json_size` with escape accounting). File tools use `O_NOFOLLOW` (Unix) for symlink-safe I/O. Shared SSRF protection in `tools/ssrf.rs`.
 
 **Tool Policies** (`tools/policy.rs`): Allow/deny lists with deny-wins semantics, wildcard matching (`exec*`), and named groups (`group:fs`, `group:runtime`, `group:search`, `group:web`, `group:sessions`). Provider-specific policies via `tools.byProvider` in config.
 
@@ -55,7 +55,7 @@ Three sandbox backends: `Bwrap` (Linux), `Macos` (sandbox-exec), `Docker`. Auto-
 
 ### MCP (`crew-agent/src/mcp.rs`)
 
-JSON-RPC stdio transport for MCP servers. Env var sanitization via shared `BLOCKED_ENV_VARS`.
+JSON-RPC stdio transport for MCP servers. Env var sanitization via shared `BLOCKED_ENV_VARS`. Input schema validation: max depth 10, max size 64KB — tools with invalid schemas are rejected at registration.
 
 ### Context Compaction (`crew-agent/src/compaction.rs`)
 
@@ -69,7 +69,7 @@ Token-aware message compaction: estimates tokens, strips tool arguments, summari
 
 - `EpisodeStore`: redb database at `.crew/episodes.redb`, stores task completion summaries
 - `MemoryStore`: Long-term memory (MEMORY.md), daily notes, recent memories (7-day window)
-- `HybridSearch`: BM25 + vector (cosine similarity) hybrid ranking with HNSW index (`hnsw_rs`). Falls back to BM25-only without embedding provider.
+- `HybridSearch`: BM25 + vector (cosine similarity) hybrid ranking with HNSW index (`hnsw_rs`). Configurable weights via `with_weights()` (default 0.7 vector / 0.3 BM25). Named HNSW constants. BM25 epsilon prevents NaN. Falls back to BM25-only without embedding provider.
 
 ### Message Coalescing (`crew-bus/src/coalesce.rs`)
 
@@ -77,7 +77,7 @@ Splits long messages into channel-safe chunks (paragraph > newline > sentence > 
 
 ### Session Management (`crew-bus/src/session.rs`)
 
-JSONL persistence with in-memory cache. Session forking (`/new` command) with parent_key tracking. Percent-encoded filenames. Atomic write-then-rename for crash safety.
+JSONL persistence with LRU in-memory cache. Session forking (`/new` command) with parent_key tracking. Percent-encoded filenames with hash suffix on truncation (prevents collisions). File size limit: 10MB. Atomic write-then-rename for crash safety.
 
 ### Hooks (`crew-agent/src/hooks.rs`)
 
@@ -90,7 +90,7 @@ SHA-256 hash-based change detection. Hot-reload for system prompt; restart-requi
 ## Key Types
 
 - `Task` (crew-core): UUID v7 ID, kind (Code/Plan/Review/Custom), status, context
-- `Message` (crew-core): role (System/User/Assistant/Tool), content, tool_call_id
+- `Message` (crew-core): role (System/User/Assistant/Tool), content, tool_call_id. `MessageRole` has `as_str()` and `Display` impl.
 - `ChatResponse` (crew-llm): content, tool_calls, stop_reason, token usage
 - `AgentConfig` (crew-agent): max_iterations (default 50), max_tokens, save_episodes
 - `truncate_utf8`/`truncated_utf8` (crew-core): Shared UTF-8 safe string truncation (in-place and copying variants)
@@ -101,9 +101,12 @@ SHA-256 hash-based change detection. Hot-reload for system prompt; restart-requi
 - Pure Rust TLS via rustls (no OpenSSL dependency)
 - `eyre`/`color-eyre` for error handling (not `anyhow`)
 - `Arc<dyn Trait>` for shared providers/tools/reporters
-- `AtomicBool` for shutdown signaling
+- `AtomicBool` for shutdown signaling (Release on store, Acquire on load)
 - API keys from env vars via `api_key_env` or OAuth via `crew auth login`
 - Email channel feature-gated: `async-imap` + `lettre` + `mailparse`
 - Browser tool feature-gated: headless Chrome via CDP over `tokio-tungstenite` + `which`
-- `ShellTool` has `SafePolicy` that denies dangerous commands (rm -rf /, dd, mkfs, fork bomb)
+- `ShellTool` has `SafePolicy` that denies dangerous commands (rm -rf /, dd, mkfs, fork bomb). Whitespace-normalized before matching. Timeout clamped to [1, 600]s.
 - `BLOCKED_ENV_VARS` shared across sandbox backends, MCP, hooks, and browser tool (18 vars: LD_PRELOAD, DYLD_*, NODE_OPTIONS, etc.)
+- Shared SSRF protection (`tools/ssrf.rs`): blocks private IPs, IPv6 ULA/link-local, IPv4-mapped/compatible addresses
+- Symlink-safe file I/O via `O_NOFOLLOW` on Unix (eliminates TOCTOU races)
+- API server (`crew serve`) binds to 127.0.0.1 by default (`--host` to override)
