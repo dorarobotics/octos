@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use reqwest::Client;
 use serde::Deserialize;
+use tracing::info;
 
 use super::{Tool, ToolResult};
 
@@ -155,6 +156,7 @@ impl Tool for WebSearchTool {
         let ddg_result = self.ddg_search(&input.query, count).await;
         if let Ok(ref r) = ddg_result {
             if r.success && !r.output.contains("No results found") {
+                info!(provider = "duckduckgo", query = %input.query, "web search");
                 return ddg_result;
             }
         }
@@ -164,6 +166,7 @@ impl Tool for WebSearchTool {
             let result = self.brave_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
+                    info!(provider = "brave", query = %input.query, "web search");
                     return result;
                 }
             }
@@ -174,6 +177,7 @@ impl Tool for WebSearchTool {
             let result = self.you_search(&input.query, count, &api_key).await;
             if let Ok(ref r) = result {
                 if r.success && !r.output.contains("No results found") {
+                    info!(provider = "you.com", query = %input.query, "web search");
                     return result;
                 }
             }
@@ -181,9 +185,11 @@ impl Tool for WebSearchTool {
 
         // Perplexity Sonar as last resort (AI-synthesized, costs money)
         if let Ok(api_key) = std::env::var("PERPLEXITY_API_KEY") {
+            info!(provider = "perplexity", query = %input.query, "web search");
             return self.perplexity_search(&input.query, &api_key).await;
         }
 
+        info!(provider = "duckduckgo (fallback)", query = %input.query, "web search");
         // Return whatever DDG gave us (even if empty)
         ddg_result
     }
