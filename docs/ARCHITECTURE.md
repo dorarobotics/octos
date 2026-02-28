@@ -188,27 +188,76 @@ pub enum StreamEvent {
 pub type ChatStream = Pin<Box<dyn Stream<Item = StreamEvent> + Send>>;
 ```
 
-### Native Providers
+### Provider Registry (`registry/`)
+
+All providers are defined in `crew-llm/src/registry/` — one file per provider. Each file exports a `ProviderEntry` with metadata (name, aliases, default model, API key env var, base URL) and a `create()` factory function. Adding a new provider = one file + one line in `mod.rs`.
+
+```rust
+pub struct ProviderEntry {
+    pub name: &'static str,              // canonical name
+    pub aliases: &'static [&'static str], // e.g. ["google"] for gemini
+    pub default_model: Option<&'static str>,
+    pub api_key_env: Option<&'static str>,
+    pub default_base_url: Option<&'static str>,
+    pub requires_api_key: bool,
+    pub requires_base_url: bool,          // true for vllm
+    pub requires_model: bool,             // true for vllm
+    pub detect_patterns: &'static [&'static str], // model→provider auto-detect
+    pub create: fn(CreateParams) -> Result<Arc<dyn LlmProvider>>,
+}
+
+pub struct CreateParams {
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub model_hints: Option<ModelHints>,  // config-level override
+}
+```
+
+**Lookup**: `registry::lookup(name)` — case-insensitive, matches canonical name or aliases.
+**Auto-detect**: `registry::detect_provider(model)` — infers provider from model name patterns.
+
+### Native Providers (4 protocol implementations)
 
 | Provider | Base URL | Auth Header | Image Format | Default Model |
 |----------|----------|-------------|--------------|---------------|
 | Anthropic | api.anthropic.com | x-api-key | Base64 blocks | claude-sonnet-4-20250514 |
 | OpenAI | api.openai.com/v1 | Authorization: Bearer | Data URI | gpt-4o |
-| Gemini | generativelanguage.googleapis.com/v1beta | x-goog-api-key | Base64 inline | gemini-2.0-flash |
+| Gemini | generativelanguage.googleapis.com/v1beta | x-goog-api-key | Base64 inline | gemini-2.5-flash |
 | OpenRouter | openrouter.ai/api/v1 | Authorization: Bearer | Data URI | anthropic/claude-sonnet-4-20250514 |
 
-**OpenAI-compatible** (all via `OpenAIProvider::with_base_url()`):
+### OpenAI-Compatible Providers (via `OpenAIProvider::with_base_url()`)
 
-| Provider | Base URL | Default Model | API Key Env |
-|----------|----------|---------------|-------------|
-| DeepSeek | api.deepseek.com/v1 | deepseek-chat | DEEPSEEK_API_KEY |
-| Groq | api.groq.com/openai/v1 | llama-3.3-70b-versatile | GROQ_API_KEY |
-| Moonshot | api.moonshot.ai/v1 | kimi-k2.5 | MOONSHOT_API_KEY |
-| DashScope | dashscope.aliyuncs.com/compatible-mode/v1 | qwen-max | DASHSCOPE_API_KEY |
-| MiniMax | api.minimax.io/v1 | MiniMax-Text-01 | MINIMAX_API_KEY |
-| Zhipu | open.bigmodel.cn/api/paas/v4 | glm-4-plus | ZHIPU_API_KEY |
-| Ollama | localhost:11434/v1 | llama3.2 | (none) |
-| vLLM | (user-provided) | (user-provided) | (user-provided) |
+| Provider | Aliases | Base URL | Default Model | API Key Env |
+|----------|---------|----------|---------------|-------------|
+| DeepSeek | — | api.deepseek.com/v1 | deepseek-chat | DEEPSEEK_API_KEY |
+| Groq | — | api.groq.com/openai/v1 | llama-3.3-70b-versatile | GROQ_API_KEY |
+| Moonshot | kimi | api.moonshot.ai/v1 | kimi-k2.5 | MOONSHOT_API_KEY |
+| DashScope | qwen | dashscope.aliyuncs.com/compatible-mode/v1 | qwen-max | DASHSCOPE_API_KEY |
+| MiniMax | — | api.minimax.io/v1 | MiniMax-Text-01 | MINIMAX_API_KEY |
+| Zhipu | glm | open.bigmodel.cn/api/paas/v4 | glm-4-plus | ZHIPU_API_KEY |
+| Nvidia | nim | integrate.api.nvidia.com/v1 | meta/llama-3.3-70b-instruct | NVIDIA_API_KEY |
+| Ollama | — | localhost:11434/v1 | llama3.2 | (none) |
+| vLLM | — | (user-provided) | (user-provided) | VLLM_API_KEY |
+
+### Anthropic-Compatible Provider
+
+| Provider | Aliases | Base URL | Default Model | API Key Env |
+|----------|---------|----------|---------------|-------------|
+| Z.AI | zai, z.ai | api.z.ai/api/anthropic | glm-5 | ZAI_API_KEY |
+
+### ModelHints (OpenAI provider)
+
+Auto-detected from model name at construction, overridable via config `model_hints`:
+
+```rust
+pub struct ModelHints {
+    pub uses_completion_tokens: bool,  // o-series, gpt-5, gpt-4.1
+    pub fixed_temperature: bool,       // o-series, kimi-k2.5
+    pub lacks_vision: bool,            // deepseek, minimax, mistral, yi-
+    pub merge_system_messages: bool,   // default: true
+}
+```
 
 ### SSE Streaming
 
@@ -959,7 +1008,7 @@ Loaded from `.crew/config.json` (local) or `~/.config/crew/config.json` (global)
 
 - **`${VAR}` expansion**: Environment variable substitution in string values
 - **Versioned config**: Version field with automatic `migrate_config()` framework
-- **Provider auto-detect** (`detect_provider(model)`): claude→anthropic, gpt/o1/o3/o4→openai, gemini→gemini, deepseek→deepseek, kimi/moonshot→moonshot, qwen→dashscope, glm→zhipu, llama/mixtral→groq
+- **Provider auto-detect** (`registry::detect_provider(model)`): claude→anthropic, gpt/o1/o3/o4→openai, gemini→gemini, deepseek→deepseek, kimi/moonshot→moonshot, qwen→dashscope, glm→zhipu, llama/mixtral→groq. Patterns defined per-provider in `registry/`.
 
 **API key resolution order**: Auth store (`~/.crew/auth.json`) → environment variable.
 
@@ -1080,7 +1129,10 @@ crates/
 ├── crew-llm/src/
 │   ├── lib.rs, provider.rs, config.rs, types.rs, retry.rs, failover.rs, sse.rs
 │   ├── embedding.rs, pricing.rs, context.rs, transcription.rs, vision.rs
-│   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs
+│   ├── anthropic.rs, openai.rs, gemini.rs, openrouter.rs  (protocol impls)
+│   └── registry/ (mod.rs + 14 provider entries: anthropic, openai, gemini,
+│                   openrouter, deepseek, groq, moonshot, dashscope, minimax,
+│                   zhipu, zai, nvidia, ollama, vllm)
 ├── crew-memory/src/
 │   ├── lib.rs, episode.rs, store.rs, memory_store.rs, hybrid_search.rs
 ├── crew-agent/src/
@@ -1143,6 +1195,89 @@ crates/
 - MCP response limit: 1MB per JSON-RPC line (DoS prevention)
 - Message coalescing: MAX_CHUNKS=50 DoS limit
 - API message limit: 1MB per request
+
+---
+
+## Concurrency Model
+
+### Why Rust
+
+crew-rs uses Rust with the tokio async runtime, which provides significant advantages over Python (OpenClaw, etc.) and Node.js (NanoCloud, etc.) agent frameworks for concurrent session handling:
+
+**True parallelism** — Tokio tasks run across all CPU cores simultaneously. Python has the GIL, so even with asyncio, CPU-bound work (JSON parsing, context compaction, token counting) is single-core. Node.js is single-threaded entirely. In crew-rs, 10 concurrent sessions doing context compaction actually execute in parallel across cores.
+
+**Memory efficiency** — No garbage collector, no runtime overhead per object. Agent sessions are compact structs on the heap. A Python agent session carries interpreter overhead, GC metadata on every object, and dict-based attribute lookup. This matters with hundreds of sessions and large conversation histories in memory.
+
+**No GC pauses** — Python and Node.js GC can cause latency spikes mid-response. Rust has deterministic deallocation — memory is freed exactly when the owning struct drops.
+
+**Single binary deployment** — No Python/Node runtime to install, no dependency hell, predictable resource usage. The gateway is one static binary.
+
+### Tokio Tasks vs OS Threads
+
+All concurrent session processing uses tokio tasks (green threads), not OS threads. A tokio task is a state machine on the heap (~few KB). An OS thread is ~8MB stack. Thousands of tasks multiplex across a handful of OS threads (defaults to CPU core count). Since agent sessions spend most of their time awaiting I/O (LLM API responses), they yield the thread to other tasks efficiently.
+
+### Gateway Concurrency
+
+```
+Inbound messages → main loop
+                      │
+                      ├─ tokio::spawn() per message
+                      │     │
+                      │     ├─ Semaphore (max_concurrent_sessions, default 10)
+                      │     │     bounds total concurrent agent runs
+                      │     │
+                      │     └─ Per-session Mutex
+                      │           serializes messages within same session
+                      │
+                      └─ Different sessions run concurrently
+                         Same session queues sequentially
+```
+
+- **Cross-session**: concurrent, bounded by `max_concurrent_sessions` semaphore (default 10)
+- **Within same session**: serialized via per-session mutex — prevents race conditions on conversation history
+- **Per-session locks**: pruned after completion (Arc strong_count == 1) to prevent unbounded HashMap growth
+
+### Tool Execution
+
+Within a single agent iteration, all tool calls from one LLM response execute concurrently via `join_all()`:
+
+```
+LLM response: [web_search, read_file, send_email]
+                   │            │           │
+                   └────────────┼───────────┘
+                          join_all()
+                   ┌────────────┼───────────┐
+                   │            │           │
+                 done         done        done
+                          ↓
+              All results appended to messages
+                          ↓
+                    Next LLM call
+```
+
+### Sub-Agent Modes (spawn tool)
+
+| Aspect | Sync | Background |
+|--------|------|------------|
+| Parent blocks? | Yes | No (`tokio::spawn()`) |
+| Result delivery | Same conversation turn | New inbound message via gateway |
+| Token accounting | Counted toward parent budget | Independent |
+| Use case | Sequential pipelines | Fire-and-forget long tasks |
+
+Sub-agents cannot spawn further sub-agents (spawn tool is always denied in sub-agent policy).
+
+### Multi-Tenant Dashboard
+
+The dashboard (`crew serve`) runs each user profile as a **separate gateway OS process**:
+
+```
+Dashboard (crew serve)
+  ├─ Profile "alice" → crew gateway --config alice.json  (deepseek, own semaphore)
+  ├─ Profile "bob"   → crew gateway --config bob.json    (kimi, own semaphore)
+  └─ Profile "carol" → crew gateway --config carol.json  (openai, own semaphore)
+```
+
+Each profile has its own LLM provider, API keys, channels, data directory, and `max_concurrent_sessions` semaphore. Profiles are fully isolated — no shared state between gateway processes.
 
 ---
 

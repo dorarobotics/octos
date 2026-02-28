@@ -5,6 +5,34 @@
 
 use std::net::IpAddr;
 
+/// Validate a URL against SSRF protections: checks scheme, hostname, and DNS resolution.
+/// Returns `Some(error_message)` if the URL should be blocked, `None` if it's safe.
+pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return Some("Invalid URL".to_string()),
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h,
+        None => return Some("URL has no host".to_string()),
+    };
+    if is_private_host(host) {
+        return Some("Requests to private/internal hosts are not allowed".to_string());
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
+        for addr in addrs {
+            if is_private_ip(&addr.ip()) {
+                return Some(
+                    "Requests to private/internal hosts are not allowed (DNS resolved to private IP)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    None
+}
+
 /// Check if a hostname is private/internal (string check + IP parse).
 pub fn is_private_host(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();

@@ -12,7 +12,7 @@ export default function Dashboard() {
 
   // Non-admins go straight to their profile
   if (!isAdmin) {
-    return <Navigate to="/my-profile" replace />
+    return <Navigate to="/my" replace />
   }
   const { toast } = useToast()
   const [actionLoading, setActionLoading] = useState(false)

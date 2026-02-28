@@ -9,6 +9,7 @@ mod cron;
 mod docs;
 mod gateway;
 mod init;
+mod office;
 #[cfg(feature = "api")]
 mod serve;
 mod skills;
@@ -28,6 +29,7 @@ pub use cron::CronCommand;
 pub use docs::DocsCommand;
 pub use gateway::GatewayCommand;
 pub use init::InitCommand;
+pub use office::OfficeCommand;
 #[cfg(feature = "api")]
 pub use serve::ServeCommand;
 pub use skills::SkillsCommand;
@@ -70,6 +72,8 @@ pub enum Command {
     Clean(CleanCommand),
     /// Generate shell completions.
     Completions(CompletionsCommand),
+    /// Office file manipulation (extract, unpack, pack, clean, add-slide, validate).
+    Office(OfficeCommand),
 }
 
 /// Trait for executable commands (following dora-rs pattern).
@@ -127,6 +131,7 @@ impl Executable for Command {
             Self::Gateway(cmd) => cmd.execute(),
             Self::Clean(cmd) => cmd.execute(),
             Self::Completions(cmd) => cmd.execute(),
+            Self::Office(cmd) => cmd.execute(),
         }
     }
 }

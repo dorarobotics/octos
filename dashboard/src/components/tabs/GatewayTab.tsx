@@ -29,7 +29,7 @@ export default function GatewayTab({ config, onChange }: Props) {
             updateGateway('max_history', e.target.value ? Number(e.target.value) : null)
           }
           placeholder="50"
-          className="input"
+          className="input max-w-[200px]"
         />
         <p className="text-[10px] text-gray-600 mt-1">
           Maximum number of messages to keep in conversation history
@@ -45,10 +45,42 @@ export default function GatewayTab({ config, onChange }: Props) {
             updateGateway('max_iterations', e.target.value ? Number(e.target.value) : null)
           }
           placeholder="50"
-          className="input"
+          className="input max-w-[200px]"
         />
         <p className="text-[10px] text-gray-600 mt-1">
           Maximum tool-call iterations per agent turn
+        </p>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-gray-300 mb-1.5">Max Concurrent Sessions</label>
+        <input
+          type="number"
+          value={config.gateway.max_concurrent_sessions ?? ''}
+          onChange={(e) =>
+            updateGateway('max_concurrent_sessions', e.target.value ? Number(e.target.value) : null)
+          }
+          placeholder="10"
+          className="input max-w-[200px]"
+        />
+        <p className="text-[10px] text-gray-600 mt-1">
+          Maximum number of concurrent chat sessions (default: unlimited)
+        </p>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-gray-300 mb-1.5">Browser Timeout (seconds)</label>
+        <input
+          type="number"
+          value={config.gateway.browser_timeout_secs ?? ''}
+          onChange={(e) =>
+            updateGateway('browser_timeout_secs', e.target.value ? Number(e.target.value) : null)
+          }
+          placeholder="30"
+          className="input max-w-[200px]"
+        />
+        <p className="text-[10px] text-gray-600 mt-1">
+          Timeout for headless browser tool operations
         </p>
       </div>
 

@@ -15,7 +15,6 @@ pub mod cron_tool;
 pub mod otp;
 #[cfg(feature = "api")]
 pub mod process_manager;
-#[cfg(feature = "api")]
 pub mod profiles;
 #[cfg(feature = "api")]
 pub mod user_store;

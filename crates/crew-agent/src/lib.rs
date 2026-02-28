@@ -29,10 +29,12 @@ pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentRepor
 pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use tools::{
-    DeepResearchTool, DeepSearchTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
-    MessageTool, ReadFileTool, RecallMemoryTool, ResearchNotification, SaveMemoryTool,
-    SendFileTool, ShellTool, SpawnTool, TakePhotoTool, Tool, ToolPolicy, ToolRegistry, ToolResult,
-    WebFetchTool, WebSearchTool, WriteFileTool,
+    BrowserTool, ConfigureToolTool, DeepCrawlTool, DeepResearchTool, DeepSearchTool, DiffEditTool,
+    EditFileTool, EmailSender, FeishuEmailSender, GlobTool, GrepTool, ListDirTool, MessageTool,
+    NewsDigestTool, ReadFileTool, RecallMemoryTool, ResearchNotification, SaveMemoryTool,
+    SendEmailTool, SendFileTool, ShellTool, SmtpEmailSender, SpawnTool, TakePhotoTool, Tool,
+    ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
+    WriteFileTool,
 };
 
 #[cfg(test)]

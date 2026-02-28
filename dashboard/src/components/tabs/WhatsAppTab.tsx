@@ -169,9 +169,17 @@ export default function WhatsAppTab({ config, onChange, isRunning }: Props) {
                   )}
 
                   {qrInfo.status === 'connected' && (
-                    <p className="text-xs text-green-400/80">
-                      WhatsApp is connected and ready to receive messages.
-                    </p>
+                    <div className="space-y-1.5">
+                      <p className="text-xs text-green-400/80">
+                        WhatsApp is connected and ready to receive messages.
+                      </p>
+                      {qrInfo.lid && (
+                        <p className="text-xs text-gray-400">
+                          Assistant ID: <span className="font-mono text-gray-300">{qrInfo.lid}</span>
+                          <span className="text-gray-600 ml-1">— search this in WhatsApp to find the assistant</span>
+                        </p>
+                      )}
+                    </div>
                   )}
 
                   <p className="text-[10px] text-gray-600 mt-2">

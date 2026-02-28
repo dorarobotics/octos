@@ -1,5 +1,6 @@
 //! Web fetch tool for retrieving URL content.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,6 +12,7 @@ use super::{Tool, ToolResult};
 
 pub struct WebFetchTool {
     client: Client,
+    config: Option<Arc<super::tool_config::ToolConfigStore>>,
 }
 
 impl WebFetchTool {
@@ -21,7 +23,13 @@ impl WebFetchTool {
                 .user_agent("crew-rs/0.1 (web-fetch-tool)")
                 .build()
                 .expect("failed to build HTTP client"),
+            config: None,
         }
+    }
+
+    pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -34,18 +42,10 @@ impl Default for WebFetchTool {
 #[derive(Deserialize)]
 struct Input {
     url: String,
-    #[serde(default = "default_extract_mode")]
-    extract_mode: String,
-    #[serde(default = "default_max_chars")]
-    max_chars: usize,
-}
-
-fn default_extract_mode() -> String {
-    "markdown".to_string()
-}
-
-fn default_max_chars() -> usize {
-    50_000
+    #[serde(default)]
+    extract_mode: Option<String>,
+    #[serde(default)]
+    max_chars: Option<usize>,
 }
 
 #[async_trait]
@@ -87,6 +87,19 @@ impl Tool for WebFetchTool {
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid web_fetch input")?;
+
+        let (cfg_extract_mode, cfg_max_chars) = match &self.config {
+            Some(c) => (
+                c.get_str("web_fetch", "extract_mode").await,
+                c.get_usize("web_fetch", "max_chars").await,
+            ),
+            None => (None, None),
+        };
+        let extract_mode = input
+            .extract_mode
+            .or(cfg_extract_mode)
+            .unwrap_or_else(|| "markdown".to_string());
+        let max_chars = input.max_chars.or(cfg_max_chars).unwrap_or(50_000);
 
         if !input.url.starts_with("http://") && !input.url.starts_with("https://") {
             return Ok(ToolResult {
@@ -159,7 +172,7 @@ impl Tool for WebFetchTool {
 
         let is_html = content_type.contains("text/html");
         let mut content = if is_html {
-            match input.extract_mode.as_str() {
+            match extract_mode.as_str() {
                 "text" => extract_text(&body),
                 _ => extract_markdown(&body),
             }
@@ -167,7 +180,7 @@ impl Tool for WebFetchTool {
             body
         };
 
-        crew_core::truncate_utf8(&mut content, input.max_chars, "\n\n... (content truncated)");
+        crew_core::truncate_utf8(&mut content, max_chars, "\n\n... (content truncated)");
 
         let mut output = format!("URL: {final_url}\n");
         if final_url != input.url {

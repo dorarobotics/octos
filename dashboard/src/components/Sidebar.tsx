@@ -1,46 +1,74 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useMatch, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function Sidebar() {
   const { user, isAdmin, logout } = useAuth()
 
-  const links = isAdmin
-    ? [
-        { to: '/', label: 'Dashboard', icon: GridIcon },
-        { to: '/my-profile', label: 'My Profile', icon: UserIcon },
-        { to: '/users', label: 'Users', icon: UsersIcon },
-        { to: '/settings', label: 'Settings', icon: GearIcon },
-      ]
-    : [
-        { to: '/my-profile', label: 'My Profile', icon: UserIcon },
-        { to: '/settings', label: 'Settings', icon: GearIcon },
-      ]
+  // Detect if we're on a profile route
+  const adminProfileMatch = useMatch('/profile/:id/*')
+  const myProfileMatch = useMatch('/my/*')
+  const isProfileMode = !!(adminProfileMatch || myProfileMatch)
+
+  // Build the base path for profile navigation links
+  const profileBase = adminProfileMatch
+    ? `/profile/${adminProfileMatch.params.id}`
+    : '/my'
 
   return (
     <aside className="fixed top-0 left-0 w-56 h-screen bg-surface border-r border-gray-700/50 flex flex-col z-10">
+      {/* Brand */}
       <div className="px-4 py-5 border-b border-gray-700/50">
         <h1 className="text-lg font-bold text-white tracking-tight">
-          <span className="text-accent">crew-rs</span>{isAdmin ? ' Admin' : ''}
+          <span className="text-accent">crew-rs</span>
+          {isAdmin ? ' Admin' : ''}
         </h1>
       </div>
-      <nav className="flex-1 px-3 py-4 space-y-1">
-        {links.map(({ to, label, icon: Icon }) => (
-          <NavLink
-            key={to}
-            to={to}
-            end={to === '/' || to === '/my-profile'}
-            className={({ isActive }) =>
-              `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-                isActive
-                  ? 'bg-accent/15 text-accent'
-                  : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
-              }`
-            }
-          >
-            <Icon />
-            {label}
-          </NavLink>
-        ))}
+
+      <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
+        {isProfileMode ? (
+          <>
+            {/* Back to dashboard (admin only) */}
+            {isAdmin && adminProfileMatch && (
+              <Link
+                to="/"
+                className="flex items-center gap-2 px-3 py-2 mb-3 text-xs text-gray-500 hover:text-gray-300 transition-colors"
+              >
+                <ChevronLeftIcon />
+                All Profiles
+              </Link>
+            )}
+
+            {/* Profile category navigation */}
+            <SidebarLink to={profileBase} end icon={<HomeIcon />} label="Home" />
+            <SidebarLink to={`${profileBase}/llm`} icon={<CpuIcon />} label="LLM Providers" />
+            <SidebarLink to={`${profileBase}/messaging`} icon={<MessageIcon />} label="Messaging" />
+            <SidebarLink to={`${profileBase}/tools`} icon={<WrenchIcon />} label="Tools" />
+            <SidebarLink to={`${profileBase}/system`} icon={<CogIcon />} label="System" />
+
+            {/* Admin links (separator + bottom section) */}
+            {isAdmin && (
+              <>
+                <div className="border-t border-gray-700/30 my-3" />
+                <SidebarLink to="/" end icon={<GridIcon />} label="All Profiles" />
+                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            {/* Global navigation */}
+            {isAdmin && (
+              <>
+                <SidebarLink to="/" end icon={<GridIcon />} label="Dashboard" />
+                <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
+                <SidebarLink to="/users" icon={<UsersIcon />} label="Users" />
+              </>
+            )}
+            {!isAdmin && (
+              <SidebarLink to="/my" icon={<UserIcon />} label="My Profile" />
+            )}
+          </>
+        )}
       </nav>
 
       {/* User info + logout */}
@@ -68,19 +96,80 @@ export default function Sidebar() {
   )
 }
 
-function GridIcon() {
+function SidebarLink({ to, end, icon, label }: { to: string; end?: boolean; icon: React.ReactNode; label: string }) {
   return (
-    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-      <path strokeLinecap="round" strokeLinejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
+    <NavLink
+      to={to}
+      end={end}
+      className={({ isActive }) =>
+        `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+          isActive
+            ? 'bg-accent/15 text-accent'
+            : 'text-gray-400 hover:text-gray-200 hover:bg-white/5'
+        }`
+      }
+    >
+      {icon}
+      {label}
+    </NavLink>
+  )
+}
+
+// ── Icons ──
+
+function ChevronLeftIcon() {
+  return (
+    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
     </svg>
   )
 }
 
-function GearIcon() {
+function HomeIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+    </svg>
+  )
+}
+
+function CpuIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />
+    </svg>
+  )
+}
+
+function MessageIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+    </svg>
+  )
+}
+
+function WrenchIcon() {
   return (
     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
       <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
       <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+    </svg>
+  )
+}
+
+function CogIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+    </svg>
+  )
+}
+
+function GridIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" />
     </svg>
   )
 }

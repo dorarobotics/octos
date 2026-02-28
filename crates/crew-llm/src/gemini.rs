@@ -39,7 +39,7 @@ impl GeminiProvider {
         let api_key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("GOOGLE_API_KEY"))
             .wrap_err("GEMINI_API_KEY or GOOGLE_API_KEY environment variable not set")?;
-        Ok(Self::new(api_key, "gemini-2.0-flash"))
+        Ok(Self::new(api_key, "gemini-2.5-flash"))
     }
 
     /// Set a custom base URL.

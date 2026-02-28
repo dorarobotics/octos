@@ -44,6 +44,10 @@ crew-rs is a Rust-native AI agent framework that operates in two modes:
 
 - Rust 1.85.0 or later
 - An API key from at least one supported provider
+- (Optional) Node.js, `npm install -g pptxgenjs` — PPTX creation skill
+- (Optional) `ffmpeg` — video/animation skills (mofa-pptx)
+- (Optional) LibreOffice, Poppler (`pdftoppm`) — office document conversion and visual QA
+- (Optional) Chrome/Chromium — browser automation
 
 ### From Source
 

@@ -84,7 +84,18 @@ Rust-native AI agent framework with multi-channel gateway, 12+ LLM providers, we
 - **Rust 1.85.0+** (Edition 2024)
 - At least one LLM API key (e.g., `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`)
 - (Optional) Chrome/Chromium for browser automation
-- (Optional) Node.js for WhatsApp bridge
+- (Optional) Node.js for WhatsApp bridge and pptxgenjs skill
+- (Optional) `ffmpeg` for video/animation skills (mofa-pptx)
+- (Optional) LibreOffice (`soffice`) and Poppler (`pdftoppm`) for office document conversion and visual QA
+
+#### macOS (Homebrew)
+
+```bash
+# System dependencies for skills (optional but recommended)
+brew install node ffmpeg poppler
+brew install --cask libreoffice
+npm install -g pptxgenjs react-icons react react-dom sharp
+```
 
 ### Build from Source
 

@@ -227,11 +227,13 @@ impl Channel for WhatsAppChannel {
                             continue;
                         }
 
-                        // Use the full JID as chat_id for groups, clean number for DMs
-                        let chat_id = if is_group {
-                            sender.to_string()
+                        // Use the full JID as chat_id so the bridge can send replies
+                        // to the correct address (especially important for @lid JIDs).
+                        let chat_id = if let Some(cid) = msg.get("chatId").and_then(|v| v.as_str())
+                        {
+                            cid.to_string()
                         } else {
-                            clean_id.to_string()
+                            sender.to_string()
                         };
 
                         let inbound = InboundMessage {

@@ -1073,7 +1073,10 @@ impl FeishuChannel {
                                 return axum::http::Response::builder()
                                     .status(400)
                                     .header("Content-Type", "application/json")
-                                    .body(serde_json::json!({"error": "decrypt parse error"}).to_string())
+                                    .body(
+                                        serde_json::json!({"error": "decrypt parse error"})
+                                            .to_string(),
+                                    )
                                     .unwrap();
                             }
                         },

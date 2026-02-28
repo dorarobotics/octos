@@ -16,21 +16,94 @@ use crate::provider::LlmProvider;
 use crate::sse::SseEvent;
 use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
 
+/// Declarative hints about model API behavior.
+///
+/// Controls how requests are serialized for OpenAI-compatible endpoints.
+/// By default, hints are auto-detected from the model name at construction time.
+/// Users can override them via config for custom/unknown models.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelHints {
+    /// Use `max_completion_tokens` instead of `max_tokens`.
+    #[serde(default)]
+    pub uses_completion_tokens: bool,
+
+    /// Model does not support custom temperature.
+    #[serde(default)]
+    pub fixed_temperature: bool,
+
+    /// Model lacks vision/multimodal support (images stripped from requests).
+    #[serde(default)]
+    pub lacks_vision: bool,
+
+    /// Merge consecutive system messages into one (some providers reject multiples).
+    #[serde(default = "default_true")]
+    pub merge_system_messages: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ModelHints {
+    fn default() -> Self {
+        Self {
+            uses_completion_tokens: false,
+            fixed_temperature: false,
+            lacks_vision: false,
+            merge_system_messages: true,
+        }
+    }
+}
+
+impl ModelHints {
+    /// Auto-detect hints from a model name string.
+    ///
+    /// This is the single canonical location for all model-name heuristics.
+    /// Called once at provider construction time, not on every request.
+    pub fn detect(model: &str) -> Self {
+        let m = model.to_lowercase();
+
+        let is_o_series = m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4");
+
+        let uses_completion_tokens =
+            is_o_series || m.starts_with("gpt-5") || m.starts_with("gpt-4.1");
+
+        let fixed_temperature = is_o_series || m.contains("k2.5");
+
+        let lacks_vision = m.starts_with("deepseek")
+            || m.starts_with("minimax")
+            || m.contains("codestral")
+            || m.starts_with("mistral")
+            || m.starts_with("yi-");
+
+        Self {
+            uses_completion_tokens,
+            fixed_temperature,
+            lacks_vision,
+            merge_system_messages: true,
+        }
+    }
+}
+
 /// OpenAI GPT provider.
 pub struct OpenAIProvider {
     client: Client,
     api_key: SecretString,
     model: String,
     base_url: String,
+    hints: ModelHints,
 }
 
 impl OpenAIProvider {
     /// Create a new OpenAI provider.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let hints = ModelHints::detect(&model);
         Self {
             client: Client::new(),
             api_key: SecretString::from(api_key.into()),
-            model: model.into(),
+            hints,
+            model,
             base_url: "https://api.openai.com/v1".to_string(),
         }
     }
@@ -45,6 +118,12 @@ impl OpenAIProvider {
     /// Set a custom base URL (for Azure, local proxies, etc.).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Override the auto-detected model hints.
+    pub fn with_hints(mut self, hints: ModelHints) -> Self {
+        self.hints = hints;
         self
     }
 
@@ -74,16 +153,19 @@ impl OpenAIProvider {
                 });
                 OpenAIMessage {
                     role,
-                    content: build_openai_content(m, &self.model),
+                    content: build_openai_content(m, &self.hints),
                     reasoning_content: m.reasoning_content.as_deref(),
                     tool_call_id: m.tool_call_id.as_deref(),
                     tool_calls,
                 }
             })
             .collect();
-        // Merge consecutive system messages into one (some providers like
-        // MiniMax reject multiple system messages with error 2013).
-        let openai_messages = merge_system_messages(openai_messages);
+
+        let openai_messages = if self.hints.merge_system_messages {
+            merge_system_messages(openai_messages)
+        } else {
+            openai_messages
+        };
 
         let openai_tools: Option<Vec<OpenAITool>> = if tools.is_empty() {
             None
@@ -103,17 +185,7 @@ impl OpenAIProvider {
             )
         };
 
-        // GPT-5+, o1, o3, o4 models use max_completion_tokens instead of max_tokens
-        let uses_completion_tokens = self.model.starts_with("gpt-5")
-            || self.model.starts_with("o1")
-            || self.model.starts_with("o3")
-            || self.model.starts_with("o4");
-
-        // Some models (o1, o3, kimi-k2.5) don't support custom temperature
-        let fixed_temperature = self.model.starts_with("o1")
-            || self.model.starts_with("o3")
-            || self.model.contains("k2.5");
-        let temperature = if fixed_temperature {
+        let temperature = if self.hints.fixed_temperature {
             None
         } else {
             config.temperature
@@ -122,12 +194,12 @@ impl OpenAIProvider {
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
-            max_tokens: if uses_completion_tokens {
+            max_tokens: if self.hints.uses_completion_tokens {
                 None
             } else {
                 config.max_tokens
             },
-            max_completion_tokens: if uses_completion_tokens {
+            max_completion_tokens: if self.hints.uses_completion_tokens {
                 config.max_tokens.or(Some(4096))
             } else {
                 None
@@ -349,18 +421,8 @@ fn merge_system_messages(messages: Vec<OpenAIMessage<'_>>) -> Vec<OpenAIMessage<
     result
 }
 
-/// Check if a model is known to lack vision/multimodal support.
-fn model_lacks_vision(model: &str) -> bool {
-    let m = model.to_lowercase();
-    m.starts_with("deepseek")
-        || m.starts_with("minimax")
-        || m.contains("codestral")
-        || m.starts_with("mistral")
-        || m.starts_with("yi-")
-}
-
-fn build_openai_content(msg: &Message, model: &str) -> Option<OpenAIContent> {
-    let images: Vec<_> = if model_lacks_vision(model) {
+fn build_openai_content(msg: &Message, hints: &ModelHints) -> Option<OpenAIContent> {
+    let images: Vec<_> = if hints.lacks_vision {
         vec![]
     } else {
         msg.media.iter().filter(|p| vision::is_image(p)).collect()
@@ -368,22 +430,21 @@ fn build_openai_content(msg: &Message, model: &str) -> Option<OpenAIContent> {
 
     if images.is_empty() {
         // If media was stripped due to model not supporting vision, note it in text
-        let media_note =
-            if model_lacks_vision(model) && msg.media.iter().any(|p| vision::is_image(p)) {
-                let filenames: Vec<_> = msg
-                    .media
-                    .iter()
-                    .map(|p| {
-                        std::path::Path::new(p)
-                            .file_name()
-                            .map(|f| f.to_string_lossy().to_string())
-                            .unwrap_or_else(|| p.clone())
-                    })
-                    .collect();
-                Some(format!("[attached media: {}]", filenames.join(", ")))
-            } else {
-                None
-            };
+        let media_note = if hints.lacks_vision && msg.media.iter().any(|p| vision::is_image(p)) {
+            let filenames: Vec<_> = msg
+                .media
+                .iter()
+                .map(|p| {
+                    std::path::Path::new(p)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            Some(format!("[attached media: {}]", filenames.join(", ")))
+        } else {
+            None
+        };
 
         if msg.content.is_empty() && media_note.is_none() {
             // Tool messages require a content string (OpenAI spec).
@@ -559,6 +620,127 @@ mod tests {
             reasoning_content: None,
             timestamp: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn test_detect_gpt4o() {
+        let h = ModelHints::detect("gpt-4o");
+        assert!(!h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+        assert!(!h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_gpt4o_mini() {
+        let h = ModelHints::detect("gpt-4o-mini");
+        assert!(!h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+    }
+
+    #[test]
+    fn test_detect_gpt41() {
+        let h = ModelHints::detect("gpt-4.1");
+        assert!(h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+        assert!(!h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_gpt41_mini() {
+        let h = ModelHints::detect("gpt-4.1-mini");
+        assert!(h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+    }
+
+    #[test]
+    fn test_detect_gpt5() {
+        let h = ModelHints::detect("gpt-5.3-codex");
+        assert!(h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+    }
+
+    #[test]
+    fn test_detect_o3() {
+        let h = ModelHints::detect("o3-mini");
+        assert!(h.uses_completion_tokens);
+        assert!(h.fixed_temperature);
+        assert!(!h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_o1() {
+        let h = ModelHints::detect("o1-preview");
+        assert!(h.uses_completion_tokens);
+        assert!(h.fixed_temperature);
+    }
+
+    #[test]
+    fn test_detect_kimi_k25() {
+        let h = ModelHints::detect("kimi-k2.5");
+        assert!(!h.uses_completion_tokens);
+        assert!(h.fixed_temperature);
+        assert!(!h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_deepseek() {
+        let h = ModelHints::detect("deepseek-chat");
+        assert!(!h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+        assert!(h.lacks_vision);
+    }
+
+    #[test]
+    fn test_detect_minimax() {
+        let h = ModelHints::detect("MiniMax-Text-01");
+        assert!(h.lacks_vision);
+        assert!(h.merge_system_messages);
+    }
+
+    #[test]
+    fn test_detect_unknown_model() {
+        let h = ModelHints::detect("my-custom-model");
+        assert!(!h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+        assert!(!h.lacks_vision);
+        assert!(h.merge_system_messages);
+    }
+
+    #[test]
+    fn test_model_hints_serde_roundtrip() {
+        let hints = ModelHints {
+            uses_completion_tokens: true,
+            fixed_temperature: false,
+            lacks_vision: true,
+            merge_system_messages: false,
+        };
+        let json = serde_json::to_string(&hints).unwrap();
+        let parsed: ModelHints = serde_json::from_str(&json).unwrap();
+        assert_eq!(hints, parsed);
+    }
+
+    #[test]
+    fn test_model_hints_deserialize_partial() {
+        let json = r#"{"uses_completion_tokens": true}"#;
+        let h: ModelHints = serde_json::from_str(json).unwrap();
+        assert!(h.uses_completion_tokens);
+        assert!(!h.fixed_temperature);
+        assert!(!h.lacks_vision);
+        assert!(h.merge_system_messages);
+    }
+
+    #[test]
+    fn test_with_hints_overrides_detection() {
+        let p = OpenAIProvider::new("key", "gpt-4o").with_hints(ModelHints {
+            uses_completion_tokens: true,
+            fixed_temperature: true,
+            lacks_vision: true,
+            merge_system_messages: false,
+        });
+        assert!(p.hints.uses_completion_tokens);
+        assert!(p.hints.fixed_temperature);
+        assert!(p.hints.lacks_vision);
+        assert!(!p.hints.merge_system_messages);
     }
 
     /// Real API test: NVIDIA NIM with Llama 3.3 70B.

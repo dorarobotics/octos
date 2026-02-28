@@ -13,29 +13,29 @@ use super::AppState;
 #[folder = "static/"]
 struct Assets;
 
-/// Fallback handler: serves embedded static files, falls back to index.html for SPA routing.
-/// Routes under `/admin/` fall back to `admin/index.html` for the admin dashboard SPA.
+/// Fallback handler: serves embedded static files, falls back to admin/index.html for SPA routing.
+/// The admin dashboard SPA handles all UI routes (login, profiles, users, etc.).
 pub async fn static_handler(State(_state): State<Arc<AppState>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
+    let path = if path.is_empty() {
+        "admin/index.html"
+    } else {
+        path
+    };
 
-    // Check if this is an admin route
-    let is_admin = path.starts_with("admin");
+    // Try the exact path first, then under admin/ prefix (dashboard assets)
+    if let Some(file) = Assets::get(path) {
+        return serve_file(path, &file.data);
+    }
+    let admin_path = format!("admin/{path}");
+    if let Some(file) = Assets::get(&admin_path) {
+        return serve_file(&admin_path, &file.data);
+    }
 
-    match Assets::get(path) {
-        Some(file) => serve_file(path, &file.data),
-        None => {
-            // SPA fallback: serve the appropriate index.html
-            let fallback = if is_admin {
-                "admin/index.html"
-            } else {
-                "index.html"
-            };
-            match Assets::get(fallback) {
-                Some(file) => serve_file(fallback, &file.data),
-                None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
-            }
-        }
+    // SPA fallback: serve admin/index.html for client-side routing
+    match Assets::get("admin/index.html") {
+        Some(file) => serve_file("admin/index.html", &file.data),
+        None => (StatusCode::NOT_FOUND, "Not Found").into_response(),
     }
 }
 

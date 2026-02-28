@@ -35,10 +35,7 @@ pub async fn feishu_webhook_proxy(
     // the gateway hasn't started yet or is in websocket mode.
     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
         if json.get("type").and_then(|v| v.as_str()) == Some("url_verification") {
-            let challenge = json
-                .get("challenge")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let challenge = json.get("challenge").and_then(|v| v.as_str()).unwrap_or("");
             tracing::info!(
                 profile = %profile_id,
                 "webhook proxy: handling url_verification challenge directly"
@@ -74,7 +71,12 @@ async fn proxy_to_gateway_with_bytes(
 ) -> Response {
     let pm = match state.process_manager.as_ref() {
         Some(pm) => pm,
-        None => return json_error(StatusCode::SERVICE_UNAVAILABLE, "process manager not available"),
+        None => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "process manager not available",
+            );
+        }
     };
 
     let port = match pm.webhook_port(&profile_id).await {
@@ -82,8 +84,10 @@ async fn proxy_to_gateway_with_bytes(
         None => {
             return json_error(
                 StatusCode::BAD_GATEWAY,
-                &format!("no webhook port for profile '{profile_id}' (gateway not running or not in webhook mode)"),
-            )
+                &format!(
+                    "no webhook port for profile '{profile_id}' (gateway not running or not in webhook mode)"
+                ),
+            );
         }
     };
 
@@ -124,8 +128,7 @@ async fn proxy_to_gateway_with_bytes(
     };
 
     // Convert upstream response back to axum response
-    let status =
-        StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = resp.headers().clone();
     let resp_body = match resp.bytes().await {
         Ok(b) => b,

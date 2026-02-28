@@ -10,6 +10,7 @@ export interface GatewaySettings {
   max_iterations?: number | null
   system_prompt?: string | null
   max_concurrent_sessions?: number | null
+  browser_timeout_secs?: number | null
 }
 
 export interface ChannelCredentials {
@@ -17,12 +18,36 @@ export interface ChannelCredentials {
   [key: string]: string | number
 }
 
+export interface FallbackModel {
+  provider: string
+  model?: string | null
+  api_key_env?: string | null
+  api_type?: string | null
+}
+
+export interface EmailSettings {
+  provider: string
+  smtp_host?: string | null
+  smtp_port?: number | null
+  username?: string | null
+  password_env?: string | null
+  from_address?: string | null
+  feishu_app_id?: string | null
+  feishu_app_secret_env?: string | null
+  feishu_from_address?: string | null
+  feishu_region?: string | null
+}
+
 export interface ProfileConfig {
   provider?: string | null
   model?: string | null
+  base_url?: string | null
   api_key_env?: string | null
+  api_type?: string | null
+  fallback_models?: FallbackModel[]
   channels: ChannelCredentials[]
   gateway: GatewaySettings
+  email?: EmailSettings | null
   env_vars: Record<string, string>
 }
 
@@ -88,7 +113,8 @@ export const CHANNEL_LABELS: Record<ChannelType, string> = {
 
 export const PROVIDERS = [
   'anthropic', 'openai', 'gemini', 'openrouter', 'deepseek',
-  'groq', 'moonshot', 'dashscope', 'minimax', 'zhipu', 'ollama', 'vllm',
+  'groq', 'moonshot', 'dashscope', 'minimax', 'zhipu', 'zai',
+  'nvidia', 'ollama', 'vllm',
 ] as const
 
 // ── User & Auth types ───────────────────────────────────────────────
@@ -126,4 +152,6 @@ export interface BridgeQrInfo {
   status: 'waiting' | 'connected' | 'disconnected' | 'logged_out'
   ws_port: number
   http_port: number
+  phone_number: string | null
+  lid: string | null
 }

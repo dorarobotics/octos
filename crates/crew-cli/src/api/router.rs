@@ -82,7 +82,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/my/profile/whatsapp/qr",
             get(auth_handlers::my_whatsapp_qr),
         )
-        .route("/api/auth/me", get(auth_handlers::me));
+        .route("/api/auth/me", get(auth_handlers::me))
+        .route("/api/my/test-provider", post(admin::test_provider))
+        .route("/api/my/test-search", post(admin::test_search));
 
     // Admin API routes (admin auth only, 1MB body limit)
     let admin_api = Router::new()
@@ -108,6 +110,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/profiles/{id}/whatsapp/qr",
             get(admin::whatsapp_qr),
         )
+        .route("/api/admin/test-provider", post(admin::test_provider))
         .route("/api/admin/start-all", post(admin::start_all))
         .route("/api/admin/stop-all", post(admin::stop_all))
         // User management

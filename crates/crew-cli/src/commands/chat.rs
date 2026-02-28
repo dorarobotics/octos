@@ -8,11 +8,7 @@ use clap::Args;
 use colored::Colorize;
 use crew_agent::{Agent, AgentConfig, ConsoleReporter, HookExecutor, ToolRegistry};
 use crew_core::{AgentId, Message, MessageRole};
-use crew_llm::{
-    EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain, RetryProvider,
-    anthropic::AnthropicProvider, gemini::GeminiProvider, openai::OpenAIProvider,
-    openrouter::OpenRouterProvider,
-};
+use crew_llm::{EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain, RetryProvider};
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use rustyline::DefaultEditor;
@@ -118,8 +114,20 @@ impl ChatCommand {
             let mut providers: Vec<Arc<dyn LlmProvider>> =
                 vec![Arc::new(RetryProvider::new(base_provider))];
             for fb in &config.fallback_models {
-                match create_provider(&fb.provider, &config, fb.model.clone(), fb.base_url.clone())
-                {
+                let fb_config = if fb.api_key_env.is_some() {
+                    let mut c = config.clone();
+                    c.api_key_env = fb.api_key_env.clone();
+                    c
+                } else {
+                    config.clone()
+                };
+                match create_provider_with_api_type(
+                    &fb.provider,
+                    &fb_config,
+                    fb.model.clone(),
+                    fb.base_url.clone(),
+                    fb.api_type.as_deref(),
+                ) {
                     Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
                     Err(e) => {
                         tracing::warn!(provider = %fb.provider, error = %e, "skipping fallback provider");
@@ -140,7 +148,30 @@ impl ChatCommand {
         // Create tool registry (with sandbox if configured)
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+
+        // Open tool config store for user-customizable tool defaults
+        let tool_config = std::sync::Arc::new(
+            crew_agent::ToolConfigStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open tool config store")?,
+        );
+        tools.inject_tool_config(tool_config.clone());
+
         tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
+        tools.register(
+            crew_agent::DeepCrawlTool::new(data_dir.join("research"))
+                .with_config(tool_config.clone()),
+        );
+
+        // Override browser tool with configured timeout if set
+        if let Some(gw) = &config.gateway {
+            if let Some(secs) = gw.browser_timeout_secs {
+                tools.register(
+                    crew_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
+                        .with_config(tool_config.clone()),
+                );
+            }
+        }
 
         // Register spawn tool for sync sub-agent support in chat mode.
         // Background mode won't deliver results (dummy channel), but sync mode works fine.
@@ -155,12 +186,15 @@ impl ChatCommand {
         // Register deep research tool with background notification channel
         let (research_tx, mut research_rx) =
             tokio::sync::mpsc::channel::<crew_agent::ResearchNotification>(8);
-        tools.register(crew_agent::DeepResearchTool::new(
-            llm.clone(),
-            memory.clone(),
-            data_dir.clone(),
-            research_tx,
-        ));
+        tools.register(
+            crew_agent::DeepResearchTool::new(
+                llm.clone(),
+                memory.clone(),
+                data_dir.clone(),
+                research_tx,
+            )
+            .with_config(tool_config.clone()),
+        );
 
         // Create memory store and register memory bank tools
         let memory_store = Arc::new(
@@ -170,6 +204,16 @@ impl ChatCommand {
         );
         tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
+
+        // Send email tool (configured via config.email)
+        if let Some(ref email_cfg) = config.email {
+            match super::gateway::build_email_sender(email_cfg) {
+                Ok(sender) => {
+                    tools.register(crew_agent::SendEmailTool::new(sender));
+                }
+                Err(e) => eprintln!("Warning: skipping send_email tool: {e}"),
+            }
+        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -359,6 +403,14 @@ impl ChatCommand {
                 break;
             }
 
+            // Handle /config command
+            if input == "/config" || input.starts_with("/config ") {
+                let args = input.strip_prefix("/config").unwrap_or("").trim();
+                let response = tool_config.handle_config_command(args).await;
+                println!("{response}");
+                continue;
+            }
+
             // Process message (may return quickly for background research)
             let response = agent.process_message(input, &history, vec![]).await?;
 
@@ -487,159 +539,80 @@ mod tests {
 }
 
 /// Create an LLM provider from name and config.
+///
+/// When `api_type` is `Some("anthropic")` (from config or sub-provider),
+/// the Anthropic Messages API protocol is used regardless of provider name.
 pub(crate) fn create_provider(
     name: &str,
     config: &Config,
     model: Option<String>,
     base_url: Option<String>,
 ) -> Result<Arc<dyn LlmProvider>> {
-    let provider: Arc<dyn LlmProvider> = match name {
-        "anthropic" => {
-            let api_key = config.get_api_key("anthropic")?;
-            let model_name = model.unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
-            let mut p = AnthropicProvider::new(&api_key, &model_name);
-            if let Some(url) = &base_url {
-                p = p.with_base_url(url);
-            }
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "openai" => {
-            let api_key = config.get_api_key("openai")?;
-            let model_name = model.unwrap_or_else(|| "gpt-4o".to_string());
-            let mut p = OpenAIProvider::new(&api_key, &model_name);
-            if let Some(url) = &base_url {
-                p = p.with_base_url(url);
-            }
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "gemini" | "google" => {
-            let api_key = config.get_api_key("gemini")?;
-            let model_name = model.unwrap_or_else(|| "gemini-2.0-flash".to_string());
-            let mut p = GeminiProvider::new(&api_key, &model_name);
-            if let Some(url) = &base_url {
-                p = p.with_base_url(url);
-            }
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "openrouter" => {
-            let api_key = config.get_api_key("openrouter")?;
-            let model_name =
-                model.unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".to_string());
-            let mut p = OpenRouterProvider::new(&api_key, &model_name);
-            if let Some(url) = &base_url {
-                p = p.with_base_url(url);
-            }
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "deepseek" => {
-            let api_key = config.get_api_key("deepseek")?;
-            let model_name = model.unwrap_or_else(|| "deepseek-chat".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name)
-                .with_base_url(base_url.as_deref().unwrap_or("https://api.deepseek.com/v1"));
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "groq" => {
-            let api_key = config.get_api_key("groq")?;
-            let model_name = model.unwrap_or_else(|| "llama-3.3-70b-versatile".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://api.groq.com/openai/v1"),
-            );
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "moonshot" | "kimi" => {
-            let api_key = config.get_api_key("moonshot")?;
-            let model_name = model.unwrap_or_else(|| "kimi-k2.5".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name)
-                .with_base_url(base_url.as_deref().unwrap_or("https://api.moonshot.ai/v1"));
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "dashscope" | "qwen" => {
-            let api_key = config.get_api_key("dashscope")?;
-            let model_name = model.unwrap_or_else(|| "qwen-max".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://dashscope.aliyuncs.com/compatible-mode/v1"),
-            );
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "minimax" => {
-            let api_key = config.get_api_key("minimax")?;
-            let model_name = model.unwrap_or_else(|| "MiniMax-Text-01".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name)
-                .with_base_url(base_url.as_deref().unwrap_or("https://api.minimax.io/v1"));
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "zhipu" | "glm" => {
-            let api_key = config.get_api_key("zhipu")?;
-            let model_name = model.unwrap_or_else(|| "glm-4-plus".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://open.bigmodel.cn/api/paas/v4"),
-            );
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "zai" | "z.ai" => {
-            let api_key = config.get_api_key("zai")?;
-            let model_name = model.unwrap_or_else(|| "glm-5".to_string());
-            let mut p = AnthropicProvider::new(&api_key, &model_name);
-            p = p.with_base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://api.z.ai/api/anthropic"),
-            );
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "nvidia" | "nim" => {
-            let api_key = config.get_api_key("nvidia")?;
-            let model_name = model.unwrap_or_else(|| "meta/llama-3.3-70b-instruct".to_string());
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(
-                base_url
-                    .as_deref()
-                    .unwrap_or("https://integrate.api.nvidia.com/v1"),
-            );
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "ollama" => {
-            let model_name = model.unwrap_or_else(|| "llama3.2".to_string());
-            let p = OpenAIProvider::new("ollama", &model_name)
-                .with_base_url(base_url.as_deref().unwrap_or("http://localhost:11434/v1"));
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        "vllm" => {
-            let api_key = config
-                .get_api_key("vllm")
-                .unwrap_or_else(|_| "token".to_string());
-            let model_name = model
-                .ok_or_else(|| eyre::eyre!("vllm provider requires --model to be specified"))?;
-            let url = base_url
-                .ok_or_else(|| eyre::eyre!("vllm provider requires --base-url to be specified"))?;
-            let p = OpenAIProvider::new(&api_key, &model_name).with_base_url(&url);
-            println!("{}: {}", "Model".green(), p.model_id());
-            Arc::new(p)
-        }
-        other => {
-            eyre::bail!(
-                "unknown provider: {other}. Valid: anthropic, openai, gemini, openrouter, \
-                 deepseek, groq, moonshot, dashscope, minimax, zhipu, zai, nvidia, ollama, vllm"
-            );
-        }
+    create_provider_with_api_type(name, config, model, base_url, config.api_type.as_deref())
+}
+
+/// Inner factory that accepts an explicit `api_type` override.
+pub(crate) fn create_provider_with_api_type(
+    name: &str,
+    config: &Config,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_type: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>> {
+    let entry = crew_llm::registry::lookup(name).ok_or_else(|| {
+        eyre::eyre!(
+            "unknown provider: {name}. Valid: {}",
+            crew_llm::registry::all_names().join(", ")
+        )
+    })?;
+
+    // Resolve API key via config (auth store → env var).
+    let api_key = if entry.requires_api_key {
+        Some(config.get_api_key(entry.name)?)
+    } else {
+        config.get_api_key(entry.name).ok()
     };
+
+    if entry.requires_model && model.is_none() {
+        eyre::bail!("{} provider requires --model to be specified", name);
+    }
+    if entry.requires_base_url && base_url.is_none() {
+        eyre::bail!("{} provider requires --base-url to be specified", name);
+    }
+
+    // If api_type is "anthropic", bypass registry and use AnthropicProvider directly.
+    // This allows any provider to use the Anthropic Messages API protocol.
+    if api_type == Some("anthropic") {
+        let key = api_key.ok_or_else(|| eyre::eyre!("API key required for anthropic api_type"))?;
+        let m = model.unwrap_or_else(|| {
+            entry
+                .default_model
+                .unwrap_or("claude-sonnet-4-20250514")
+                .into()
+        });
+        let url = base_url.unwrap_or_else(|| {
+            entry
+                .default_base_url
+                .unwrap_or("https://api.anthropic.com")
+                .into()
+        });
+        let provider = crew_llm::anthropic::AnthropicProvider::new(&key, &m).with_base_url(&url);
+        println!(
+            "{}: {} (anthropic api)",
+            "Model".green(),
+            provider.model_id()
+        );
+        return Ok(Arc::new(provider));
+    }
+
+    let params = crew_llm::registry::CreateParams {
+        api_key,
+        model,
+        base_url,
+        model_hints: config.model_hints.clone(),
+    };
+
+    let provider = (entry.create)(params)?;
+    println!("{}: {}", "Model".green(), provider.model_id());
     Ok(provider)
 }

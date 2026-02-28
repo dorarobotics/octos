@@ -52,6 +52,8 @@ struct BridgeProcess {
     started_at: DateTime<Utc>,
     qr_code: Arc<Mutex<Option<String>>>,
     status: Arc<Mutex<BridgeStatus>>,
+    phone_number: Arc<Mutex<Option<String>>>,
+    lid: Arc<Mutex<Option<String>>>,
     log_tx: broadcast::Sender<String>,
     stop_tx: watch::Sender<bool>,
 }
@@ -86,6 +88,10 @@ pub struct BridgeQrInfo {
     pub status: BridgeStatus,
     pub ws_port: u16,
     pub http_port: u16,
+    /// Phone number of the connected WhatsApp account (e.g. "14088882719").
+    pub phone_number: Option<String>,
+    /// WhatsApp LID of the connected account (e.g. "197061790171194").
+    pub lid: Option<String>,
 }
 
 impl ProcessManager {
@@ -144,26 +150,31 @@ impl ProcessManager {
             None => None,
         };
 
-        // Generate config file for the gateway
-        let config_path = self
-            .profile_store
-            .generate_config(profile, bridge_url_override.as_deref(), feishu_port)?;
+        // Resolve data directory and ensure subdirs exist
         let data_dir = self.profile_store.resolve_data_dir(profile);
         for sub in ["memory", "sessions", "research", "skills", "history"] {
             std::fs::create_dir_all(data_dir.join(sub))?;
         }
 
-        // Spawn the gateway as a child process
+        // Spawn the gateway as a child process, pointing at the profile JSON directly
         let exe = std::env::current_exe()?;
+        let profile_path = self.profile_store.profile_path(&profile.id);
         let mut cmd = Command::new(&exe);
         cmd.arg("gateway")
-            .arg("--config")
-            .arg(&config_path)
+            .arg("--profile")
+            .arg(&profile_path)
             .arg("--data-dir")
             .arg(&data_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        if let Some(ref url) = bridge_url_override {
+            cmd.arg("--bridge-url").arg(url);
+        }
+        if let Some(port) = feishu_port {
+            cmd.arg("--feishu-port").arg(port.to_string());
+        }
 
         // Pass env vars from profile config, filtering out dangerous ones.
         for (key, value) in &profile.config.env_vars {
@@ -360,7 +371,7 @@ impl ProcessManager {
         let used: std::collections::HashSet<u16> =
             procs.values().filter_map(|p| p.webhook_port).collect();
         let mut port = WEBHOOK_BASE_PORT;
-        while used.contains(&port) {
+        while used.contains(&port) || !port_available(port) {
             port += 1;
         }
         port
@@ -421,6 +432,8 @@ impl ProcessManager {
         let (stop_tx, stop_rx) = watch::channel(false);
         let qr_code: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let status: Arc<Mutex<BridgeStatus>> = Arc::new(Mutex::new(BridgeStatus::Waiting));
+        let phone_number: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let lid: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let bridge = BridgeProcess {
             pid,
@@ -429,6 +442,8 @@ impl ProcessManager {
             started_at: Utc::now(),
             qr_code: Arc::clone(&qr_code),
             status: Arc::clone(&status),
+            phone_number: Arc::clone(&phone_number),
+            lid: Arc::clone(&lid),
             log_tx: log_tx.clone(),
             stop_tx,
         };
@@ -441,6 +456,8 @@ impl ProcessManager {
             let tx = log_tx.clone();
             let qr = Arc::clone(&qr_code);
             let st = Arc::clone(&status);
+            let ph = Arc::clone(&phone_number);
+            let li = Arc::clone(&lid);
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
@@ -460,6 +477,16 @@ impl ProcessManager {
                                         "connected" => {
                                             *qr.lock().await = None;
                                             *st.lock().await = BridgeStatus::Connected;
+                                            if let Some(phone) =
+                                                json.get("phone").and_then(|p| p.as_str())
+                                            {
+                                                *ph.lock().await = Some(phone.to_string());
+                                            }
+                                            if let Some(lid_val) =
+                                                json.get("lid").and_then(|l| l.as_str())
+                                            {
+                                                *li.lock().await = Some(lid_val.to_string());
+                                            }
                                         }
                                         "disconnected" => {
                                             *st.lock().await = BridgeStatus::Disconnected;
@@ -544,26 +571,39 @@ impl ProcessManager {
         let bridge = bridges.get(profile_id)?;
         let qr = bridge.qr_code.lock().await.clone();
         let status = *bridge.status.lock().await;
+        let phone_number = bridge.phone_number.lock().await.clone();
+        let lid = bridge.lid.lock().await.clone();
         Some(BridgeQrInfo {
             qr,
             status,
             ws_port: bridge.ws_port,
             http_port: bridge.http_port,
+            phone_number,
+            lid,
         })
     }
 
     /// Allocate the next available port pair for a bridge.
+    /// Checks both the in-memory bridge map and actual port availability.
     fn allocate_bridge_ports(&self, bridges: &HashMap<String, BridgeProcess>) -> (u16, u16) {
         let used_ports: std::collections::HashSet<u16> =
             bridges.values().map(|b| b.ws_port).collect();
         let mut ws_port = BRIDGE_BASE_WS_PORT;
         loop {
-            if !used_ports.contains(&ws_port) {
+            if !used_ports.contains(&ws_port)
+                && port_available(ws_port)
+                && port_available(ws_port + 1)
+            {
                 return (ws_port, ws_port + 1);
             }
             ws_port += 2;
         }
     }
+}
+
+/// Check if a TCP port is available by attempting to bind it.
+fn port_available(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 /// Find the `node` binary on PATH.
@@ -575,10 +615,7 @@ fn find_node() -> Result<PathBuf> {
             return Ok(p.to_path_buf());
         }
         // Try which
-        if let Ok(output) = std::process::Command::new("which")
-            .arg(name)
-            .output()
-        {
+        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
             if output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() {

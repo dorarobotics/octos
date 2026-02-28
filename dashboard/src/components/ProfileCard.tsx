@@ -28,7 +28,7 @@ export default function ProfileCard({ profile, onStart, onStop }: Props) {
     <div className="bg-surface rounded-xl border border-gray-700/50 p-5 hover:border-gray-600/50 transition-colors group">
       <div className="flex items-start justify-between mb-3">
         <Link
-          to={`/profiles/${profile.id}`}
+          to={`/profile/${profile.id}`}
           className="text-white font-semibold hover:text-accent transition-colors"
         >
           {profile.name}
@@ -86,7 +86,7 @@ export default function ProfileCard({ profile, onStart, onStop }: Props) {
           </button>
         )}
         <Link
-          to={`/profiles/${profile.id}`}
+          to={`/profile/${profile.id}`}
           className="px-3 py-1.5 text-xs font-medium rounded-lg bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white border border-gray-700/50 transition"
         >
           Configure

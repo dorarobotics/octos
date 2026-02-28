@@ -17,6 +17,10 @@ pub const BUILTIN_SKILLS: &[BuiltinSkill] = &[
         content: include_str!("../skills/github/SKILL.md"),
     },
     BuiltinSkill {
+        name: "news",
+        content: include_str!("../skills/news/SKILL.md"),
+    },
+    BuiltinSkill {
         name: "skill-creator",
         content: include_str!("../skills/skill-creator/SKILL.md"),
     },

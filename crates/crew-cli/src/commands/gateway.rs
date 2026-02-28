@@ -42,8 +42,20 @@ pub struct GatewayCommand {
     pub data_dir: Option<PathBuf>,
 
     /// Path to config file.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "profile")]
     pub config: Option<PathBuf>,
+
+    /// Path to a profile JSON file (used by managed gateways).
+    #[arg(long, conflicts_with = "config")]
+    pub profile: Option<PathBuf>,
+
+    /// Override WhatsApp bridge URL (used by managed gateways).
+    #[arg(long, hide = true)]
+    pub bridge_url: Option<String>,
+
+    /// Override Feishu webhook port (used by managed gateways).
+    #[arg(long, hide = true)]
+    pub feishu_port: Option<u16>,
 
     /// LLM provider to use (overrides config).
     #[arg(long)]
@@ -58,8 +70,8 @@ pub struct GatewayCommand {
     pub base_url: Option<String>,
 
     /// Maximum agent iterations per message (default: 50).
-    #[arg(long, default_value = "50")]
-    pub max_iterations: u32,
+    #[arg(long)]
+    pub max_iterations: Option<u32>,
 
     /// Disable automatic retry on transient errors.
     #[arg(long)]
@@ -87,7 +99,18 @@ impl GatewayCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
-        let config = if let Some(config_path) = &self.config {
+        let config = if let Some(ref profile_path) = self.profile {
+            // Load config from profile JSON (single source of truth)
+            let content = std::fs::read_to_string(profile_path)
+                .wrap_err_with(|| format!("failed to read profile: {}", profile_path.display()))?;
+            let profile: crate::profiles::UserProfile = serde_json::from_str(&content)
+                .wrap_err_with(|| format!("failed to parse profile: {}", profile_path.display()))?;
+            crate::profiles::config_from_profile(
+                &profile,
+                self.bridge_url.as_deref(),
+                self.feishu_port,
+            )
+        } else if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
         } else {
             Config::load(&cwd)?
@@ -115,6 +138,7 @@ impl GatewayCommand {
                 queue_mode: QueueMode::default(),
                 max_sessions: 1000,
                 max_concurrent_sessions: 10,
+                browser_timeout_secs: None,
             });
 
         println!("{}: {}", "Provider".green(), provider_name);
@@ -139,11 +163,12 @@ impl GatewayCommand {
                 } else {
                     config.clone()
                 };
-                match create_provider(
+                match super::chat::create_provider_with_api_type(
                     &fb.provider,
                     &fb_config,
                     fb.model.clone(),
                     fb.base_url.clone(),
+                    fb.api_type.as_deref(),
                 ) {
                     Ok(p) => providers.push(Arc::new(RetryProvider::new(p))),
                     Err(e) => {
@@ -210,7 +235,32 @@ impl GatewayCommand {
         // Build tool registry (with sandbox if configured)
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(&cwd, sandbox);
+
+        // Open tool config store for user-customizable tool defaults
+        let tool_config = Arc::new(
+            crew_agent::ToolConfigStore::open(&data_dir)
+                .await
+                .wrap_err("failed to open tool config store")?,
+        );
+        tools.inject_tool_config(tool_config.clone());
+
         tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
+        tools.register(
+            crew_agent::DeepCrawlTool::new(data_dir.join("research"))
+                .with_config(tool_config.clone()),
+        );
+        tools.register(
+            crew_agent::NewsDigestTool::new(llm.clone(), &data_dir)
+                .with_config(tool_config.clone()),
+        );
+
+        // Override browser tool with configured timeout (replaces default 300s)
+        if let Some(secs) = gw_config.browser_timeout_secs {
+            tools.register(
+                crew_agent::BrowserTool::with_timeout(std::time::Duration::from_secs(secs))
+                    .with_config(tool_config.clone()),
+            );
+        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {
@@ -243,7 +293,8 @@ impl GatewayCommand {
             tools.set_provider_policy(policy);
         }
 
-        tools.register(CronTool::new(cron_service.clone()));
+        let cron_tool = Arc::new(CronTool::new(cron_service.clone()));
+        tools.register_arc(cron_tool.clone() as Arc<dyn crew_agent::Tool>);
 
         // Message tool (cross-channel messaging)
         let message_tool = Arc::new(MessageTool::new(out_tx.clone()));
@@ -269,11 +320,12 @@ impl GatewayCommand {
                 } else {
                     config.clone()
                 };
-                match create_provider(
+                match super::chat::create_provider_with_api_type(
                     &sp.provider,
                     &sp_config,
                     sp.model.clone(),
                     sp.base_url.clone(),
+                    sp.api_type.as_deref(),
                 ) {
                     Ok(p) => {
                         router.register_with_meta(
@@ -311,16 +363,33 @@ impl GatewayCommand {
         // Deep research tool with background notification channel
         let (research_tx, _research_rx) =
             tokio::sync::mpsc::channel::<crew_agent::ResearchNotification>(8);
-        tools.register(crew_agent::DeepResearchTool::new(
-            llm.clone(),
-            memory.clone(),
-            data_dir.clone(),
-            research_tx,
-        ));
+        tools.register(
+            crew_agent::DeepResearchTool::new(
+                llm.clone(),
+                memory.clone(),
+                data_dir.clone(),
+                research_tx,
+            )
+            .with_config(tool_config.clone()),
+        );
 
         // Memory bank tools (recall/save entity pages)
         tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
+
+        // Send email tool (configured via config.email)
+        if let Some(ref email_cfg) = config.email {
+            match build_email_sender(email_cfg) {
+                Ok(sender) => {
+                    tools.register(crew_agent::SendEmailTool::new(sender));
+                    info!(
+                        "send_email tool registered (provider: {})",
+                        email_cfg.provider
+                    );
+                }
+                Err(e) => warn!("skipping send_email tool: {e}"),
+            }
+        }
 
         // Build enhanced system prompt
         let system_prompt = build_system_prompt(
@@ -328,12 +397,14 @@ impl GatewayCommand {
             &project_dir,
             &memory_store,
             &skills_loader,
+            &tool_config,
         )
         .await;
 
         // Build the agent
+        let max_iterations = self.max_iterations.or(config.max_iterations).unwrap_or(50);
         let agent_config = AgentConfig {
-            max_iterations: self.max_iterations,
+            max_iterations,
             save_episodes: false,
             ..Default::default()
         };
@@ -359,7 +430,9 @@ impl GatewayCommand {
         // Start config watcher for hot-reload
         let watch_paths = {
             let mut paths = Vec::new();
-            if let Some(ref p) = self.config {
+            if let Some(ref p) = self.profile {
+                paths.push(p.clone());
+            } else if let Some(ref p) = self.config {
                 paths.push(p.clone());
             } else {
                 let local = cwd.join(".crew").join("config.json");
@@ -744,6 +817,28 @@ impl GatewayCommand {
                 continue;
             }
 
+            // Handle /config command inline
+            if inbound.content.trim() == "/config" || inbound.content.trim().starts_with("/config ")
+            {
+                let args = inbound
+                    .content
+                    .trim()
+                    .strip_prefix("/config")
+                    .unwrap_or("")
+                    .trim();
+                let response = tool_config.handle_config_command(args).await;
+                let msg = OutboundMessage {
+                    channel: reply_channel.clone(),
+                    chat_id: reply_chat_id.clone(),
+                    content: response,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                };
+                let _ = agent_handle.send_outbound(msg).await;
+                continue;
+            }
+
             info!(
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,
@@ -760,6 +855,7 @@ impl GatewayCommand {
             let send_file_tool = send_file_tool.clone();
             let take_photo_tool = take_photo_tool.clone();
             let spawn_tool = spawn_tool.clone();
+            let cron_tool = cron_tool.clone();
             let llm_for_compaction = llm_for_compaction.clone();
             let out_tx = agent_handle.outbound_sender();
             let max_history = max_history.clone();
@@ -799,6 +895,7 @@ impl GatewayCommand {
                     &send_file_tool,
                     &take_photo_tool,
                     &spawn_tool,
+                    &cron_tool,
                     &llm_for_compaction,
                     &out_tx,
                     &inbound,
@@ -862,6 +959,7 @@ async fn process_session_message(
     send_file_tool: &SendFileTool,
     take_photo_tool: &TakePhotoTool,
     spawn_tool: &SpawnTool,
+    cron_tool: &CronTool,
     llm: &Arc<dyn LlmProvider>,
     out_tx: &tokio::sync::mpsc::Sender<OutboundMessage>,
     inbound: &crew_core::InboundMessage,
@@ -878,6 +976,7 @@ async fn process_session_message(
     send_file_tool.set_context(reply_channel, reply_chat_id);
     take_photo_tool.set_context(reply_channel, reply_chat_id);
     spawn_tool.set_context(reply_channel, reply_chat_id);
+    cron_tool.set_context(reply_channel, reply_chat_id);
 
     // Get conversation history (hold session_mgr lock briefly)
     let history: Vec<Message> = {
@@ -989,6 +1088,7 @@ async fn build_system_prompt(
     project_dir: &Path,
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
+    tool_config: &crew_agent::ToolConfigStore,
 ) -> String {
     let default_prompt = "You are a helpful AI assistant. Your role is to:\n\
         \n\
@@ -1053,6 +1153,13 @@ async fn build_system_prompt(
         }
     }
 
+    // Append tool preferences summary
+    let config_summary = tool_config.summary().await;
+    if !config_summary.is_empty() {
+        prompt.push_str("\n\n## Tool Preferences\n\n");
+        prompt.push_str(&config_summary);
+    }
+
     prompt
 }
 
@@ -1072,6 +1179,28 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
+}
+
+/// Build an email sender from the config.
+pub(crate) fn build_email_sender(
+    cfg: &crate::config::EmailConfig,
+) -> Result<Arc<dyn crew_agent::EmailSender>> {
+    match cfg.provider.as_str() {
+        "smtp" => Ok(Arc::new(crew_agent::SmtpEmailSender::new(
+            cfg.smtp_host.clone().unwrap_or_default(),
+            cfg.smtp_port.unwrap_or(465),
+            cfg.username.clone().unwrap_or_default(),
+            cfg.password_env.clone().unwrap_or_default(),
+            cfg.from_address.clone().unwrap_or_default(),
+        ))),
+        "feishu" | "lark" => Ok(Arc::new(crew_agent::FeishuEmailSender::new(
+            cfg.feishu_app_id.clone().unwrap_or_default(),
+            cfg.feishu_app_secret_env.clone().unwrap_or_default(),
+            cfg.feishu_from_address.clone().unwrap_or_default(),
+            cfg.feishu_region.as_deref().unwrap_or("cn"),
+        ))),
+        other => eyre::bail!("unknown email provider: {other}"),
+    }
 }
 
 /// Merge queued inbound messages by session key.

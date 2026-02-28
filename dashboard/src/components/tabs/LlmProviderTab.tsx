@@ -1,23 +1,54 @@
-import type { ProfileConfig } from '../../types'
+import { useState } from 'react'
+import type { ProfileConfig, FallbackModel } from '../../types'
 import { PROVIDERS } from '../../types'
+import { myApi } from '../../api'
+import _PROVIDER_MODELS from '../../providers.json'
 
-const PROVIDER_DEFAULTS: Record<string, { env: string; model: string }> = {
-  anthropic: { env: 'ANTHROPIC_API_KEY', model: 'claude-sonnet-4-20250514' },
-  openai: { env: 'OPENAI_API_KEY', model: 'gpt-4o' },
-  gemini: { env: 'GEMINI_API_KEY', model: 'gemini-2.0-flash' },
-  openrouter: { env: 'OPENROUTER_API_KEY', model: 'anthropic/claude-sonnet-4-20250514' },
-  deepseek: { env: 'DEEPSEEK_API_KEY', model: 'deepseek-chat' },
-  groq: { env: 'GROQ_API_KEY', model: 'llama-3.3-70b-versatile' },
-  moonshot: { env: 'MOONSHOT_API_KEY', model: 'kimi-k2.5' },  // API model ID, not display name
-  dashscope: { env: 'DASHSCOPE_API_KEY', model: 'qwen-max' },
-  minimax: { env: 'MINIMAX_API_KEY', model: 'MiniMax-Text-01' },
-  zhipu: { env: 'ZHIPU_API_KEY', model: 'glm-4-plus' },
-  ollama: { env: '', model: 'llama3.2' },
-  vllm: { env: 'VLLM_API_KEY', model: '' },
+interface ModelEntry {
+  id: string
+  input: number
+  output: number
 }
 
+const PROVIDER_MODELS = _PROVIDER_MODELS as Record<string, { env: string; models: ModelEntry[] }>
+
+// Provider registry handles all providers natively — no mapping needed.
+
 function getApiKeyEnvName(provider: string | null | undefined): string {
-  return PROVIDER_DEFAULTS[provider || 'anthropic']?.env || `${(provider || 'ANTHROPIC').toUpperCase()}_API_KEY`
+  const entry = PROVIDER_MODELS[provider || '']
+  return entry?.env || `${(provider || 'ANTHROPIC').toUpperCase()}_API_KEY`
+}
+
+function getModelIds(provider: string): string[] {
+  return (PROVIDER_MODELS[provider]?.models || []).map((m) => m.id)
+}
+
+function getModelPricing(provider: string, modelId: string): ModelEntry | null {
+  const entry = PROVIDER_MODELS[provider]
+  if (!entry) return null
+  return entry.models.find((m) => m.id === modelId) || null
+}
+
+function formatPrice(p: ModelEntry): string {
+  if (p.input === 0 && p.output === 0) return 'Free (local)'
+  return `$${p.input}/M in, $${p.output}/M out`
+}
+
+/** Generate a unique env var name for a fallback, avoiding collisions. */
+function getFallbackEnvName(provider: string, index: number, allFallbacks: FallbackModel[], primaryEnv: string): string {
+  const baseEnv = getApiKeyEnvName(provider)
+  if (!baseEnv) return `FALLBACK_${index}_API_KEY`
+  // Check if primary or another fallback already uses this env name
+  const usedByPrimary = primaryEnv === baseEnv
+  const usedByEarlierFallback = allFallbacks.some(
+    (fb, i) => i < index && (fb.api_key_env || getApiKeyEnvName(fb.provider)) === baseEnv
+  )
+  // If no collision, use the base name (allows sharing keys between primary and fallback intentionally)
+  if (!usedByPrimary && !usedByEarlierFallback) return baseEnv
+  // Same provider used by primary — share the key (common: same provider, different model)
+  if (usedByPrimary && !usedByEarlierFallback) return baseEnv
+  // Collision with another fallback — suffix with index
+  return `${baseEnv}_${index + 1}`
 }
 
 interface Props {
@@ -25,62 +56,357 @@ interface Props {
   onChange: (config: ProfileConfig) => void
 }
 
+type TestState = 'idle' | 'testing' | 'success' | 'error'
+
+interface TestResult {
+  state: TestState
+  error: string
+  pricing: ModelEntry | null
+}
+
 export default function LlmProviderTab({ config, onChange }: Props) {
-  const envName = getApiKeyEnvName(config.provider)
+  const primaryEnv = getApiKeyEnvName(config.provider)
+  const fallbacks = config.fallback_models || []
+
+  // Test results keyed by index (-1 = primary)
+  const [testResults, setTestResults] = useState<Record<number, TestResult>>({})
+
+  const updateConfig = (patch: Partial<ProfileConfig>) => {
+    onChange({ ...config, ...patch })
+  }
+
+  const setFallbacks = (fbs: FallbackModel[]) => {
+    updateConfig({ fallback_models: fbs })
+  }
+
+  const addFallback = () => {
+    const provider = 'deepseek'
+    const models = getModelIds(provider)
+    const env = getFallbackEnvName(provider, fallbacks.length, fallbacks, primaryEnv)
+    setFallbacks([...fallbacks, { provider, model: models[0] || null, api_key_env: env }])
+  }
+
+  const moveFallback = (idx: number, direction: -1 | 1) => {
+    const target = idx + direction
+    if (target < 0 || target >= fallbacks.length) return
+    const updated = [...fallbacks]
+    ;[updated[idx], updated[target]] = [updated[target], updated[idx]]
+    setFallbacks(updated)
+    // Swap test results too
+    setTestResults((prev) => {
+      const next = { ...prev }
+      const a = prev[idx]
+      const b = prev[target]
+      if (a) next[target] = a; else delete next[target]
+      if (b) next[idx] = b; else delete next[idx]
+      return next
+    })
+  }
+
+  const removeFallback = (idx: number) => {
+    setFallbacks(fallbacks.filter((_, i) => i !== idx))
+    // Clear test result for removed index
+    setTestResults((prev) => {
+      const next = { ...prev }
+      delete next[idx]
+      return next
+    })
+  }
+
+  const updateFallback = (idx: number, patch: Partial<FallbackModel>) => {
+    const updated = fallbacks.map((fb, i) => (i === idx ? { ...fb, ...patch } : fb))
+    updateConfig({ fallback_models: updated })
+  }
+
+  const updateFallbackEnvVar = (idx: number, fbEnv: string, value: string) => {
+    const newEnvVars = { ...config.env_vars }
+    if (value) {
+      newEnvVars[fbEnv] = value
+    } else {
+      delete newEnvVars[fbEnv]
+    }
+    const updated = fallbacks.map((fb, i) => (i === idx ? { ...fb, api_key_env: fbEnv } : fb))
+    updateConfig({ env_vars: newEnvVars, fallback_models: updated })
+  }
+
+  const doTest = async (key: number, provider: string, model: string, apiKeyEnv: string) => {
+    const apiKey = config.env_vars[apiKeyEnv] || ''
+    if (!apiKey) {
+      setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'No API key configured.', pricing: null } }))
+      return
+    }
+    if (!model) {
+      setTestResults((s) => ({ ...s, [key]: { state: 'error', error: 'No model selected.', pricing: null } }))
+      return
+    }
+    setTestResults((s) => ({ ...s, [key]: { state: 'testing', error: '', pricing: null } }))
+    try {
+      const isMasked = apiKey.includes('***')
+      const res = await myApi.testProvider({
+        provider,
+        model,
+        // If key is masked (loaded from server), send env name so backend reads from saved profile
+        // If key is fresh (user just typed it), send the raw key
+        api_key: isMasked ? undefined : apiKey,
+        api_key_env: isMasked ? apiKeyEnv : undefined,
+      })
+      const pricing = getModelPricing(provider, model)
+      if (res.ok) {
+        setTestResults((s) => ({ ...s, [key]: { state: 'success', error: '', pricing } }))
+      } else {
+        setTestResults((s) => ({ ...s, [key]: { state: 'error', error: res.error || 'Unknown error', pricing: null } }))
+      }
+    } catch (e: unknown) {
+      setTestResults((s) => ({ ...s, [key]: { state: 'error', error: e instanceof Error ? e.message : 'Request failed', pricing: null } }))
+    }
+  }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3 text-xs text-amber-400">
-        LLM provider is required to start the gateway. Select a provider, choose a model, and paste your API key below.
+        LLM provider is required to start the gateway. Configure a primary provider and optional fallbacks for automatic failover.
       </div>
 
-      <div className="text-xs text-gray-400 space-y-1.5 bg-surface-dark/50 rounded-lg p-3 border border-gray-700/50">
-        <p className="font-medium text-gray-300">Supported Providers</p>
-        <p>
-          <strong>Anthropic</strong> (Claude), <strong>OpenAI</strong> (GPT-4o), <strong>Gemini</strong> (Google), <strong>OpenRouter</strong> (multi-model), <strong>DeepSeek</strong>, <strong>Groq</strong> (fast inference), <strong>Moonshot</strong> (Kimi), <strong>DashScope</strong> (Qwen), <strong>MiniMax</strong>, <strong>Zhipu</strong> (GLM), <strong>Ollama</strong> (local, no key needed), <strong>vLLM</strong> (self-hosted).
-        </p>
-        <p className="text-gray-600">Get your API key from the provider's dashboard. The key is stored securely and passed as an environment variable to the gateway process.</p>
+      {/* ── Primary Provider ── */}
+      <div className="bg-surface-dark/30 rounded-lg p-4 border border-gray-700/50 space-y-4">
+        <h3 className="text-sm font-semibold text-gray-200">Primary Provider</h3>
+
+        <Field label="Provider">
+          <select
+            value={config.provider || ''}
+            onChange={(e) => {
+              const provider = e.target.value || null
+              const models = getModelIds(provider || '')
+              updateConfig({ provider, model: models[0] || null })
+            }}
+            className="input"
+          >
+            {!config.provider && <option value="">Select a provider...</option>}
+            {PROVIDERS.map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+        </Field>
+
+        <ModelSelect
+          provider={config.provider || ''}
+          model={config.model || ''}
+          onModelChange={(model) => updateConfig({ model })}
+        />
+
+        <Field label="API Key" hint={primaryEnv ? `Stored as ${primaryEnv}` : undefined}>
+          <input
+            type="password"
+            value={config.env_vars[primaryEnv] || ''}
+            onChange={(e) => {
+              const newEnvVars = { ...config.env_vars }
+              if (e.target.value) {
+                newEnvVars[primaryEnv] = e.target.value
+              } else {
+                delete newEnvVars[primaryEnv]
+              }
+              updateConfig({ api_key_env: primaryEnv, env_vars: newEnvVars })
+            }}
+            placeholder={`Paste your ${config.provider || 'anthropic'} API key`}
+            className="input font-mono text-xs"
+          />
+        </Field>
+
+        <TestButton
+          result={testResults[-1] || null}
+          onTest={() => doTest(-1, config.provider || 'anthropic', config.model || '', primaryEnv)}
+        />
       </div>
 
-      <Field label="Provider">
+      {/* ── Fallback Models ── */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-gray-200">Fallback Models</h3>
+          <button
+            type="button"
+            onClick={addFallback}
+            className="px-3 py-1 text-xs font-medium rounded-lg bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white border border-gray-700/50 transition"
+          >
+            + Add Fallback
+          </button>
+        </div>
+
+        {fallbacks.length === 0 && (
+          <p className="text-xs text-gray-600 italic">
+            No fallback models configured. If the primary provider fails (429, 5xx, auth error), the gateway will retry the same provider.
+          </p>
+        )}
+
+        {fallbacks.map((fb, idx) => {
+          const fbEnv = fb.api_key_env || getApiKeyEnvName(fb.provider)
+          const sharesPrimaryKey = fbEnv === primaryEnv
+          return (
+            <div
+              key={idx}
+              className="bg-surface-dark/30 rounded-lg p-4 border border-gray-700/50 space-y-3"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-medium text-gray-400">Fallback #{idx + 1}</span>
+                  <button
+                    type="button"
+                    onClick={() => moveFallback(idx, -1)}
+                    disabled={idx === 0}
+                    className="p-0.5 text-gray-500 hover:text-gray-300 transition disabled:opacity-25 disabled:cursor-not-allowed"
+                    title="Move up"
+                  >
+                    <ArrowUpIcon />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => moveFallback(idx, 1)}
+                    disabled={idx === fallbacks.length - 1}
+                    className="p-0.5 text-gray-500 hover:text-gray-300 transition disabled:opacity-25 disabled:cursor-not-allowed"
+                    title="Move down"
+                  >
+                    <ArrowDownIcon />
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeFallback(idx)}
+                  className="p-1 text-red-400 hover:text-red-300 transition"
+                  title="Remove fallback"
+                >
+                  <XIcon />
+                </button>
+              </div>
+
+              <Field label="Provider">
+                <select
+                  value={fb.provider}
+                  onChange={(e) => {
+                    const newProvider = e.target.value
+                    const models = getModelIds(newProvider)
+                    const newEnv = getFallbackEnvName(newProvider, idx, fallbacks, primaryEnv)
+                    updateFallback(idx, { provider: newProvider, model: models[0] || null, api_key_env: newEnv })
+                  }}
+                  className="input"
+                >
+                  {PROVIDERS.map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </Field>
+
+              <ModelSelect
+                provider={fb.provider}
+                model={fb.model || ''}
+                onModelChange={(model) => updateFallback(idx, { model })}
+              />
+
+              <Field label="API Key" hint={sharesPrimaryKey ? `Shared with primary (${fbEnv})` : `Stored as ${fbEnv}`}>
+                <input
+                  type="password"
+                  value={config.env_vars[fbEnv] || ''}
+                  onChange={(e) => updateFallbackEnvVar(idx, fbEnv, e.target.value)}
+                  placeholder={sharesPrimaryKey ? 'Using primary API key' : `Paste your ${fb.provider} API key`}
+                  className="input font-mono text-xs"
+                />
+              </Field>
+
+              <TestButton
+                result={testResults[idx] || null}
+                onTest={() => doTest(idx, fb.provider, fb.model || '', fbEnv)}
+              />
+            </div>
+          )
+        })}
+
+        {fallbacks.length > 0 && (
+          <p className="text-xs text-gray-600">
+            Failover order: primary → fallback #1 → #2 → ... Providers with 3+ consecutive failures are temporarily skipped.
+          </p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Sub-components ──────────────────────────────────────────────────
+
+function ModelSelect({ provider, model, onModelChange }: { provider: string; model: string; onModelChange: (m: string) => void }) {
+  const entry = PROVIDER_MODELS[provider || '']
+  const models = entry?.models || []
+  const modelIds = models.map((m) => m.id)
+  const isCustom = model !== '' && !modelIds.includes(model)
+  const pricing = models.find((m) => m.id === model)
+
+  return (
+    <Field label="Model">
+      <div className="space-y-2">
         <select
-          value={config.provider || ''}
-          onChange={(e) => onChange({ ...config, provider: e.target.value || null })}
+          value={isCustom ? '__custom__' : model}
+          onChange={(e) => {
+            if (e.target.value === '__custom__') {
+              onModelChange('')
+            } else {
+              onModelChange(e.target.value)
+            }
+          }}
           className="input"
         >
-          <option value="">Auto-detect</option>
-          {PROVIDERS.map((p) => (
-            <option key={p} value={p}>{p}</option>
+          {!model && <option value="">Select a model...</option>}
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.id} — {m.input === 0 && m.output === 0 ? 'Free' : `$${m.input}/$${m.output} per 1M tokens`}
+            </option>
           ))}
+          <option value="__custom__">{isCustom ? `Custom: ${model}` : 'Custom model...'}</option>
         </select>
-      </Field>
+        {(isCustom || (!model && models.length === 0)) && (
+          <input
+            value={model}
+            onChange={(e) => onModelChange(e.target.value)}
+            placeholder="Enter model name"
+            className="input text-xs font-mono"
+            autoFocus
+          />
+        )}
+        {pricing && pricing.input > 0 && (
+          <p className="text-xs text-gray-500">
+            {formatPrice(pricing)}
+          </p>
+        )}
+      </div>
+    </Field>
+  )
+}
 
-      <Field label="Model">
-        <input
-          value={config.model || ''}
-          onChange={(e) => onChange({ ...config, model: e.target.value || null })}
-          placeholder={PROVIDER_DEFAULTS[config.provider || '']?.model || 'claude-sonnet-4-20250514'}
-          className="input"
-        />
-      </Field>
-
-      <Field label="API Key" hint={`Stored as ${envName}`}>
-        <input
-          type="password"
-          value={config.env_vars[envName] || ''}
-          onChange={(e) => {
-            const newEnvVars = { ...config.env_vars }
-            if (e.target.value) {
-              newEnvVars[envName] = e.target.value
-            } else {
-              delete newEnvVars[envName]
-            }
-            onChange({ ...config, api_key_env: envName, env_vars: newEnvVars })
-          }}
-          placeholder={`Paste your ${config.provider || 'anthropic'} API key`}
-          className="input font-mono text-xs"
-        />
-      </Field>
+function TestButton({ result, onTest }: { result: TestResult | null; onTest: () => void }) {
+  const state = result?.state || 'idle'
+  return (
+    <div className="space-y-1">
+      <button
+        type="button"
+        onClick={onTest}
+        disabled={state === 'testing'}
+        className={`px-3 py-1.5 text-xs font-medium rounded-lg transition flex items-center gap-1.5 ${
+          state === 'success'
+            ? 'bg-green-500/15 text-green-400 border border-green-500/30'
+            : state === 'error'
+              ? 'bg-red-500/15 text-red-400 border border-red-500/30'
+              : 'bg-white/5 text-gray-400 hover:bg-white/10 hover:text-white border border-gray-700/50'
+        } disabled:opacity-50`}
+      >
+        {state === 'testing' && <Spinner />}
+        {state === 'success' && <CheckIcon />}
+        {state === 'error' && <AlertIcon />}
+        {state === 'testing' ? 'Testing...' : state === 'success' ? 'Connected' : state === 'error' ? 'Failed — Retry' : 'Test Connection'}
+      </button>
+      {state === 'success' && result?.pricing && (
+        <p className="text-xs text-green-400/80 pl-1">
+          {formatPrice(result.pricing)}
+        </p>
+      )}
+      {state === 'error' && result?.error && (
+        <p className="text-xs text-red-400/80 pl-1">{result.error}</p>
+      )}
     </div>
   )
 }
@@ -92,5 +418,56 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
       {hint && <p className="text-xs text-gray-500 mb-1.5">{hint}</p>}
       {children}
     </div>
+  )
+}
+
+// ── Icons ───────────────────────────────────────────────────────────
+
+function XIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+    </svg>
+  )
+}
+
+function Spinner() {
+  return (
+    <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  )
+}
+
+function CheckIcon() {
+  return (
+    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  )
+}
+
+function AlertIcon() {
+  return (
+    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  )
+}
+
+function ArrowUpIcon() {
+  return (
+    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 15l7-7 7 7" />
+    </svg>
+  )
+}
+
+function ArrowDownIcon() {
+  return (
+    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+    </svg>
   )
 }

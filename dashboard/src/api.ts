@@ -176,6 +176,18 @@ export const myApi = {
 
   whatsappQr: () =>
     authedRequest<BridgeQrInfo>('/my/profile/whatsapp/qr'),
+
+  testProvider: (data: { provider: string; model: string; api_key?: string; api_key_env?: string; base_url?: string }) =>
+    authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-provider', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  testSearch: (data: { provider: string; api_key?: string; api_key_env?: string }) =>
+    authedRequest<{ ok: boolean; message?: string; error?: string }>('/my/test-search', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 }
 
 // Helper to get SSE log URL with auth token (user's own profile)

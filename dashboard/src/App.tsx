@@ -4,13 +4,12 @@ import { AuthProvider } from './contexts/AuthContext'
 import AuthGuard from './components/AuthGuard'
 import AdminGuard from './components/AdminGuard'
 import Layout from './components/Layout'
+import ProfileLayout from './layouts/ProfileLayout'
 import Dashboard from './pages/Dashboard'
-import ProfilePage from './pages/ProfilePage'
 import NewProfile from './pages/NewProfile'
-import Settings from './pages/Settings'
 import LoginPage from './pages/LoginPage'
-import MyProfile from './pages/MyProfile'
 import UsersPage from './pages/UsersPage'
+import { HomePage, LlmPage, MessagingPage, ToolsPage, SystemPage } from './pages/profile'
 
 export default function App() {
   return (
@@ -19,12 +18,28 @@ export default function App() {
         <Routes>
           <Route path="login" element={<LoginPage />} />
           <Route element={<AuthGuard><Layout /></AuthGuard>}>
+            {/* Global admin pages */}
             <Route index element={<Dashboard />} />
-            <Route path="my-profile" element={<MyProfile />} />
-            <Route path="settings" element={<Settings />} />
-            <Route path="profiles/new" element={<AdminGuard><NewProfile /></AdminGuard>} />
-            <Route path="profiles/:id" element={<AdminGuard><ProfilePage /></AdminGuard>} />
             <Route path="users" element={<AdminGuard><UsersPage /></AdminGuard>} />
+            <Route path="profiles/new" element={<AdminGuard><NewProfile /></AdminGuard>} />
+
+            {/* Admin managing specific profile */}
+            <Route path="profile/:id" element={<AdminGuard><ProfileLayout /></AdminGuard>}>
+              <Route index element={<HomePage />} />
+              <Route path="llm" element={<LlmPage />} />
+              <Route path="messaging" element={<MessagingPage />} />
+              <Route path="tools" element={<ToolsPage />} />
+              <Route path="system" element={<SystemPage />} />
+            </Route>
+
+            {/* User's own profile */}
+            <Route path="my" element={<ProfileLayout />}>
+              <Route index element={<HomePage />} />
+              <Route path="llm" element={<LlmPage />} />
+              <Route path="messaging" element={<MessagingPage />} />
+              <Route path="tools" element={<ToolsPage />} />
+              <Route path="system" element={<SystemPage />} />
+            </Route>
           </Route>
         </Routes>
       </ToastProvider>

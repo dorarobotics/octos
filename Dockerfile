@@ -37,7 +37,16 @@ RUN touch crates/*/src/*.rs && \
 # ============================================================
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata \
+    # Runtime deps for skills (pptx, mofa-pptx, browser)
+    nodejs npm ffmpeg chromium \
+    # LibreOffice + Poppler for office document conversion and visual QA
+    libreoffice poppler-utils \
+    # GCC for soffice sandbox shim (compiled on first use if needed)
+    gcc musl-dev
+
+# Install Node.js skill dependencies
+RUN npm install -g pptxgenjs react-icons react react-dom sharp
 
 # Copy binary
 COPY --from=builder /src/target/release/crew /usr/local/bin/crew

@@ -84,6 +84,11 @@ tree-sitter-typescript = "0.23"
 # Diff
 similar = "2"
 
+# Office file manipulation (DOCX/PPTX/XLSX are ZIP+XML)
+zip = "2"
+quick-xml = "0.37"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # Unix-specific (O_NOFOLLOW for symlink-safe file I/O)
 libc = "0.2"
 

@@ -296,20 +296,11 @@ pub async fn update_my_profile(
         profile.enabled = enabled;
     }
     if let Some(config) = req.config {
-        // Smart merge: preserve existing secrets if incoming value contains "***"
-        let mut merged = config;
-        for (key, new_val) in merged.env_vars.iter_mut() {
-            if new_val.contains("***") || new_val.is_empty() {
-                if let Some(old_val) = profile.config.env_vars.get(key) {
-                    *new_val = old_val.clone();
-                }
-            }
-        }
-        profile.config = merged;
+        profile.config = config;
     }
     profile.updated_at = chrono::Utc::now();
 
-    ps.save(&profile)
+    ps.save_with_merge(&mut profile)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let status = if let Some(ref pm) = state.process_manager {

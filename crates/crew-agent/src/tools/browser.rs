@@ -20,35 +20,10 @@ use super::{Tool, ToolResult};
 use crate::sandbox::BLOCKED_ENV_VARS;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OUTPUT_CHARS: usize = 50_000;
 
-use super::ssrf::{is_private_host, is_private_ip};
-
-async fn check_ssrf(url: &str) -> Option<String> {
-    let parsed = match reqwest::Url::parse(url) {
-        Ok(u) => u,
-        Err(_) => return Some("Invalid URL".to_string()),
-    };
-    let host = match parsed.host_str() {
-        Some(h) => h,
-        None => return Some("URL has no host".to_string()),
-    };
-    if is_private_host(host) {
-        return Some("Requests to private/internal hosts are not allowed".to_string());
-    }
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-        for addr in addrs {
-            if is_private_ip(&addr.ip()) {
-                return Some(
-                    "Requests to private/internal hosts are not allowed (DNS resolved to private IP)"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    None
-}
+use super::ssrf::check_ssrf;
 
 // --- Browser session ---
 
@@ -135,13 +110,33 @@ struct Input {
 
 pub struct BrowserTool {
     session: Arc<Mutex<Option<BrowserSession>>>,
+    /// Per-action timeout. If any single `execute()` call exceeds this, it returns
+    /// a timeout error and kills the browser session to avoid blocking the agent.
+    action_timeout: Duration,
+    config: Option<Arc<super::tool_config::ToolConfigStore>>,
 }
 
 impl BrowserTool {
     pub fn new() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            action_timeout: DEFAULT_ACTION_TIMEOUT,
+            config: None,
         }
+    }
+
+    /// Create a browser tool with a custom per-action timeout.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+            action_timeout: timeout,
+            config: None,
+        }
+    }
+
+    pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     async fn ensure_session(guard: &mut Option<BrowserSession>) -> Result<()> {
@@ -292,6 +287,41 @@ impl Tool for BrowserTool {
             }
         }
 
+        // Resolve timeout from config, falling back to constructor value
+        let timeout = match &self.config {
+            Some(c) => {
+                let secs = c.get_u64("browser", "action_timeout_secs").await;
+                secs.map(Duration::from_secs).unwrap_or(self.action_timeout)
+            }
+            None => self.action_timeout,
+        };
+        // Wrap the entire session-holding section with a timeout to prevent
+        // a stuck Chrome from blocking the agent indefinitely.
+        let session_arc = self.session.clone();
+        match tokio::time::timeout(timeout, self.execute_action(input)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Timeout: kill the browser session so the next call starts fresh
+                let mut guard = session_arc.lock().await;
+                if let Some(session) = guard.take() {
+                    session.shutdown().await;
+                }
+                Ok(ToolResult {
+                    output: format!(
+                        "Browser action timed out after {}s. Session killed. \
+                         Try a simpler approach or use web_fetch/web_search instead.",
+                        timeout.as_secs()
+                    ),
+                    success: false,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
+impl BrowserTool {
+    async fn execute_action(&self, input: Input) -> Result<ToolResult> {
         let mut guard = self.session.lock().await;
         if let Err(e) = Self::ensure_session(&mut guard).await {
             return Ok(ToolResult {
@@ -612,6 +642,7 @@ impl Tool for BrowserTool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ssrf::is_private_host;
     use super::*;
 
     #[test]

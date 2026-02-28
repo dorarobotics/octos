@@ -10,6 +10,8 @@
 //! the next one is attempted. Perplexity is last because it costs the most but
 //! gives the best answers (AI-synthesized with citations).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
 use reqwest::Client;
@@ -20,6 +22,7 @@ use super::{Tool, ToolResult};
 
 pub struct WebSearchTool {
     client: Client,
+    config: Option<Arc<super::tool_config::ToolConfigStore>>,
 }
 
 impl WebSearchTool {
@@ -29,7 +32,13 @@ impl WebSearchTool {
                 .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .build()
                 .unwrap_or_else(|_| Client::new()),
+            config: None,
         }
+    }
+
+    pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
+        self.config = Some(config);
+        self
     }
 }
 
@@ -42,12 +51,8 @@ impl Default for WebSearchTool {
 #[derive(Deserialize)]
 struct Input {
     query: String,
-    #[serde(default = "default_count")]
-    count: u8,
-}
-
-fn default_count() -> u8 {
-    5
+    #[serde(default)]
+    count: Option<u8>,
 }
 
 // --- Brave types ---
@@ -144,7 +149,11 @@ impl Tool for WebSearchTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid web_search input")?;
 
-        let count = input.count.clamp(1, 10);
+        let config_count = match &self.config {
+            Some(c) => c.get_u64("web_search", "count").await.map(|v| v as u8),
+            None => None,
+        };
+        let count = input.count.or(config_count).unwrap_or(5).clamp(1, 10);
 
         // Provider priority: free/cheap first, Perplexity as AI-powered fallback.
         // 1. DuckDuckGo (free, always available)

@@ -31,6 +31,17 @@ pub struct Config {
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Override auto-detected model behavior hints for the OpenAI provider.
+    /// Useful for custom/unknown models behind OpenAI-compatible proxies.
+    #[serde(default)]
+    pub model_hints: Option<crew_llm::openai::ModelHints>,
+
+    /// API protocol type: "openai" (default) or "anthropic".
+    /// When set to "anthropic", the Anthropic Messages API format is used
+    /// regardless of the provider name (for Anthropic-compatible proxies).
+    #[serde(default)]
+    pub api_type: Option<String>,
+
     /// Gateway configuration (optional).
     #[serde(default)]
     pub gateway: Option<GatewayConfig>,
@@ -61,6 +72,10 @@ pub struct Config {
     #[serde(default)]
     pub fallback_models: Vec<FallbackModel>,
 
+    /// Maximum agent iterations per message (overridden by --max-iterations).
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+
     /// Lifecycle hooks for agent events.
     #[serde(default)]
     pub hooks: Vec<crew_agent::HookConfig>,
@@ -74,6 +89,10 @@ pub struct Config {
     /// Each entry registers a provider under a short key that the LLM can reference.
     #[serde(default)]
     pub sub_providers: Vec<SubProviderConfig>,
+
+    /// Email sending configuration for the send_email tool.
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
 
     /// Dashboard user authentication configuration (email OTP).
     /// When set, enables multi-user login via email verification codes.
@@ -96,6 +115,12 @@ pub struct FallbackModel {
     /// Override the API key env var for this fallback.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Override auto-detected model hints for this fallback.
+    #[serde(default)]
+    pub model_hints: Option<crew_llm::openai::ModelHints>,
+    /// API protocol type: "openai" or "anthropic". Overrides provider default.
+    #[serde(default)]
+    pub api_type: Option<String>,
 }
 
 /// A sub-provider available for subagent spawning via the spawn tool.
@@ -126,6 +151,9 @@ pub struct SubProviderConfig {
     /// sub-agent trims conversation history during its tool loop.
     #[serde(default)]
     pub default_context_window: Option<u32>,
+    /// API protocol type: "openai" or "anthropic". Overrides provider default.
+    #[serde(default)]
+    pub api_type: Option<String>,
 }
 
 /// Embedding provider configuration.
@@ -146,6 +174,38 @@ pub struct EmbeddingConfig {
 
 fn default_embedding_provider() -> String {
     "openai".to_string()
+}
+
+/// Email sending configuration for the `send_email` tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmailConfig {
+    /// Provider: "smtp" or "feishu" / "lark".
+    pub provider: String,
+
+    // -- SMTP fields --
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Environment variable holding the SMTP password.
+    #[serde(default)]
+    pub password_env: Option<String>,
+    #[serde(default)]
+    pub from_address: Option<String>,
+
+    // -- Feishu/Lark fields --
+    #[serde(default)]
+    pub feishu_app_id: Option<String>,
+    /// Environment variable holding the Feishu app secret.
+    #[serde(default)]
+    pub feishu_app_secret_env: Option<String>,
+    #[serde(default)]
+    pub feishu_from_address: Option<String>,
+    /// "cn" (default) or "global".
+    #[serde(default)]
+    pub feishu_region: Option<String>,
 }
 
 impl Config {
@@ -203,6 +263,29 @@ pub struct GatewayConfig {
     /// Maximum concurrent session processing. Default: 10.
     #[serde(default = "default_max_concurrent_sessions")]
     pub max_concurrent_sessions: usize,
+
+    /// Per-action timeout in seconds for the browser tool. Default: 300 (5 minutes).
+    /// If a single browser action exceeds this, the session is killed and an error is returned.
+    #[serde(default)]
+    pub browser_timeout_secs: Option<u64>,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            channels: vec![ChannelEntry {
+                channel_type: "cli".into(),
+                allowed_senders: vec![],
+                settings: serde_json::json!({}),
+            }],
+            max_history: default_max_history(),
+            system_prompt: None,
+            queue_mode: QueueMode::default(),
+            max_sessions: default_max_sessions(),
+            max_concurrent_sessions: default_max_concurrent_sessions(),
+            browser_timeout_secs: None,
+        }
+    }
 }
 
 fn default_max_sessions() -> usize {
@@ -337,13 +420,11 @@ impl Config {
         }
 
         // Fall back to environment variable.
-        let env_var = self.api_key_env.clone().unwrap_or_else(|| match provider {
-            "anthropic" => "ANTHROPIC_API_KEY".to_string(),
-            "openai" => "OPENAI_API_KEY".to_string(),
-            "gemini" => "GEMINI_API_KEY".to_string(),
-            "zhipu" | "glm" => "ZHIPU_API_KEY".to_string(),
-            "zai" | "z.ai" => "ZAI_API_KEY".to_string(),
-            _ => format!("{}_API_KEY", provider.to_uppercase()),
+        let env_var = self.api_key_env.clone().unwrap_or_else(|| {
+            crew_llm::registry::lookup(provider)
+                .and_then(|e| e.api_key_env)
+                .map(String::from)
+                .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
         });
 
         std::env::var(&env_var).wrap_err_with(|| {
@@ -358,32 +439,12 @@ impl Config {
 
         // Check provider is valid
         if let Some(ref provider) = self.provider {
-            const VALID: &[&str] = &[
-                "anthropic",
-                "openai",
-                "gemini",
-                "openrouter",
-                "deepseek",
-                "groq",
-                "moonshot",
-                "kimi",
-                "dashscope",
-                "qwen",
-                "minimax",
-                "zhipu",
-                "glm",
-                "zai",
-                "z.ai",
-                "nvidia",
-                "nim",
-                "ollama",
-                "vllm",
-            ];
-            if !VALID.contains(&provider.as_str()) {
+            if crew_llm::registry::lookup(provider).is_none() {
+                let valid = crew_llm::registry::all_names();
                 warnings.push(format!(
                     "Unknown provider '{}'. Valid options: {}",
                     provider,
-                    VALID.join(", ")
+                    valid.join(", ")
                 ));
             }
         }
@@ -430,13 +491,11 @@ impl Config {
         // Check API key is set
         let provider = self.provider.as_deref().unwrap_or("anthropic");
         if self.get_api_key(provider).is_err() {
-            let env_var = self.api_key_env.clone().unwrap_or_else(|| match provider {
-                "anthropic" => "ANTHROPIC_API_KEY".to_string(),
-                "openai" => "OPENAI_API_KEY".to_string(),
-                "gemini" => "GEMINI_API_KEY".to_string(),
-                "zhipu" | "glm" => "ZHIPU_API_KEY".to_string(),
-                "zai" | "z.ai" => "ZAI_API_KEY".to_string(),
-                _ => format!("{}_API_KEY", provider.to_uppercase()),
+            let env_var = self.api_key_env.clone().unwrap_or_else(|| {
+                crew_llm::registry::lookup(provider)
+                    .and_then(|e| e.api_key_env)
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{}_API_KEY", provider.to_uppercase()))
             });
             warnings.push(format!("{} environment variable not set", env_var));
         }
@@ -485,35 +544,7 @@ fn is_valid_model_for_provider(provider: &str, model: &str) -> bool {
 
 /// Detect LLM provider from model name when no explicit provider is set.
 pub fn detect_provider(model: &str) -> Option<&'static str> {
-    let m = model.to_lowercase();
-    if m.contains("claude") {
-        return Some("anthropic");
-    }
-    if m.contains("gpt") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
-        return Some("openai");
-    }
-    if m.contains("gemini") {
-        return Some("gemini");
-    }
-    if m.contains("deepseek") {
-        return Some("deepseek");
-    }
-    if m.contains("kimi") || m.contains("moonshot") {
-        return Some("moonshot");
-    }
-    if m.contains("qwen") {
-        return Some("dashscope");
-    }
-    if m.contains("glm") {
-        return Some("zhipu");
-    }
-    if m.contains("minimax") {
-        return Some("minimax");
-    }
-    if m.contains("llama") || m.contains("mixtral") {
-        return Some("groq");
-    }
-    None
+    crew_llm::registry::detect_provider(model)
 }
 
 #[cfg(test)]
@@ -651,6 +682,7 @@ mod tests {
                 queue_mode: QueueMode::default(),
                 max_sessions: default_max_sessions(),
                 max_concurrent_sessions: default_max_concurrent_sessions(),
+                browser_timeout_secs: None,
             }),
             ..Default::default()
         };
@@ -717,6 +749,7 @@ mod tests {
                 queue_mode: QueueMode::default(),
                 max_sessions: default_max_sessions(),
                 max_concurrent_sessions: default_max_concurrent_sessions(),
+                browser_timeout_secs: None,
             }),
             ..Default::default()
         };

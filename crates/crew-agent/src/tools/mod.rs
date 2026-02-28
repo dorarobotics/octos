@@ -231,11 +231,14 @@ pub mod glob_tool;
 pub mod grep_tool;
 pub mod list_dir;
 pub mod message;
+pub mod news_digest;
 pub mod read_file;
 pub mod recall_memory;
 pub mod save_memory;
+pub mod send_email;
 pub mod send_file;
 pub mod shell;
+pub mod site_crawl;
 pub mod spawn;
 pub mod take_photo;
 pub mod web_fetch;
@@ -243,6 +246,7 @@ pub mod web_search;
 pub mod write_file;
 
 pub mod browser;
+pub mod tool_config;
 
 #[cfg(feature = "git")]
 pub mod git;
@@ -258,11 +262,14 @@ pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use message::MessageTool;
+pub use news_digest::NewsDigestTool;
 pub use read_file::ReadFileTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
+pub use send_email::{EmailSender, FeishuEmailSender, SendEmailTool, SmtpEmailSender};
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
+pub use site_crawl::DeepCrawlTool;
 pub use spawn::SpawnTool;
 pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;
@@ -270,6 +277,7 @@ pub use web_search::WebSearchTool;
 pub use write_file::WriteFileTool;
 
 pub use browser::BrowserTool;
+pub use tool_config::{ConfigureToolTool, ToolConfigStore};
 
 #[cfg(feature = "git")]
 pub use git::GitTool;
@@ -501,6 +509,23 @@ impl ToolRegistry {
         #[cfg(feature = "ast")]
         registry.register(CodeStructureTool::new(cwd));
         registry
+    }
+
+    /// Re-register builtin configurable tools with a ToolConfigStore.
+    ///
+    /// Tools already registered by `with_builtins_and_sandbox()` are replaced
+    /// with config-aware instances. Also registers the `configure_tool` tool.
+    pub fn inject_tool_config(&mut self, config: Arc<ToolConfigStore>) {
+        if self.tools.contains_key("web_search") {
+            self.register(WebSearchTool::new().with_config(config.clone()));
+        }
+        if self.tools.contains_key("web_fetch") {
+            self.register(WebFetchTool::new().with_config(config.clone()));
+        }
+        if self.tools.contains_key("browser") {
+            self.register(BrowserTool::new().with_config(config.clone()));
+        }
+        self.register(ConfigureToolTool::new(config));
     }
 }
 

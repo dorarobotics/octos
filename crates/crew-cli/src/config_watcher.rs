@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::profiles::UserProfile;
 
 /// What changed in the config.
 #[derive(Debug, Clone)]
@@ -84,10 +85,16 @@ impl ConfigWatcher {
     }
 
     /// Parse config from the first non-empty buffer.
+    /// Tries `Config` format first, then `UserProfile` format (for --profile mode).
     fn parse_first(buffers: &[(PathBuf, Vec<u8>)]) -> Option<Config> {
         let (path, bytes) = buffers.first()?;
-        match serde_json::from_slice(bytes) {
-            Ok(c) => Some(c),
+        // Try Config format first
+        if let Ok(c) = serde_json::from_slice::<Config>(bytes) {
+            return Some(c);
+        }
+        // Try UserProfile format (for --profile mode)
+        match serde_json::from_slice::<UserProfile>(bytes) {
+            Ok(profile) => Some(crate::profiles::config_from_profile(&profile, None, None)),
             Err(e) => {
                 warn!("config reload failed for {}: {e}", path.display());
                 None

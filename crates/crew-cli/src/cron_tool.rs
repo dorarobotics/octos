@@ -12,11 +12,29 @@ use serde::Deserialize;
 
 pub struct CronTool {
     service: Arc<CronService>,
+    default_channel: std::sync::Mutex<String>,
+    default_chat_id: std::sync::Mutex<String>,
 }
 
 impl CronTool {
     pub fn new(service: Arc<CronService>) -> Self {
-        Self { service }
+        Self {
+            service,
+            default_channel: std::sync::Mutex::new(String::new()),
+            default_chat_id: std::sync::Mutex::new(String::new()),
+        }
+    }
+
+    /// Update the default channel/chat_id context (called per inbound message).
+    pub fn set_context(&self, channel: &str, chat_id: &str) {
+        *self
+            .default_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = channel.to_string();
+        *self
+            .default_chat_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
     }
 }
 
@@ -49,9 +67,10 @@ impl Tool for CronTool {
 
     fn description(&self) -> &str {
         "Schedule recurring or one-time tasks. Actions: add, list, remove, enable, disable. \
-         IMPORTANT: When adding a job, you MUST specify 'channel' and 'chat_id' so the \
-         reminder can be delivered. For Telegram users, use channel='telegram' and the \
-         user's numeric chat_id. Use 'every_seconds' for recurring reminders, not 'at_ms'."
+         When adding a job, 'channel' and 'chat_id' are auto-filled from the current \
+         conversation — you do NOT need to ask the user for them. Just call add with \
+         'message' and 'every_seconds' (or 'cron_expr'). \
+         Use 'every_seconds' for recurring reminders, not 'at_ms'."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -85,11 +104,11 @@ impl Tool for CronTool {
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Channel to deliver to (e.g. 'telegram')"
+                    "description": "Channel to deliver to: 'telegram', 'whatsapp', 'feishu', etc. Must match the current conversation's channel."
                 },
                 "chat_id": {
                     "type": "string",
-                    "description": "Chat ID to deliver to"
+                    "description": "Chat ID to deliver to. Use the current conversation's chat_id / sender_id."
                 },
                 "job_id": {
                     "type": "string",
@@ -162,11 +181,35 @@ impl CronTool {
             });
         };
 
+        // Auto-fill channel/chat_id from current session context if not provided
+        let channel = input.channel.or_else(|| {
+            let ch = self
+                .default_channel
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if ch.is_empty() {
+                None
+            } else {
+                Some(ch.clone())
+            }
+        });
+        let chat_id = input.chat_id.or_else(|| {
+            let cid = self
+                .default_chat_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cid.is_empty() {
+                None
+            } else {
+                Some(cid.clone())
+            }
+        });
+
         let payload = CronPayload {
             message,
-            deliver: input.channel.is_some(),
-            channel: input.channel,
-            chat_id: input.chat_id,
+            deliver: channel.is_some(),
+            channel,
+            chat_id,
         };
 
         let name = input.name.unwrap_or_else(|| "unnamed".into());

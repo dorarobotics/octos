@@ -37,6 +37,7 @@ pub struct DeepResearchTool {
     /// Channel for background completion notifications.
     notify_tx: tokio::sync::mpsc::Sender<ResearchNotification>,
     worker_count: AtomicU32,
+    config: Option<Arc<super::tool_config::ToolConfigStore>>,
 }
 
 impl DeepResearchTool {
@@ -52,7 +53,13 @@ impl DeepResearchTool {
             data_dir: data_dir.into(),
             notify_tx,
             worker_count: AtomicU32::new(0),
+            config: None,
         }
+    }
+
+    pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Split a research question into independent sub-questions using an LLM call.
@@ -179,6 +186,7 @@ impl DeepResearchTool {
         research_dir: &Path,
         report_path: &Path,
         worker_num: u32,
+        custom_prompt: Option<&str>,
     ) -> Result<ToolResult> {
         // Step 1: Split question
         info!(question, "splitting question into sub-questions");
@@ -190,7 +198,14 @@ impl DeepResearchTool {
             Err(e) => {
                 warn!(error = %e, "failed to split question, falling back to single agent");
                 return self
-                    .execute_single(question, max_iter, research_dir, report_path, worker_num)
+                    .execute_single(
+                        question,
+                        max_iter,
+                        research_dir,
+                        report_path,
+                        worker_num,
+                        custom_prompt,
+                    )
                     .await;
             }
         };
@@ -199,7 +214,10 @@ impl DeepResearchTool {
         // Each parallel agent gets the full iteration budget — they run concurrently,
         // so total wall-clock time stays similar to a single agent.
         let per_agent_iter = max_iter.max(10);
-        let researcher_prompt = include_str!("../prompts/researcher.txt").to_string();
+        let researcher_prompt = match custom_prompt {
+            Some(p) => p.to_string(),
+            None => include_str!("../prompts/researcher.txt").to_string(),
+        };
 
         // Step 2: Spawn parallel sub-agents
         info!(
@@ -347,10 +365,14 @@ impl DeepResearchTool {
         research_dir: &Path,
         report_path: &Path,
         worker_num: u32,
+        custom_prompt: Option<&str>,
     ) -> Result<ToolResult> {
         let worker_id = AgentId::new(format!("researcher-{worker_num}"));
         let tools = build_research_tools(research_dir);
-        let system_prompt = include_str!("../prompts/researcher.txt").to_string();
+        let system_prompt = match custom_prompt {
+            Some(p) => p.to_string(),
+            None => include_str!("../prompts/researcher.txt").to_string(),
+        };
 
         let config = AgentConfig {
             max_iterations: max_iter,
@@ -419,24 +441,17 @@ impl DeepResearchTool {
 #[derive(Deserialize)]
 struct Input {
     question: String,
-    #[serde(default = "default_max_iterations")]
-    max_iterations: u32,
-    #[serde(default = "default_parallel")]
-    parallel: bool,
-    #[serde(default = "default_mode")]
-    mode: String,
-}
-
-fn default_max_iterations() -> u32 {
-    25
-}
-
-fn default_parallel() -> bool {
-    true
-}
-
-fn default_mode() -> String {
-    "background".into()
+    #[serde(default)]
+    max_iterations: Option<u32>,
+    #[serde(default)]
+    parallel: Option<bool>,
+    #[serde(default)]
+    mode: Option<String>,
+    /// Optional custom system prompt for the researcher sub-agents.
+    /// When provided, replaces the default researcher.txt prompt.
+    /// Use this to give sub-agents domain-specific instructions.
+    #[serde(default)]
+    system_prompt: Option<String>,
 }
 
 #[async_trait]
@@ -450,7 +465,9 @@ impl Tool for DeepResearchTool {
          crawl sources, and synthesize a comprehensive report with tables and citations. \
          Default mode is 'background': returns immediately so the user can continue chatting, \
          and notifies when the report is ready. Use 'sync' mode only when the user needs the \
-         report content inline. Use this for any research question that needs thorough investigation."
+         report content inline. Use this for any research question that needs thorough investigation. \
+         You can provide a custom system_prompt to give sub-agents domain-specific instructions \
+         (e.g. focus on academic papers, use specific terminology, crawl certain sites)."
     }
 
     fn tags(&self) -> &[&str] {
@@ -477,6 +494,10 @@ impl Tool for DeepResearchTool {
                     "type": "string",
                     "enum": ["background", "sync"],
                     "description": "background (default): return immediately, notify when done. sync: wait for report."
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "Custom system prompt for researcher sub-agents. Overrides the default researcher instructions. Use to give domain-specific guidance (e.g. 'Focus on academic papers from arxiv', 'Only use Chinese-language sources', 'Crawl the official docs at https://example.com/docs/')."
                 }
             },
             "required": ["question"]
@@ -487,9 +508,30 @@ impl Tool for DeepResearchTool {
         let input: Input =
             serde_json::from_value(args.clone()).wrap_err("invalid deep_research input")?;
 
-        let max_iter = input.max_iterations.clamp(5, 50);
+        let (cfg_max_iter, cfg_parallel, cfg_mode) = match &self.config {
+            Some(c) => (
+                c.get_u64("deep_research", "max_iterations")
+                    .await
+                    .map(|v| v as u32),
+                c.get_bool("deep_research", "parallel").await,
+                c.get_str("deep_research", "mode").await,
+            ),
+            None => (None, None, None),
+        };
+
+        let max_iter = input
+            .max_iterations
+            .or(cfg_max_iter)
+            .unwrap_or(25)
+            .clamp(5, 50);
+        let parallel = input.parallel.or(cfg_parallel).unwrap_or(true);
+        let mode = input
+            .mode
+            .or(cfg_mode)
+            .unwrap_or_else(|| "background".into());
+
         let worker_num = self.worker_count.fetch_add(1, Ordering::SeqCst);
-        let background = input.mode == "background";
+        let background = mode == "background";
 
         // Build output path
         let slug = slugify(&input.question);
@@ -502,8 +544,8 @@ impl Tool for DeepResearchTool {
         info!(
             question = %input.question,
             max_iterations = max_iter,
-            parallel = input.parallel,
-            mode = %input.mode,
+            parallel = parallel,
+            mode = %mode,
             "starting deep research"
         );
 
@@ -512,10 +554,11 @@ impl Tool for DeepResearchTool {
             let llm = self.llm.clone();
             let memory = self.memory.clone();
             let question = input.question.clone();
-            let parallel = input.parallel;
+            let bg_parallel = parallel;
             let notify_tx = self.notify_tx.clone();
             let data_dir = self.data_dir.clone();
             let rp = report_path.clone();
+            let custom_prompt = input.system_prompt.clone();
 
             tokio::spawn(async move {
                 // Build a temporary DeepResearchTool for the background task.
@@ -527,14 +570,29 @@ impl Tool for DeepResearchTool {
                     data_dir,
                     notify_tx: dummy_tx,
                     worker_count: AtomicU32::new(worker_num),
+                    config: None,
                 };
 
-                let result = if parallel {
-                    tool.execute_parallel(&question, max_iter, &research_dir, &rp, worker_num)
-                        .await
+                let result = if bg_parallel {
+                    tool.execute_parallel(
+                        &question,
+                        max_iter,
+                        &research_dir,
+                        &rp,
+                        worker_num,
+                        custom_prompt.as_deref(),
+                    )
+                    .await
                 } else {
-                    tool.execute_single(&question, max_iter, &research_dir, &rp, worker_num)
-                        .await
+                    tool.execute_single(
+                        &question,
+                        max_iter,
+                        &research_dir,
+                        &rp,
+                        worker_num,
+                        custom_prompt.as_deref(),
+                    )
+                    .await
                 };
 
                 let (success, summary) = match result {
@@ -563,13 +621,15 @@ impl Tool for DeepResearchTool {
             })
         } else {
             // Sync mode: wait for result
-            if input.parallel {
+            let custom_prompt = input.system_prompt.as_deref();
+            if parallel {
                 self.execute_parallel(
                     &input.question,
                     max_iter,
                     &research_dir,
                     &report_path,
                     worker_num,
+                    custom_prompt,
                 )
                 .await
             } else {
@@ -579,6 +639,7 @@ impl Tool for DeepResearchTool {
                     &research_dir,
                     &report_path,
                     worker_num,
+                    custom_prompt,
                 )
                 .await
             }
@@ -591,6 +652,8 @@ fn build_research_tools(cwd: &Path) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register(super::WebSearchTool::new());
     tools.register(super::WebFetchTool::new());
+    tools.register(super::BrowserTool::new());
+    tools.register(super::DeepCrawlTool::new(cwd));
     tools.register(super::DeepSearchTool::new(cwd));
     tools.register(super::ReadFileTool::new(cwd));
     tools.register(super::WriteFileTool::new(cwd));
@@ -715,11 +778,6 @@ mod tests {
     fn test_slugify() {
         assert_eq!(slugify("top AI startups 2025"), "top-ai-startups-2025");
         assert_eq!(slugify("What are the best GPUs?"), "what-are-the-best-gpus");
-    }
-
-    #[test]
-    fn test_default_max_iterations() {
-        assert_eq!(default_max_iterations(), 25);
     }
 
     #[test]

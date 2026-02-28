@@ -11,6 +11,8 @@ use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ChannelEntry, Config, FallbackModel, GatewayConfig, QueueMode};
+
 /// A user profile with all configuration needed to run a gateway.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
@@ -33,7 +35,7 @@ pub struct UserProfile {
 }
 
 /// LLM and gateway configuration for a profile.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProfileConfig {
     /// LLM provider name (anthropic, openai, moonshot, deepseek, etc.).
     #[serde(default)]
@@ -47,20 +49,77 @@ pub struct ProfileConfig {
     /// Env var name for API key.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Fallback models for provider failover chain.
+    #[serde(default)]
+    pub fallback_models: Vec<FallbackModelConfig>,
     /// Channel configurations.
     #[serde(default)]
     pub channels: Vec<ChannelCredentials>,
     /// Gateway-specific settings.
     #[serde(default)]
     pub gateway: GatewaySettings,
+    /// Email sending configuration (SMTP or Feishu/Lark).
+    #[serde(default)]
+    pub email: Option<EmailSettings>,
+    /// API protocol type: "openai" or "anthropic". Overrides provider default.
+    #[serde(default)]
+    pub api_type: Option<String>,
     /// Environment variables to pass to the gateway process (e.g. API keys).
     /// Keys are env var names, values are the actual secrets.
     #[serde(default)]
     pub env_vars: HashMap<String, String>,
 }
 
+/// Email sending tool configuration for a profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmailSettings {
+    /// Provider: "smtp" or "feishu" / "lark".
+    pub provider: String,
+
+    // -- SMTP fields --
+    #[serde(default)]
+    pub smtp_host: Option<String>,
+    #[serde(default)]
+    pub smtp_port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Env var name holding the SMTP password.
+    #[serde(default)]
+    pub password_env: Option<String>,
+    #[serde(default)]
+    pub from_address: Option<String>,
+
+    // -- Feishu/Lark fields --
+    #[serde(default)]
+    pub feishu_app_id: Option<String>,
+    /// Env var name holding the Feishu app secret.
+    #[serde(default)]
+    pub feishu_app_secret_env: Option<String>,
+    #[serde(default)]
+    pub feishu_from_address: Option<String>,
+    /// "cn" (default) or "global".
+    #[serde(default)]
+    pub feishu_region: Option<String>,
+}
+
+/// A fallback model entry for the provider failover chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FallbackModelConfig {
+    /// Provider name (e.g. "openai", "moonshot", "deepseek").
+    pub provider: String,
+    /// Model name.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Env var name for API key (if different from primary).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// API protocol type: "openai" or "anthropic".
+    #[serde(default)]
+    pub api_type: Option<String>,
+}
+
 /// Channel-specific credentials (tagged by type).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ChannelCredentials {
     Telegram {
@@ -151,7 +210,7 @@ fn default_email_pass_env() -> String {
 }
 
 /// Gateway-specific settings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GatewaySettings {
     #[serde(default)]
     pub max_history: Option<usize>,
@@ -161,6 +220,8 @@ pub struct GatewaySettings {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub max_concurrent_sessions: Option<usize>,
+    #[serde(default)]
+    pub browser_timeout_secs: Option<u64>,
 }
 
 /// Manages profile storage as individual JSON files.
@@ -253,6 +314,24 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Save a profile, merging masked/empty secret values with the existing profile.
+    ///
+    /// For each env var: if the incoming value contains "***" or is empty, the
+    /// existing saved value is preserved. This prevents the masked values
+    /// returned by GET from overwriting the real secrets.
+    pub fn save_with_merge(&self, profile: &mut UserProfile) -> Result<()> {
+        if let Some(existing) = self.get(&profile.id)? {
+            for (key, new_val) in profile.config.env_vars.iter_mut() {
+                if new_val.contains("***") || new_val.is_empty() {
+                    if let Some(old_val) = existing.config.env_vars.get(key) {
+                        *new_val = old_val.clone();
+                    }
+                }
+            }
+        }
+        self.save(profile)
+    }
+
     /// Delete a profile by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         let path = self.profile_path(id);
@@ -272,84 +351,7 @@ impl ProfileStore {
         }
     }
 
-    /// Generate a crew-rs config JSON for a profile's gateway process.
-    ///
-    /// `bridge_url_override`: if provided, replaces the WhatsApp bridge_url in the
-    /// generated config. Used by managed bridges where the ProcessManager assigns
-    /// a dynamic port.
-    pub fn generate_config(
-        &self,
-        profile: &UserProfile,
-        bridge_url_override: Option<&str>,
-        feishu_webhook_port_override: Option<u16>,
-    ) -> Result<PathBuf> {
-        let config_dir = self.profiles_dir.join(&profile.id);
-        std::fs::create_dir_all(&config_dir)?;
-        let config_path = config_dir.join("config.json");
-
-        let channels: Vec<serde_json::Value> = profile
-            .config
-            .channels
-            .iter()
-            .map(|ch| {
-                let mut entry = channel_to_entry(ch);
-                // Override WhatsApp bridge_url if managed
-                if let ChannelCredentials::WhatsApp { .. } = ch {
-                    if let Some(url) = bridge_url_override {
-                        entry["settings"]["bridge_url"] = serde_json::json!(url);
-                    }
-                }
-                // Override Feishu webhook_port if auto-assigned
-                if let ChannelCredentials::Feishu { .. } = ch {
-                    if let Some(port) = feishu_webhook_port_override {
-                        entry["settings"]["webhook_port"] = serde_json::json!(port);
-                    }
-                }
-                entry
-            })
-            .collect();
-
-        let mut gateway = serde_json::json!({
-            "channels": channels,
-        });
-        if let Some(mh) = profile.config.gateway.max_history {
-            gateway["max_history"] = serde_json::json!(mh);
-        }
-        if let Some(ref sp) = profile.config.gateway.system_prompt {
-            gateway["system_prompt"] = serde_json::json!(sp);
-        }
-        if let Some(mcs) = profile.config.gateway.max_concurrent_sessions {
-            gateway["max_concurrent_sessions"] = serde_json::json!(mcs);
-        }
-
-        let mut config = serde_json::json!({
-            "gateway": gateway,
-        });
-
-        // Resolve provider: map friendly names to native provider + base_url
-        if let Some(ref p) = profile.config.provider {
-            let (native_provider, default_base_url) = resolve_provider(p);
-            config["provider"] = serde_json::json!(native_provider);
-            // base_url priority: explicit override > provider mapping
-            if let Some(ref url) = profile.config.base_url {
-                config["base_url"] = serde_json::json!(url);
-            } else if let Some(url) = default_base_url {
-                config["base_url"] = serde_json::json!(url);
-            }
-        }
-        if let Some(ref m) = profile.config.model {
-            config["model"] = serde_json::json!(m);
-        }
-        if let Some(ref k) = profile.config.api_key_env {
-            config["api_key_env"] = serde_json::json!(k);
-        }
-
-        let content = serde_json::to_string_pretty(&config)?;
-        std::fs::write(&config_path, content)?;
-        Ok(config_path)
-    }
-
-    fn profile_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn profile_path(&self, id: &str) -> PathBuf {
         self.profiles_dir.join(format!("{id}.json"))
     }
 }
@@ -396,35 +398,108 @@ fn validate_profile_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Map a friendly provider name to (native_provider, optional_base_url).
+/// Build a `Config` in-memory from a `UserProfile`, without writing any file.
 ///
-/// Native providers (anthropic, openai, gemini, openrouter) are passed through.
-/// OpenAI-compatible providers are mapped to "openai" with their API base URL.
-fn resolve_provider(name: &str) -> (&str, Option<&str>) {
-    match name {
-        // Native providers — no base_url needed
-        "anthropic" => ("anthropic", None),
-        "openai" => ("openai", None),
-        "gemini" => ("gemini", None),
-        "openrouter" => ("openrouter", None),
-        // OpenAI-compatible providers
-        "deepseek" => ("openai", Some("https://api.deepseek.com/v1")),
-        "groq" => ("openai", Some("https://api.groq.com/openai/v1")),
-        "moonshot" => ("openai", Some("https://api.moonshot.ai/v1")),
-        "dashscope" => ("openai", Some("https://dashscope.aliyuncs.com/compatible-mode/v1")),
-        "minimax" => ("openai", Some("https://api.minimax.chat/v1")),
-        "zhipu" => ("openai", Some("https://open.bigmodel.cn/api/paas/v4")),
-        "ollama" => ("openai", Some("http://localhost:11434/v1")),
-        "vllm" => ("openai", Some("http://localhost:8000/v1")),
-        // Unknown — pass through as-is
-        other => (other, None),
+/// Used by `crew gateway --profile <path>` to load configuration directly
+/// from the profile JSON (the single source of truth).
+pub(crate) fn config_from_profile(
+    profile: &UserProfile,
+    bridge_url_override: Option<&str>,
+    feishu_port_override: Option<u16>,
+) -> Config {
+    let channels: Vec<ChannelEntry> = profile
+        .config
+        .channels
+        .iter()
+        .map(|ch| {
+            let mut entry = channel_to_entry(ch);
+            // Override WhatsApp bridge_url if managed
+            if let ChannelCredentials::WhatsApp { .. } = ch {
+                if let Some(url) = bridge_url_override {
+                    entry["settings"]["bridge_url"] = serde_json::json!(url);
+                }
+            }
+            // Override Feishu webhook_port if auto-assigned
+            if let ChannelCredentials::Feishu { .. } = ch {
+                if let Some(port) = feishu_port_override {
+                    entry["settings"]["webhook_port"] = serde_json::json!(port);
+                }
+            }
+            // Convert serde_json::Value → ChannelEntry
+            serde_json::from_value(entry).expect("channel_to_entry produces valid ChannelEntry")
+        })
+        .collect();
+
+    let fallback_models: Vec<FallbackModel> = profile
+        .config
+        .fallback_models
+        .iter()
+        .map(|fb| FallbackModel {
+            provider: fb.provider.clone(),
+            model: fb.model.clone(),
+            base_url: None,
+            api_key_env: fb.api_key_env.clone(),
+            model_hints: None,
+            api_type: fb.api_type.clone(),
+        })
+        .collect();
+
+    Config {
+        provider: profile.config.provider.clone(),
+        model: profile.config.model.clone(),
+        base_url: profile.config.base_url.clone(),
+        api_key_env: profile.config.api_key_env.clone(),
+        api_type: profile.config.api_type.clone(),
+        max_iterations: profile.config.gateway.max_iterations,
+        gateway: Some(GatewayConfig {
+            channels,
+            max_history: profile.config.gateway.max_history.unwrap_or(50),
+            system_prompt: profile.config.gateway.system_prompt.clone(),
+            queue_mode: QueueMode::default(),
+            max_sessions: 1000,
+            max_concurrent_sessions: profile.config.gateway.max_concurrent_sessions.unwrap_or(10),
+            browser_timeout_secs: profile.config.gateway.browser_timeout_secs,
+        }),
+        fallback_models,
+        // Fields not configured through profiles — use defaults
+        version: None,
+        model_hints: None,
+        mcp_servers: vec![],
+        sandbox: Default::default(),
+        tool_policy: None,
+        tool_policy_by_provider: Default::default(),
+        embedding: None,
+        hooks: vec![],
+        context_filter: vec![],
+        sub_providers: vec![],
+        email: profile
+            .config
+            .email
+            .as_ref()
+            .map(|e| crate::config::EmailConfig {
+                provider: e.provider.clone(),
+                smtp_host: e.smtp_host.clone(),
+                smtp_port: e.smtp_port,
+                username: e.username.clone(),
+                password_env: e.password_env.clone(),
+                from_address: e.from_address.clone(),
+                feishu_app_id: e.feishu_app_id.clone(),
+                feishu_app_secret_env: e.feishu_app_secret_env.clone(),
+                feishu_from_address: e.feishu_from_address.clone(),
+                feishu_region: e.feishu_region.clone(),
+            }),
+        #[cfg(feature = "api")]
+        dashboard_auth: None,
     }
 }
 
 /// Convert a `ChannelCredentials` to a crew-rs `ChannelEntry` JSON value.
 fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
     match cred {
-        ChannelCredentials::Telegram { token_env, allowed_senders } => {
+        ChannelCredentials::Telegram {
+            token_env,
+            allowed_senders,
+        } => {
             let senders: Vec<&str> = allowed_senders
                 .split(',')
                 .map(|s| s.trim())
@@ -505,6 +580,66 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
     }
 }
 
+/// Classification of changes between two profile versions.
+#[derive(Debug)]
+pub enum ProfileChange {
+    /// No meaningful change detected.
+    Unchanged,
+    /// Only hot-reloadable fields changed (gateway's own watcher handles these).
+    HotReloadable,
+    /// Fields changed that require a gateway restart.
+    RestartRequired(Vec<String>),
+}
+
+/// Compare two profiles and classify the nature of changes.
+///
+/// Restart-required: provider, model, base_url, api_key_env, channels,
+///   fallback_models, env_vars.
+/// Hot-reloadable: system_prompt, max_history, max_iterations,
+///   max_concurrent_sessions, browser_timeout_secs.
+pub fn diff_profiles(old: &UserProfile, new: &UserProfile) -> ProfileChange {
+    let mut restart_fields = Vec::new();
+    let oc = &old.config;
+    let nc = &new.config;
+
+    // Restart-required fields
+    if oc.provider != nc.provider {
+        restart_fields.push("provider".into());
+    }
+    if oc.model != nc.model {
+        restart_fields.push("model".into());
+    }
+    if oc.base_url != nc.base_url {
+        restart_fields.push("base_url".into());
+    }
+    if oc.api_key_env != nc.api_key_env {
+        restart_fields.push("api_key_env".into());
+    }
+    if oc.channels != nc.channels {
+        restart_fields.push("channels".into());
+    }
+    if oc.fallback_models != nc.fallback_models {
+        restart_fields.push("fallback_models".into());
+    }
+    if oc.env_vars != nc.env_vars {
+        restart_fields.push("env_vars".into());
+    }
+    if oc.email != nc.email {
+        restart_fields.push("email".into());
+    }
+
+    if !restart_fields.is_empty() {
+        return ProfileChange::RestartRequired(restart_fields);
+    }
+
+    // Hot-reloadable fields
+    if oc.gateway != nc.gateway {
+        return ProfileChange::HotReloadable;
+    }
+
+    ProfileChange::Unchanged
+}
+
 /// Check if a profile has a Feishu channel and return its webhook port configuration.
 ///
 /// Returns:
@@ -513,7 +648,10 @@ fn channel_to_entry(cred: &ChannelCredentials) -> serde_json::Value {
 /// - `None` — no Feishu channel
 pub fn feishu_webhook_port(profile: &UserProfile) -> Option<Option<u16>> {
     for ch in &profile.config.channels {
-        if let ChannelCredentials::Feishu { mode, webhook_port, .. } = ch {
+        if let ChannelCredentials::Feishu {
+            mode, webhook_port, ..
+        } = ch
+        {
             if mode == "webhook" {
                 return Some(*webhook_port);
             }
@@ -552,7 +690,6 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
-                base_url: None,
                 api_key_env: Some("ANTHROPIC_API_KEY".into()),
                 channels: vec![ChannelCredentials::Telegram {
                     token_env: "TG_TOKEN".into(),
@@ -562,7 +699,7 @@ mod tests {
                     max_history: Some(50),
                     ..Default::default()
                 },
-                env_vars: Default::default(),
+                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -582,10 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
-
+    fn test_config_from_profile() {
         let profile = UserProfile {
             id: "gen-test".into(),
             name: "Config Gen".into(),
@@ -594,8 +728,6 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("openai".into()),
                 model: Some("gpt-4o".into()),
-                base_url: None,
-                api_key_env: None,
                 channels: vec![
                     ChannelCredentials::Telegram {
                         token_env: "TG".into(),
@@ -611,29 +743,23 @@ mod tests {
                     system_prompt: Some("Hello".into()),
                     ..Default::default()
                 },
-                env_vars: Default::default(),
+                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
-        let config_path = store.generate_config(&profile, None, None).unwrap();
-        assert!(config_path.exists());
-
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(json["provider"], "openai");
-        assert_eq!(json["model"], "gpt-4o");
-        assert_eq!(json["gateway"]["max_history"], 100);
-        assert_eq!(json["gateway"]["system_prompt"], "Hello");
-        assert_eq!(json["gateway"]["channels"].as_array().unwrap().len(), 2);
+        let config = config_from_profile(&profile, None, None);
+        assert_eq!(config.provider.as_deref(), Some("openai"));
+        assert_eq!(config.model.as_deref(), Some("gpt-4o"));
+        let gw = config.gateway.unwrap();
+        assert_eq!(gw.max_history, 100);
+        assert_eq!(gw.system_prompt.as_deref(), Some("Hello"));
+        assert_eq!(gw.channels.len(), 2);
     }
 
     #[test]
-    fn test_generate_config_provider_mapping() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
-
+    fn test_config_from_profile_provider_passthrough() {
         let profile = UserProfile {
             id: "moonshot-test".into(),
             name: "Moonshot".into(),
@@ -642,30 +768,21 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("moonshot".into()),
                 model: Some("kimi-k2.5".into()),
-                base_url: None,
                 api_key_env: Some("MOONSHOT_API_KEY".into()),
-                channels: vec![],
-                gateway: GatewaySettings::default(),
-                env_vars: Default::default(),
+                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
-        let config_path = store.generate_config(&profile, None, None).unwrap();
-        let content = std::fs::read_to_string(&config_path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-        // "moonshot" should be mapped to "openai" with Moonshot base_url
-        assert_eq!(json["provider"], "openai");
-        assert_eq!(json["base_url"], "https://api.moonshot.ai/v1");
-        assert_eq!(json["model"], "kimi-k2.5");
+        let config = config_from_profile(&profile, None, None);
+        assert_eq!(config.provider.as_deref(), Some("moonshot"));
+        assert!(config.base_url.is_none());
+        assert_eq!(config.model.as_deref(), Some("kimi-k2.5"));
     }
 
     #[test]
-    fn test_generate_config_bridge_url_override() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::open(dir.path()).unwrap();
-
+    fn test_config_from_profile_bridge_url_override() {
         let profile = UserProfile {
             id: "wa-test".into(),
             name: "WA Test".into(),
@@ -674,37 +791,24 @@ mod tests {
             config: ProfileConfig {
                 provider: Some("anthropic".into()),
                 model: Some("claude-sonnet-4-20250514".into()),
-                base_url: None,
-                api_key_env: None,
                 channels: vec![ChannelCredentials::WhatsApp {
                     bridge_url: "ws://localhost:3001".into(),
                 }],
-                gateway: GatewaySettings::default(),
-                env_vars: Default::default(),
+                ..Default::default()
             },
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
 
         // Without override: uses original bridge_url
-        let config_path = store.generate_config(&profile, None, None).unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["gateway"]["channels"][0]["settings"]["bridge_url"],
-            "ws://localhost:3001"
-        );
+        let config = config_from_profile(&profile, None, None);
+        let gw = config.gateway.as_ref().unwrap();
+        assert_eq!(gw.channels[0].settings["bridge_url"], "ws://localhost:3001");
 
         // With override: uses managed bridge URL
-        let config_path = store
-            .generate_config(&profile, Some("ws://localhost:3105"), None)
-            .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["gateway"]["channels"][0]["settings"]["bridge_url"],
-            "ws://localhost:3105"
-        );
+        let config = config_from_profile(&profile, Some("ws://localhost:3105"), None);
+        let gw = config.gateway.as_ref().unwrap();
+        assert_eq!(gw.channels[0].settings["bridge_url"], "ws://localhost:3105");
     }
 
     #[test]
@@ -782,6 +886,133 @@ mod tests {
             let meta = std::fs::metadata(store.profile_path("perms-test")).unwrap();
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn test_save_with_merge_preserves_masked_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::open(dir.path()).unwrap();
+
+        // Save a profile with real secrets
+        let original = UserProfile {
+            id: "merge-test".into(),
+            name: "Merge".into(),
+            enabled: false,
+            data_dir: None,
+            config: ProfileConfig {
+                env_vars: [
+                    ("API_KEY".into(), "sk-real-secret-key".into()),
+                    ("OTHER".into(), "value-to-keep".into()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save(&original).unwrap();
+
+        // Simulate update with masked values and a new value
+        let mut updated = UserProfile {
+            id: "merge-test".into(),
+            name: "Merge".into(),
+            enabled: false,
+            data_dir: None,
+            config: ProfileConfig {
+                env_vars: [
+                    ("API_KEY".into(), "sk-r***key".into()), // masked — should keep original
+                    ("OTHER".into(), "new-value".into()),    // changed — should update
+                    ("NEW_KEY".into(), "brand-new".into()),  // new — should add
+                ]
+                .into(),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.save_with_merge(&mut updated).unwrap();
+
+        let loaded = store.get("merge-test").unwrap().unwrap();
+        assert_eq!(loaded.config.env_vars["API_KEY"], "sk-real-secret-key");
+        assert_eq!(loaded.config.env_vars["OTHER"], "new-value");
+        assert_eq!(loaded.config.env_vars["NEW_KEY"], "brand-new");
+    }
+
+    #[test]
+    fn test_diff_profiles_restart_required() {
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            config: ProfileConfig {
+                provider: Some("openai".into()),
+                model: Some("gpt-4o".into()),
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.model = Some("gpt-4o-mini".into());
+
+        match diff_profiles(&base, &changed) {
+            ProfileChange::RestartRequired(fields) => {
+                assert!(fields.contains(&"model".into()));
+            }
+            other => panic!("expected RestartRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_diff_profiles_hot_reloadable() {
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            config: ProfileConfig {
+                provider: Some("openai".into()),
+                gateway: GatewaySettings {
+                    system_prompt: Some("old".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let mut changed = base.clone();
+        changed.config.gateway.system_prompt = Some("new".into());
+
+        assert!(matches!(
+            diff_profiles(&base, &changed),
+            ProfileChange::HotReloadable
+        ));
+    }
+
+    #[test]
+    fn test_diff_profiles_unchanged() {
+        let base = UserProfile {
+            id: "diff-test".into(),
+            name: "Diff".into(),
+            enabled: false,
+            data_dir: None,
+            config: ProfileConfig::default(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Only name changed (not config) — should be Unchanged
+        let mut changed = base.clone();
+        changed.name = "New Name".into();
+
+        assert!(matches!(
+            diff_profiles(&base, &changed),
+            ProfileChange::Unchanged
+        ));
     }
 
     #[test]

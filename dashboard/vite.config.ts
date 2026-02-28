@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/admin/',
+  base: '/',
   build: {
     outDir: '../crates/crew-cli/static/admin',
     emptyOutDir: true,

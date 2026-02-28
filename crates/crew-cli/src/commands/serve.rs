@@ -191,6 +191,80 @@ impl ServeCommand {
             }
         }
 
+        // Profile file watcher: auto-restart gateways when profile JSON changes.
+        {
+            let ps = profile_store.clone();
+            let pm = process_manager.clone();
+            tokio::spawn(async move {
+                use crate::profiles::{ProfileChange, UserProfile, diff_profiles};
+                use sha2::{Digest, Sha256};
+                use std::collections::HashMap;
+
+                // Snapshot of known profile states: (hash, profile)
+                let mut known: HashMap<String, ([u8; 32], UserProfile)> = HashMap::new();
+                // Seed with current profiles
+                if let Ok(list) = ps.list() {
+                    for p in list {
+                        if let Ok(bytes) = std::fs::read(ps.profile_path(&p.id)) {
+                            let hash: [u8; 32] = Sha256::digest(&bytes).into();
+                            known.insert(p.id.clone(), (hash, p));
+                        }
+                    }
+                }
+
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    let current = match ps.list() {
+                        Ok(list) => list,
+                        Err(_) => continue,
+                    };
+                    for profile in &current {
+                        let bytes = match std::fs::read(ps.profile_path(&profile.id)) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        };
+                        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+
+                        if let Some((old_hash, old_profile)) = known.get(&profile.id) {
+                            if hash == *old_hash {
+                                continue; // no change
+                            }
+                            // File changed — check if gateway is running
+                            let status = pm.status(&profile.id).await;
+                            if status.running {
+                                match diff_profiles(old_profile, profile) {
+                                    ProfileChange::RestartRequired(fields) => {
+                                        tracing::info!(
+                                            profile = %profile.id,
+                                            fields = ?fields,
+                                            "profile changed (restart-required fields), restarting gateway"
+                                        );
+                                        if let Err(e) = pm.restart(profile).await {
+                                            tracing::warn!(
+                                                profile = %profile.id,
+                                                error = %e,
+                                                "failed to restart gateway after profile change"
+                                            );
+                                        }
+                                    }
+                                    ProfileChange::HotReloadable => {
+                                        // Gateway's own ConfigWatcher handles hot-reload
+                                        tracing::debug!(
+                                            profile = %profile.id,
+                                            "profile changed (hot-reloadable only), gateway watcher will handle"
+                                        );
+                                    }
+                                    ProfileChange::Unchanged => {}
+                                }
+                            }
+                        }
+                        known.insert(profile.id.clone(), (hash, profile.clone()));
+                    }
+                }
+            });
+        }
+
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);
 
@@ -250,6 +324,15 @@ impl ServeCommand {
 
         let sandbox = crew_agent::create_sandbox(&config.sandbox);
         let mut tools = ToolRegistry::with_builtins_and_sandbox(cwd, sandbox);
+
+        // Open tool config store for user-customizable tool defaults
+        let tool_config = std::sync::Arc::new(
+            crew_agent::ToolConfigStore::open(data_dir)
+                .await
+                .wrap_err("failed to open tool config store")?,
+        );
+        tools.inject_tool_config(tool_config);
+
         tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
 
         // MCP tools
@@ -264,6 +347,16 @@ impl ServeCommand {
         let plugin_dirs = Config::plugin_dirs(cwd);
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
+        }
+
+        // Send email tool
+        if let Some(ref email_cfg) = config.email {
+            match super::gateway::build_email_sender(email_cfg) {
+                Ok(sender) => {
+                    tools.register(crew_agent::SendEmailTool::new(sender));
+                }
+                Err(e) => tracing::warn!("skipping send_email tool: {e}"),
+            }
         }
 
         let mut agent =
