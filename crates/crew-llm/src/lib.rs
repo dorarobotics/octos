@@ -26,7 +26,7 @@ pub mod openrouter;
 pub mod registry;
 pub mod transcription;
 
-pub use config::ChatConfig;
+pub use config::{ChatConfig, ToolChoice};
 pub use context_override::ContextWindowOverride;
 pub use embedding::{EmbeddingProvider, OpenAIEmbedder};
 pub use failover::ProviderChain;

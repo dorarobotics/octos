@@ -28,6 +28,7 @@ use super::Executable;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, QueueMode, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
+use crate::persona_service::PersonaService;
 use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
@@ -394,6 +395,7 @@ impl GatewayCommand {
         // Build enhanced system prompt
         let system_prompt = build_system_prompt(
             gw_config.system_prompt.as_deref(),
+            &data_dir,
             &project_dir,
             &memory_store,
             &skills_loader,
@@ -631,6 +633,40 @@ impl GatewayCommand {
                         webhook_port,
                     )));
                 }
+                #[cfg(feature = "wecom")]
+                "wecom" => {
+                    let corp_id_env =
+                        settings_str(&entry.settings, "corp_id_env", "WECOM_CORP_ID");
+                    let secret_env =
+                        settings_str(&entry.settings, "agent_secret_env", "WECOM_AGENT_SECRET");
+                    let corp_id = std::env::var(&corp_id_env)
+                        .wrap_err_with(|| format!("{corp_id_env} environment variable not set"))?;
+                    let agent_secret = std::env::var(&secret_env)
+                        .wrap_err_with(|| format!("{secret_env} environment variable not set"))?;
+                    let agent_id = settings_str(&entry.settings, "agent_id", "");
+                    let verification_token =
+                        settings_str(&entry.settings, "verification_token", "");
+                    let encoding_aes_key =
+                        settings_str(&entry.settings, "encoding_aes_key", "");
+                    let webhook_port: u16 = entry
+                        .settings
+                        .get("webhook_port")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(9322) as u16;
+                    channel_mgr.register(Arc::new(
+                        crew_bus::WeComChannel::new(
+                            &corp_id,
+                            &agent_id,
+                            &agent_secret,
+                            &verification_token,
+                            &encoding_aes_key,
+                            entry.allowed_senders.clone(),
+                            shutdown.clone(),
+                            media_dir.clone(),
+                        )
+                        .with_webhook_port(webhook_port),
+                    ));
+                }
                 other => {
                     println!(
                         "{}: channel '{}' not supported, skipping",
@@ -686,6 +722,45 @@ impl GatewayCommand {
 
         // Wrap agent in Arc for sharing across spawned tasks
         let agent = Arc::new(agent);
+
+        // Start persona service (generates communication style from chat history)
+        let persona_service = Arc::new(PersonaService::new(
+            data_dir.clone(),
+            session_mgr.clone(),
+            llm_for_compaction.clone(),
+            crate::persona_service::DEFAULT_INTERVAL_SECS,
+        ));
+        {
+            let agent_for_persona = agent.clone();
+            let base_prompt = gw_config.system_prompt.clone();
+            let data_dir_p = data_dir.clone();
+            let project_dir_p = project_dir.clone();
+            let memory_store_p = memory_store.clone();
+            let tool_config_p = tool_config.clone();
+            persona_service.start(move |_persona_text| {
+                // Rebuild the full system prompt with the new persona and hot-update
+                let base = base_prompt.clone();
+                let dd = data_dir_p.clone();
+                let pd = project_dir_p.clone();
+                let ms = memory_store_p.clone();
+                let tc = tool_config_p.clone();
+                let agent = agent_for_persona.clone();
+                tokio::spawn(async move {
+                    let sl = SkillsLoader::new(&pd);
+                    let new_prompt = build_system_prompt(
+                        base.as_deref(),
+                        &dd,
+                        &pd,
+                        &ms,
+                        &sl,
+                        &tc,
+                    )
+                    .await;
+                    agent.set_system_prompt(new_prompt);
+                    info!("system prompt updated with new persona");
+                });
+            });
+        }
 
         // Per-session locks to serialize messages within the same session.
         // Pruned periodically to prevent unbounded growth.
@@ -942,6 +1017,7 @@ impl GatewayCommand {
             let _ = h.await;
         }
 
+        persona_service.stop().await;
         heartbeat_service.stop().await;
         cron_service.stop().await;
         channel_mgr.stop_all().await?;
@@ -1106,32 +1182,39 @@ fn strip_think_tags(s: &str) -> String {
 /// Build the system prompt with bootstrap files, memory context, and skills.
 async fn build_system_prompt(
     base: Option<&str>,
+    data_dir: &Path,
     project_dir: &Path,
     memory_store: &MemoryStore,
     skills_loader: &SkillsLoader,
     tool_config: &crew_agent::ToolConfigStore,
 ) -> String {
-    let default_prompt = "You are a helpful AI assistant. Your role is to:\n\
+    let default_prompt = "You are Crew, a smart and resourceful AI assistant. \
+        You're direct, warm, and occasionally witty — like a capable friend who happens to \
+        know how to code, research, and get things done.\n\
         \n\
-        1. EXECUTE: Complete the assigned task using available tools\n\
-        2. REPORT: Provide clear status updates\n\
-        3. ESCALATE: Request help when blocked\n\
+        ## How to work\n\
+        - Be conversational and natural — not robotic or overly formal\n\
+        - Keep responses concise. Don't over-explain. Get to the point.\n\
+        - Use your tools proactively to get things done — don't just describe what you could do\n\
+        - When a task takes time (web_search, deep_search, deep_research, spawn, take_photo, \
+        or multi-step tool work), FIRST use the `message` tool to immediately acknowledge \
+        the user and briefly say what you're about to do. Never leave the user waiting in silence.\n\
+        - When you hit a wall, say so honestly and suggest alternatives\n\
+        - When the user shares preferences, personal info, or important facts, \
+        save them using `save_memory` so you remember next time\n\
         \n\
-        Guidelines:\n\
-        - Make minimal, focused changes\n\
-        - Verify your work before completing\n\
-        - Report any blockers or uncertainties\n\
-        - Keep code simple and readable\n\
-        - You may use standard markdown formatting: **bold**, *italic*, `code`, \
-        ```code blocks```, ~~strikethrough~~, [text](url), > blockquotes, \
-        # headings, and - bullet lists. These will be rendered for the user.\n\
-        - When the user shares preferences, personal info, or important project facts, \
-        proactively save them to the memory bank using `save_memory`\n\
-        - IMPORTANT: For ANY task that takes time (web_search, deep_search, deep_research, \
-        spawn, take_photo, or multi-step tool work), you MUST first use the `message` tool \
-        to immediately acknowledge the user and briefly describe what you are about to do. \
-        Then perform the actual work. The user should never wait in silence.";
+        ## Formatting\n\
+        - You may use markdown: **bold**, *italic*, `code`, ```code blocks```, \
+        ~~strikethrough~~, [text](url), > blockquotes, and - bullet lists\n\
+        - But don't over-format. Plain conversational text is often better than \
+        a wall of bullet points.";
     let mut prompt = base.unwrap_or(default_prompt).to_string();
+
+    // Inject dynamically generated persona (from persona.md) if available
+    if let Some(persona) = PersonaService::read_persona(data_dir) {
+        prompt.push_str("\n\n## Communication Style\n\n");
+        prompt.push_str(&persona);
+    }
 
     // Append bootstrap files (AGENTS.md, SOUL.md, USER.md, etc.)
     let bootstrap = super::load_bootstrap_files(project_dir);
@@ -1192,7 +1275,8 @@ async fn build_system_prompt(
     feature = "whatsapp",
     feature = "email",
     feature = "feishu",
-    feature = "twilio"
+    feature = "twilio",
+    feature = "wecom"
 ))]
 fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> String {
     settings

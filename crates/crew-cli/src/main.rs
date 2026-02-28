@@ -13,6 +13,7 @@ pub mod config_watcher;
 pub mod cron_tool;
 #[cfg(feature = "api")]
 pub mod otp;
+pub mod persona_service;
 #[cfg(feature = "api")]
 pub mod process_manager;
 pub mod profiles;
