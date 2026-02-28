@@ -10,13 +10,16 @@ use clap::Args;
 use colored::Colorize;
 use crew_agent::{
     Agent, AgentConfig, HookExecutor, MessageTool, SendFileTool, SilentReporter, SkillsLoader,
-    SpawnTool, TakePhotoTool, ToolRegistry,
+    SpawnTool, /* TakePhotoTool, */ ToolRegistry,
 };
 use crew_bus::{
     ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
 };
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
-use crew_llm::{GroqTranscriber, LlmProvider, ProviderChain, ProviderRouter, RetryProvider};
+use crew_llm::{
+    AdaptiveConfig, AdaptiveRouter, GroqTranscriber, LlmProvider, ProviderChain, ProviderRouter,
+    RetryProvider,
+};
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use tokio::sync::{Mutex, Semaphore};
@@ -29,6 +32,7 @@ use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, QueueMode, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
+use crate::status_indicator::StatusIndicator;
 use crate::cron_tool::CronTool;
 
 /// Run as a persistent gateway daemon.
@@ -177,7 +181,19 @@ impl GatewayCommand {
                     }
                 }
             }
-            Arc::new(ProviderChain::new(providers))
+            if let Some(ref ar) = config.adaptive_routing {
+                if ar.enabled {
+                    info!("adaptive routing enabled");
+                    Arc::new(AdaptiveRouter::new(
+                        providers,
+                        AdaptiveConfig::from(ar),
+                    ))
+                } else {
+                    Arc::new(ProviderChain::new(providers))
+                }
+            } else {
+                Arc::new(ProviderChain::new(providers))
+            }
         };
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
@@ -206,6 +222,27 @@ impl GatewayCommand {
 
         // Initialize skills loader (project-level, from cwd/.crew/)
         let project_dir = cwd.join(".crew");
+
+        // Auto-install system-skills and app-skills if no skills are installed yet
+        let skills_dir = project_dir.join("skills");
+        if !skills_dir.exists() || is_dir_empty(&skills_dir) {
+            info!("No skills installed. Auto-installing default skills...");
+            let crew_exe = std::env::current_exe().unwrap_or("crew".into());
+            for repo in ["hagency-org/system-skills", "hagency-org/app-skills"] {
+                let status = std::process::Command::new(&crew_exe)
+                    .args(["skills", "install", repo, "--cwd"])
+                    .arg(&cwd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .status();
+                match status {
+                    Ok(s) if s.success() => info!("{repo} installed successfully"),
+                    Ok(s) => warn!("{repo} install exited with: {s}"),
+                    Err(e) => warn!("Failed to auto-install {repo}: {e}"),
+                }
+            }
+        }
+
         let skills_loader = SkillsLoader::new(&project_dir);
 
         // Create message bus (before publisher is consumed by channel manager)
@@ -244,16 +281,6 @@ impl GatewayCommand {
                 .wrap_err("failed to open tool config store")?,
         );
         tools.inject_tool_config(tool_config.clone());
-
-        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
-        tools.register(
-            crew_agent::DeepCrawlTool::new(data_dir.join("research"))
-                .with_config(tool_config.clone()),
-        );
-        tools.register(
-            crew_agent::NewsDigestTool::new(llm.clone(), &data_dir)
-                .with_config(tool_config.clone()),
-        );
 
         // Override browser tool with configured timeout (replaces default 300s)
         if let Some(secs) = gw_config.browser_timeout_secs {
@@ -305,9 +332,10 @@ impl GatewayCommand {
         let send_file_tool = Arc::new(SendFileTool::new(out_tx.clone()));
         tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
 
-        // Take photo tool (camera capture + send)
-        let take_photo_tool = Arc::new(TakePhotoTool::new(out_tx));
-        tools.register_arc(take_photo_tool.clone() as Arc<dyn crew_agent::Tool>);
+        // Take photo tool (camera capture + send) — disabled for now
+        // let take_photo_tool = Arc::new(TakePhotoTool::new(out_tx));
+        // tools.register_arc(take_photo_tool.clone() as Arc<dyn crew_agent::Tool>);
+        drop(out_tx);
 
         // Build sub-provider router from config
         let provider_router = if !config.sub_providers.is_empty() {
@@ -378,19 +406,7 @@ impl GatewayCommand {
         tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
 
-        // Send email tool (configured via config.email)
-        if let Some(ref email_cfg) = config.email {
-            match build_email_sender(email_cfg) {
-                Ok(sender) => {
-                    tools.register(crew_agent::SendEmailTool::new(sender));
-                    info!(
-                        "send_email tool registered (provider: {})",
-                        email_cfg.provider
-                    );
-                }
-                Err(e) => warn!("skipping send_email tool: {e}"),
-            }
-        }
+        // Note: send_email tool is now provided by the system-skills package
 
         // Build enhanced system prompt
         let system_prompt = build_system_prompt(
@@ -723,10 +739,24 @@ impl GatewayCommand {
         // Wrap agent in Arc for sharing across spawned tasks
         let agent = Arc::new(agent);
 
+        // Create status indicators for each channel (used for typing + dynamic status)
+        let status_words = PersonaService::read_status_words(&data_dir);
+        let status_indicators: Arc<HashMap<String, Arc<StatusIndicator>>> = {
+            let mut map = HashMap::new();
+            for entry in &gw_config.channels {
+                if let Some(ch) = channel_mgr.get_channel(&entry.channel_type) {
+                    map.insert(
+                        entry.channel_type.clone(),
+                        Arc::new(StatusIndicator::new(ch, status_words.clone())),
+                    );
+                }
+            }
+            Arc::new(map)
+        };
+
         // Start persona service (generates communication style from chat history)
         let persona_service = Arc::new(PersonaService::new(
             data_dir.clone(),
-            session_mgr.clone(),
             llm_for_compaction.clone(),
             crate::persona_service::DEFAULT_INTERVAL_SECS,
         ));
@@ -737,29 +767,39 @@ impl GatewayCommand {
             let project_dir_p = project_dir.clone();
             let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
-            persona_service.start(move |_persona_text| {
-                // Rebuild the full system prompt with the new persona and hot-update
-                let base = base_prompt.clone();
-                let dd = data_dir_p.clone();
-                let pd = project_dir_p.clone();
-                let ms = memory_store_p.clone();
-                let tc = tool_config_p.clone();
-                let agent = agent_for_persona.clone();
-                tokio::spawn(async move {
-                    let sl = SkillsLoader::new(&pd);
-                    let new_prompt = build_system_prompt(
-                        base.as_deref(),
-                        &dd,
-                        &pd,
-                        &ms,
-                        &sl,
-                        &tc,
-                    )
-                    .await;
-                    agent.set_system_prompt(new_prompt);
-                    info!("system prompt updated with new persona");
-                });
-            });
+            let indicators = status_indicators.clone();
+            persona_service.start(
+                move |_persona_text| {
+                    // Rebuild the full system prompt with the new persona and hot-update
+                    let base = base_prompt.clone();
+                    let dd = data_dir_p.clone();
+                    let pd = project_dir_p.clone();
+                    let ms = memory_store_p.clone();
+                    let tc = tool_config_p.clone();
+                    let agent = agent_for_persona.clone();
+                    tokio::spawn(async move {
+                        let sl = SkillsLoader::new(&pd);
+                        let new_prompt = build_system_prompt(
+                            base.as_deref(),
+                            &dd,
+                            &pd,
+                            &ms,
+                            &sl,
+                            &tc,
+                        )
+                        .await;
+                        agent.set_system_prompt(new_prompt);
+                        info!("system prompt updated with new persona");
+                    });
+                },
+                move |words| {
+                    // Update status word pools in all indicators
+                    for indicator in indicators.values() {
+                        indicator.set_words(words.clone());
+                    }
+                    info!("status words updated in indicators");
+                },
+            );
         }
 
         // Per-session locks to serialize messages within the same session.
@@ -928,7 +968,7 @@ impl GatewayCommand {
             let semaphore = concurrency_semaphore.clone();
             let message_tool = message_tool.clone();
             let send_file_tool = send_file_tool.clone();
-            let take_photo_tool = take_photo_tool.clone();
+            // let take_photo_tool = take_photo_tool.clone();
             let spawn_tool = spawn_tool.clone();
             let cron_tool = cron_tool.clone();
             let llm_for_compaction = llm_for_compaction.clone();
@@ -937,6 +977,7 @@ impl GatewayCommand {
             let shutdown = shutdown.clone();
             let queue_mode = gw_config.queue_mode.clone();
             let collect_inbound_tx = collect_inbound_tx.clone();
+            let status_indicator = status_indicators.get(&reply_channel).cloned();
 
             let session_key_str = session_key.to_string();
             let locks_for_prune = session_locks.clone();
@@ -968,7 +1009,7 @@ impl GatewayCommand {
                     &session_mgr,
                     &message_tool,
                     &send_file_tool,
-                    &take_photo_tool,
+                    // &take_photo_tool,
                     &spawn_tool,
                     &cron_tool,
                     &llm_for_compaction,
@@ -981,6 +1022,7 @@ impl GatewayCommand {
                     max_history.load(Ordering::Relaxed),
                     &queue_mode,
                     &collect_inbound_tx,
+                    status_indicator.as_deref(),
                 )
                 .await;
             });
@@ -1033,7 +1075,7 @@ async fn process_session_message(
     session_mgr: &Mutex<SessionManager>,
     message_tool: &MessageTool,
     send_file_tool: &SendFileTool,
-    take_photo_tool: &TakePhotoTool,
+    // take_photo_tool: &TakePhotoTool,
     spawn_tool: &SpawnTool,
     cron_tool: &CronTool,
     llm: &Arc<dyn LlmProvider>,
@@ -1046,11 +1088,12 @@ async fn process_session_message(
     max_history: usize,
     queue_mode: &QueueMode,
     collect_tx: &tokio::sync::mpsc::Sender<crew_core::InboundMessage>,
+    status_indicator: Option<&StatusIndicator>,
 ) {
     // Set tool context for this session's reply routing
     message_tool.set_context(reply_channel, reply_chat_id);
     send_file_tool.set_context(reply_channel, reply_chat_id);
-    take_photo_tool.set_context(reply_channel, reply_chat_id);
+    // take_photo_tool.set_context(reply_channel, reply_chat_id);
     spawn_tool.set_context(reply_channel, reply_chat_id);
     cron_tool.set_context(reply_channel, reply_chat_id);
 
@@ -1061,21 +1104,19 @@ async fn process_session_message(
         session.get_history(max_history).to_vec()
     };
 
-    // Send a quick acknowledgment so the user knows we're working on it
-    let ack = OutboundMessage {
-        channel: reply_channel.to_string(),
-        chat_id: reply_chat_id.to_string(),
-        content: "Thinking...".to_string(),
-        reply_to: None,
-        media: vec![],
-        metadata: serde_json::json!({}),
-    };
-    let _ = out_tx.send(ack).await;
+    // Start dynamic status indicator (typing + rotating status message)
+    let status_handle =
+        status_indicator.map(|si| si.start(reply_chat_id.to_string(), &inbound.content));
 
     // Process message through agent (potentially long LLM call, no lock held)
     let response = agent
         .process_message(&inbound.content, &history, image_media)
         .await;
+
+    // Stop status indicator and clean up status message
+    if let Some(handle) = status_handle {
+        handle.stop().await;
+    }
 
     match response {
         Ok(conv_response) => {
@@ -1188,26 +1229,11 @@ async fn build_system_prompt(
     skills_loader: &SkillsLoader,
     tool_config: &crew_agent::ToolConfigStore,
 ) -> String {
-    let default_prompt = "You are Crew, a smart and resourceful AI assistant. \
-        You're direct, warm, and occasionally witty — like a capable friend who happens to \
-        know how to code, research, and get things done.\n\
-        \n\
-        ## How to work\n\
-        - Be conversational and natural — not robotic or overly formal\n\
-        - Keep responses concise. Don't over-explain. Get to the point.\n\
-        - Use your tools proactively to get things done — don't just describe what you could do\n\
-        - When a task takes time (web_search, deep_search, deep_research, spawn, take_photo, \
-        or multi-step tool work), FIRST use the `message` tool to immediately acknowledge \
-        the user and briefly say what you're about to do. Never leave the user waiting in silence.\n\
-        - When you hit a wall, say so honestly and suggest alternatives\n\
-        - When the user shares preferences, personal info, or important facts, \
-        save them using `save_memory` so you remember next time\n\
-        \n\
-        ## Formatting\n\
-        - You may use markdown: **bold**, *italic*, `code`, ```code blocks```, \
-        ~~strikethrough~~, [text](url), > blockquotes, and - bullet lists\n\
-        - But don't over-format. Plain conversational text is often better than \
-        a wall of bullet points.";
+    let default_prompt = "You are Crew, an AI assistant. \
+        Reply directly — never say \"Thinking\" or narrate your reasoning process. \
+        Only use the `message` tool to send an early heads-up when you need to run slow tools \
+        (deep_search, deep_research, spawn, take_photo) — NOT for simple questions. \
+        Save important user preferences with `save_memory`.";
     let mut prompt = base.unwrap_or(default_prompt).to_string();
 
     // Inject dynamically generated persona (from persona.md) if available
@@ -1286,25 +1312,12 @@ fn settings_str(settings: &serde_json::Value, key: &str, default: &str) -> Strin
         .to_string()
 }
 
-/// Build an email sender from the config.
-pub(crate) fn build_email_sender(
-    cfg: &crate::config::EmailConfig,
-) -> Result<Arc<dyn crew_agent::EmailSender>> {
-    match cfg.provider.as_str() {
-        "smtp" => Ok(Arc::new(crew_agent::SmtpEmailSender::new(
-            cfg.smtp_host.clone().unwrap_or_default(),
-            cfg.smtp_port.unwrap_or(465),
-            cfg.username.clone().unwrap_or_default(),
-            cfg.password_env.clone().unwrap_or_default(),
-            cfg.from_address.clone().unwrap_or_default(),
-        ))),
-        "feishu" | "lark" => Ok(Arc::new(crew_agent::FeishuEmailSender::new(
-            cfg.feishu_app_id.clone().unwrap_or_default(),
-            cfg.feishu_app_secret_env.clone().unwrap_or_default(),
-            cfg.feishu_from_address.clone().unwrap_or_default(),
-            cfg.feishu_region.as_deref().unwrap_or("cn"),
-        ))),
-        other => eyre::bail!("unknown email provider: {other}"),
+
+/// Check if a directory is empty (no entries) or doesn't exist.
+fn is_dir_empty(path: &std::path::Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
     }
 }
 

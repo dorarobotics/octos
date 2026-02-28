@@ -12,6 +12,16 @@ use super::Executable;
 const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/humanagency-org/skill-registry/main/registry.json";
 
+/// Pre-built binary info for a specific platform.
+#[derive(Debug, Clone, Deserialize)]
+struct BinaryInfo {
+    /// Download URL.
+    url: String,
+    /// SHA-256 hash for integrity verification.
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
 /// A skill package entry in the registry.
 #[derive(Debug, Deserialize)]
 struct RegistryEntry {
@@ -19,17 +29,43 @@ struct RegistryEntry {
     name: String,
     /// Human-readable description.
     description: String,
-    /// GitHub repo path (user/repo).
+    /// Source repo path (user/repo for GitHub, or full URL).
     repo: String,
+    /// Package version (semver).
+    #[serde(default)]
+    version: Option<String>,
+    /// Package author.
+    #[serde(default)]
+    author: Option<String>,
+    /// License identifier (e.g. MIT, Apache-2.0).
+    #[serde(default)]
+    license: Option<String>,
     /// Individual skill names included in this package.
     #[serde(default)]
     skills: Vec<String>,
     /// External tools required (e.g. git, node).
     #[serde(default)]
     requires: Vec<String>,
+    /// Whether this package provides tool executables (manifest.json).
+    #[serde(default)]
+    provides_tools: bool,
+    /// Pre-built binaries keyed by `{os}-{arch}` (e.g. "darwin-aarch64").
+    /// Managed by the registry after audit — not in the skill repo itself.
+    #[serde(default)]
+    binaries: std::collections::HashMap<String, BinaryInfo>,
     /// Searchable tags.
     #[serde(default)]
     tags: Vec<String>,
+}
+
+/// Source tracking info written to .source during install.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct SourceInfo {
+    repo: String,
+    #[serde(default)]
+    subdir: Option<String>,
+    branch: String,
+    installed_at: String,
 }
 
 /// Manage agent skills.
@@ -71,6 +107,19 @@ pub enum SkillsSubcommand {
         #[arg(long)]
         registry: Option<String>,
     },
+    /// Show detailed information about an installed skill.
+    Info {
+        /// Skill name.
+        name: String,
+    },
+    /// Update an installed skill package from its source.
+    Update {
+        /// Skill name (or "all" to update everything).
+        name: String,
+        /// Git branch or tag (overrides stored branch).
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 impl Executable for SkillsCommand {
@@ -90,6 +139,8 @@ impl Executable for SkillsCommand {
             } => cmd_install(&skills_dir, &repo, force, &branch),
             SkillsSubcommand::Remove { name } => cmd_remove(&skills_dir, &name),
             SkillsSubcommand::Search { query, registry } => cmd_search(query.as_deref(), registry.as_deref()),
+            SkillsSubcommand::Info { name } => cmd_info(&skills_dir, &name),
+            SkillsSubcommand::Update { name, branch } => cmd_update(&skills_dir, &name, branch.as_deref()),
         }
     }
 }
@@ -99,40 +150,68 @@ fn cmd_list(skills_dir: &Path) -> Result<()> {
     println!("{}", "=".repeat(50));
     println!();
 
-    // Built-in skills
-    let builtins = [
-        "cron",
-        "github",
-        "news",
-        "skill-creator",
-        "skill-store",
-        "summarize",
-        "tmux",
-        "weather",
-    ];
-    for name in &builtins {
-        let overridden = skills_dir.join(name).join("SKILL.md").exists();
-        if overridden {
-            println!("  {} {}", name.cyan(), "(overridden by workspace)".dimmed());
-        } else {
-            println!("  {} {}", name.cyan(), "(built-in)".dimmed());
-        }
+    if !skills_dir.exists() {
+        println!("  {}", "No skills installed.".dimmed());
+        println!();
+        println!(
+            "  Install system skills: {}",
+            "crew skills install hagency-org/system-skills".cyan()
+        );
+        println!();
+        return Ok(());
     }
 
-    // Workspace skills
-    if skills_dir.exists() {
-        let mut found_custom = false;
-        for entry in std::fs::read_dir(skills_dir)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !builtins.contains(&name.as_str()) && entry.path().join("SKILL.md").exists() {
-                if !found_custom {
-                    println!();
-                    found_custom = true;
-                }
-                println!("  {} {}", name.cyan(), "(workspace)".dimmed());
+    let mut count = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(skills_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("SKILL.md").exists())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in &entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let mut extras = Vec::new();
+
+        // Show version from frontmatter if available
+        if let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) {
+            if let Some(ver) = extract_fm_value(&content, "version") {
+                extras.push(format!("v{ver}"));
             }
         }
+        // Show tools indicator if manifest.json exists
+        if entry.path().join("manifest.json").exists() {
+            if let Ok(manifest) = std::fs::read_to_string(entry.path().join("manifest.json")) {
+                let tool_count = manifest.matches("\"name\"").count().saturating_sub(1);
+                if tool_count > 0 {
+                    extras.push(format!("[{tool_count} tool(s)]"));
+                }
+            }
+        }
+        // Show source
+        if entry.path().join(".source").exists() {
+            if let Ok(source_str) = std::fs::read_to_string(entry.path().join(".source")) {
+                if let Ok(source) = serde_json::from_str::<SourceInfo>(&source_str) {
+                    extras.push(format!("from {}", source.repo));
+                }
+            }
+        }
+
+        let extras_str = if extras.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", extras.join("  "))
+        };
+        println!("  {} {}", name.cyan(), extras_str.dimmed());
+        count += 1;
+    }
+
+    if count == 0 {
+        println!("  {}", "No skills installed.".dimmed());
+        println!();
+        println!(
+            "  Install system skills: {}",
+            "crew skills install hagency-org/system-skills".cyan()
+        );
     }
 
     println!();
@@ -184,7 +263,9 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
     }
 
     for entry in &filtered {
-        println!("  {}  {}", entry.name.cyan().bold(), entry.description);
+        let version_str = entry.version.as_deref().map(|v| format!(" v{v}")).unwrap_or_default();
+        let tools_str = if entry.provides_tools { "  [tools]" } else { "" };
+        println!("  {}{}{}  {}", entry.name.cyan().bold(), version_str.dimmed(), tools_str.dimmed(), entry.description);
         if !entry.skills.is_empty() {
             println!(
                 "  {}  {}",
@@ -204,6 +285,20 @@ fn cmd_search(query: Option<&str>, registry_url: Option<&str>) -> Result<()> {
                 "  {}     {}",
                 "Tags:".dimmed(),
                 entry.tags.join(", ")
+            );
+        }
+        if let Some(author) = &entry.author {
+            println!(
+                "  {}   {}",
+                "Author:".dimmed(),
+                author
+            );
+        }
+        if let Some(license) = &entry.license {
+            println!(
+                "  {}  {}",
+                "License:".dimmed(),
+                license
             );
         }
         println!(
@@ -425,9 +520,17 @@ fn install_via_git(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &str
     }
 
     // Run npm install in any installed dirs that have package.json
+    // and run cargo build for Rust crate tools
     for name in installed.iter().chain(deps_installed.iter()) {
         let dir = skills_dir.join(name);
         maybe_npm_install(&dir)?;
+        maybe_install_binary(&dir)?;
+    }
+
+    // Write .source tracking file for each installed skill
+    for name in installed.iter().chain(deps_installed.iter()) {
+        let dest = skills_dir.join(name);
+        write_source_info(&dest, spec, branch)?;
     }
 
     // Summary
@@ -505,6 +608,7 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
     }
     std::fs::create_dir_all(&dest)?;
     std::fs::write(dest.join("SKILL.md"), &content)?;
+    write_source_info(&dest, spec, branch)?;
 
     println!(
         "{} Installed skill '{}' to {}",
@@ -515,14 +619,368 @@ fn install_via_http(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &st
     Ok(())
 }
 
-/// Recursively copy a directory, skipping .git and node_modules.
+/// Write source tracking info so we can update later.
+fn write_source_info(dest: &Path, spec: &RepoSpec, branch: &str) -> Result<()> {
+    let info = SourceInfo {
+        repo: format!("{}/{}", spec.user, spec.repo),
+        subdir: spec.subdir.clone(),
+        branch: branch.to_string(),
+        installed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    std::fs::write(
+        dest.join(".source"),
+        serde_json::to_string_pretty(&info)?,
+    )?;
+    Ok(())
+}
+
+/// Extract a frontmatter value from raw SKILL.md content (simple helper for display).
+fn extract_fm_value(content: &str, key: &str) -> Option<String> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let after_first = trimmed[3..].trim_start_matches(['\r', '\n']);
+    let end = after_first.find("\n---")?;
+    let fm_text = &after_first[..end];
+    let prefix = format!("{key}:");
+    fm_text.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with(&prefix) {
+            Some(line[prefix.len()..].trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn cmd_info(skills_dir: &Path, name: &str) -> Result<()> {
+    let skill_dir = skills_dir.join(name);
+    let skill_file = skill_dir.join("SKILL.md");
+
+    if !skill_file.exists() {
+        eyre::bail!(
+            "Skill '{name}' not found. Install it with: crew skills install <repo>/{name}"
+        );
+    }
+
+    let content = std::fs::read_to_string(&skill_file)?;
+
+    println!("{}", "Skill Package Info".cyan().bold());
+    println!("{}", "=".repeat(50));
+    println!();
+
+    // Frontmatter fields
+    println!("  {}    {}", "Name:".dimmed(), name.cyan());
+    if let Some(desc) = extract_fm_value(&content, "description") {
+        println!("  {}    {}", "Desc:".dimmed(), desc);
+    }
+    if let Some(ver) = extract_fm_value(&content, "version") {
+        println!("  {} {}", "Version:".dimmed(), ver);
+    }
+    if let Some(author) = extract_fm_value(&content, "author") {
+        println!("  {}  {}", "Author:".dimmed(), author);
+    }
+    if let Some(always) = extract_fm_value(&content, "always") {
+        println!("  {}  {}", "Always:".dimmed(), always);
+    }
+    if let Some(bins) = extract_fm_value(&content, "requires_bins") {
+        println!("  {}    {}", "Bins:".dimmed(), bins);
+    }
+    if let Some(envs) = extract_fm_value(&content, "requires_env") {
+        println!("  {}     {}", "Env:".dimmed(), envs);
+    }
+
+    // Tools (manifest.json)
+    let manifest_path = skill_dir.join("manifest.json");
+    if manifest_path.exists() {
+        let manifest_str = std::fs::read_to_string(&manifest_path)?;
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&manifest_str) {
+            if let Some(tools) = manifest.get("tools").and_then(|t| t.as_array()) {
+                println!();
+                println!("  {} ({} tool(s))", "Tools:".cyan(), tools.len());
+                for tool in tools {
+                    let tname = tool.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let tdesc = tool.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                    println!("    - {}  {}", tname.cyan(), tdesc.dimmed());
+                }
+            }
+        }
+    }
+
+    // Source info
+    let source_path = skill_dir.join(".source");
+    if source_path.exists() {
+        if let Ok(source_str) = std::fs::read_to_string(&source_path) {
+            if let Ok(source) = serde_json::from_str::<SourceInfo>(&source_str) {
+                println!();
+                println!("  {}  {}", "Source:".dimmed(), source.repo);
+                println!("  {}  {}", "Branch:".dimmed(), source.branch);
+                println!("  {} {}", "Installed:".dimmed(), source.installed_at);
+            }
+        }
+    }
+
+    // Node.js deps
+    if skill_dir.join("package.json").exists() {
+        println!();
+        println!("  {} Node.js (package.json present)", "Runtime:".dimmed());
+    }
+    // Rust crate
+    if skill_dir.join("Cargo.toml").exists() {
+        println!();
+        println!("  {} Rust crate (Cargo.toml present)", "Runtime:".dimmed());
+    }
+
+    println!();
+    Ok(())
+}
+
+fn cmd_update(skills_dir: &Path, name: &str, branch_override: Option<&str>) -> Result<()> {
+    if name == "all" {
+        // Update all skills that have .source files
+        if !skills_dir.exists() {
+            println!("{} No skills directory found", "WARN".yellow());
+            return Ok(());
+        }
+        let mut updated = 0;
+        for entry in std::fs::read_dir(skills_dir)? {
+            let entry = entry?;
+            let skill_name = entry.file_name().to_string_lossy().to_string();
+            if entry.path().join(".source").exists() {
+                println!("Updating {}...", skill_name.cyan());
+                match update_single(skills_dir, &skill_name, branch_override) {
+                    Ok(()) => updated += 1,
+                    Err(e) => println!("  {} {}: {}", "FAIL".red(), skill_name, e),
+                }
+            }
+        }
+        println!();
+        println!("{} Updated {} skill(s)", "OK".green(), updated);
+        return Ok(());
+    }
+
+    update_single(skills_dir, name, branch_override)
+}
+
+fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -> Result<()> {
+    let skill_dir = skills_dir.join(name);
+    let source_path = skill_dir.join(".source");
+
+    if !source_path.exists() {
+        eyre::bail!(
+            "No source info for '{name}'. Was it installed with `crew skills install`?"
+        );
+    }
+
+    let source: SourceInfo = serde_json::from_str(
+        &std::fs::read_to_string(&source_path)?,
+    )?;
+
+    let branch = branch_override.unwrap_or(&source.branch);
+    let repo = if let Some(subdir) = &source.subdir {
+        format!("{}/{}", source.repo, subdir)
+    } else {
+        source.repo.clone()
+    };
+
+    cmd_install(skills_dir, &repo, true, branch)
+}
+
+/// Get the current platform key for binary downloads (e.g. "darwin-aarch64").
+fn platform_key() -> String {
+    let os = std::env::consts::OS;    // darwin, linux, windows
+    let arch = std::env::consts::ARCH; // aarch64, x86_64
+    format!("{os}-{arch}")
+}
+
+/// Fetch the registry and find binary info for a package name.
+fn lookup_registry_binaries(
+    package_name: &str,
+    registry_url: Option<&str>,
+) -> Option<std::collections::HashMap<String, BinaryInfo>> {
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
+    let entries: Vec<RegistryEntry> = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .ok()?;
+
+    entries
+        .into_iter()
+        .find(|e| e.name == package_name || e.skills.contains(&package_name.to_string()))
+        .map(|e| e.binaries)
+        .filter(|b| !b.is_empty())
+}
+
+/// Download a pre-built binary from registry binary info.
+/// Returns true if a binary was downloaded and verified successfully.
+fn download_binary(
+    dir: &Path,
+    binaries: &std::collections::HashMap<String, BinaryInfo>,
+) -> Result<bool> {
+    let key = platform_key();
+    let info = match binaries.get(&key) {
+        Some(info) => info,
+        None => {
+            println!(
+                "  {} No pre-built binary for {} (available: {})",
+                "WARN".yellow(),
+                key,
+                binaries.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+            return Ok(false);
+        }
+    };
+
+    println!("  Downloading binary for {}...", key.cyan());
+
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .wrap_err("failed to create HTTP client")?
+        .get(&info.url)
+        .send()
+        .wrap_err_with(|| format!("failed to download binary from {}", info.url))?;
+
+    if !response.status().is_success() {
+        println!(
+            "  {} Download failed (HTTP {})",
+            "WARN".yellow(),
+            response.status()
+        );
+        return Ok(false);
+    }
+
+    let bytes = response.bytes().wrap_err("failed to read binary response")?;
+
+    // Verify SHA-256 if provided by registry
+    if let Some(expected_hash) = &info.sha256 {
+        use sha2::{Digest, Sha256};
+        let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+        if actual_hash != expected_hash.to_lowercase() {
+            println!(
+                "  {} Binary integrity check failed (hash mismatch)",
+                "FAIL".red()
+            );
+            return Ok(false);
+        }
+        println!("  {} Hash verified", "OK".green());
+    }
+
+    let dest = dir.join("main");
+    std::fs::write(&dest, &bytes)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    println!(
+        "  {} Downloaded binary ({} bytes)",
+        "OK".green(),
+        bytes.len()
+    );
+    Ok(true)
+}
+
+/// Install binary for skill package.
+///
+/// Resolution order:
+/// 1. Download pre-built binary from the registry (audited, with SHA-256 verification)
+/// 2. `cargo build --release` as fallback if Cargo.toml exists
+fn maybe_install_binary(dir: &Path) -> Result<()> {
+    let has_manifest = dir.join("manifest.json").exists();
+    let has_cargo = dir.join("Cargo.toml").exists();
+
+    if !has_manifest && !has_cargo {
+        return Ok(());
+    }
+
+    // Skip if executable already exists
+    let dir_name = dir.file_name().unwrap().to_string_lossy().to_string();
+    if dir.join(&dir_name).exists() || dir.join("main").exists() {
+        return Ok(());
+    }
+
+    // Try 1: look up pre-built binary from registry
+    if let Some(binaries) = lookup_registry_binaries(&dir_name, None) {
+        if download_binary(dir, &binaries)? {
+            return Ok(());
+        }
+    }
+
+    // Try 2: cargo build if Cargo.toml exists
+    if !has_cargo {
+        return Ok(());
+    }
+
+    println!(
+        "  Running {} in {}...",
+        "cargo build --release".cyan(),
+        dir_name
+    );
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .status()
+        .map_err(|_| {
+            eyre::eyre!("cargo not found. Install Rust or ask the skill author for pre-built binaries.")
+        })?;
+    if !status.success() {
+        eyre::bail!("cargo build failed in {}", dir.display());
+    }
+
+    // Copy the built binary to 'main' for PluginLoader to find
+    let target_dir = dir.join("target").join("release");
+    if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+        for line in cargo_toml.lines() {
+            let line = line.trim();
+            if line.starts_with("name") {
+                if let Some(name) = line.split('=').nth(1) {
+                    let name = name.trim().trim_matches('"');
+                    let bin_path = target_dir.join(name);
+                    if bin_path.exists() {
+                        std::fs::copy(&bin_path, dir.join("main"))?;
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(
+                                dir.join("main"),
+                                std::fs::Permissions::from_mode(0o755),
+                            )?;
+                        }
+                        println!(
+                            "  {} Built and installed binary '{}'",
+                            "OK".green(),
+                            name
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory, skipping .git, node_modules, and target (Rust build).
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str == ".git" || name_str == "node_modules" {
+        if name_str == ".git" || name_str == "node_modules" || name_str == "target" {
             continue;
         }
         let src_path = entry.path();

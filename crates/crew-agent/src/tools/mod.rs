@@ -224,21 +224,19 @@ pub mod ssrf;
 
 // Built-in tools
 pub mod deep_research;
-pub mod deep_search;
+pub(crate) mod deep_search;
 pub mod diff_edit;
 pub mod edit_file;
 pub mod glob_tool;
 pub mod grep_tool;
 pub mod list_dir;
 pub mod message;
-pub mod news_digest;
 pub mod read_file;
 pub mod recall_memory;
 pub mod save_memory;
-pub mod send_email;
 pub mod send_file;
 pub mod shell;
-pub mod site_crawl;
+pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod take_photo;
 pub mod web_fetch;
@@ -255,21 +253,17 @@ pub mod git;
 pub mod code_structure;
 
 pub use deep_research::{DeepResearchTool, ResearchNotification};
-pub use deep_search::DeepSearchTool;
 pub use diff_edit::DiffEditTool;
 pub use edit_file::EditFileTool;
 pub use glob_tool::GlobTool;
 pub use grep_tool::GrepTool;
 pub use list_dir::ListDirTool;
 pub use message::MessageTool;
-pub use news_digest::NewsDigestTool;
 pub use read_file::ReadFileTool;
 pub use recall_memory::RecallMemoryTool;
 pub use save_memory::SaveMemoryTool;
-pub use send_email::{EmailSender, FeishuEmailSender, SendEmailTool, SmtpEmailSender};
 pub use send_file::SendFileTool;
 pub use shell::ShellTool;
-pub use site_crawl::DeepCrawlTool;
 pub use spawn::SpawnTool;
 pub use take_photo::TakePhotoTool;
 pub use web_fetch::WebFetchTool;
@@ -502,7 +496,6 @@ impl ToolRegistry {
         registry.register(ListDirTool::new(cwd));
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
-        // DeepSearchTool registered separately by caller with correct data_dir
         registry.register(BrowserTool::new());
         #[cfg(feature = "git")]
         registry.register(GitTool::new(cwd));

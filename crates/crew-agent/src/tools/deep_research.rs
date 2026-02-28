@@ -653,8 +653,8 @@ fn build_research_tools(cwd: &Path) -> ToolRegistry {
     tools.register(super::WebSearchTool::new());
     tools.register(super::WebFetchTool::new());
     tools.register(super::BrowserTool::new());
-    tools.register(super::DeepCrawlTool::new(cwd));
-    tools.register(super::DeepSearchTool::new(cwd));
+    tools.register(super::site_crawl::DeepCrawlTool::new(cwd));
+    tools.register(super::deep_search::DeepSearchTool::new(cwd));
     tools.register(super::ReadFileTool::new(cwd));
     tools.register(super::WriteFileTool::new(cwd));
     tools.register(super::GlobTool::new(cwd));

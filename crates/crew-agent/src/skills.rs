@@ -6,18 +6,20 @@ use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 
-use crate::builtin_skills::BUILTIN_SKILLS;
-
 /// Information about a loaded skill.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    pub version: Option<String>,
+    pub author: Option<String>,
     pub path: PathBuf,
     pub available: bool,
     pub always: bool,
-    /// True if this skill comes from built-in (not workspace).
+    /// Kept for API compatibility; always false now (all skills are workspace-installed).
     pub builtin: bool,
+    /// True if this skill package includes a manifest.json (provides tools).
+    pub has_tools: bool,
 }
 
 /// Loads workspace skills from `.crew/skills/`.
@@ -33,13 +35,10 @@ impl SkillsLoader {
         }
     }
 
-    /// List all skills found in workspace and built-in sources.
-    /// Workspace skills override built-in skills with the same name.
+    /// List all installed skills from `.crew/skills/`.
     pub async fn list_skills(&self) -> Result<Vec<SkillInfo>> {
         let mut skills = Vec::new();
-        let mut seen_names = std::collections::HashSet::new();
 
-        // Load workspace skills first (they take priority)
         let entries = match tokio::fs::read_dir(&self.skills_dir).await {
             Ok(entries) => Some(entries),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -56,21 +55,9 @@ impl SkillsLoader {
                 let skill_file = path.join("SKILL.md");
                 if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
                     if let Some(info) = parse_skill(&skill_file, &content, false) {
-                        seen_names.insert(info.name.clone());
                         skills.push(info);
                     }
                 }
-            }
-        }
-
-        // Load built-in skills (skip if workspace has same name)
-        for builtin in BUILTIN_SKILLS {
-            if seen_names.contains(builtin.name) {
-                continue;
-            }
-            let path = PathBuf::from(format!("(built-in)/{}/SKILL.md", builtin.name));
-            if let Some(info) = parse_skill(&path, builtin.content, true) {
-                skills.push(info);
             }
         }
 
@@ -79,23 +66,13 @@ impl SkillsLoader {
     }
 
     /// Load a specific skill's full content (without frontmatter).
-    /// Checks workspace first, then built-in skills.
     pub async fn load_skill(&self, name: &str) -> Result<Option<String>> {
         let skill_file = self.skills_dir.join(name).join("SKILL.md");
         match tokio::fs::read_to_string(&skill_file).await {
-            Ok(content) => return Ok(Some(strip_frontmatter(&content))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
+            Ok(content) => Ok(Some(strip_frontmatter(&content))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
         }
-
-        // Fall back to built-in
-        for builtin in BUILTIN_SKILLS {
-            if builtin.name == name {
-                return Ok(Some(strip_frontmatter(builtin.content)));
-            }
-        }
-
-        Ok(None)
     }
 
     /// Build an XML summary of all skills for the system prompt.
@@ -107,9 +84,10 @@ impl SkillsLoader {
 
         let mut xml = String::from("<skills>\n");
         for s in &skills {
+            let tools_attr = if s.has_tools { " tools=\"true\"" } else { "" };
             xml.push_str(&format!(
-                "  <skill available=\"{}\">\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
-                s.available, s.name, s.description, s.path.display()
+                "  <skill available=\"{}\"{}>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
+                s.available, tools_attr, s.name, s.description, s.path.display()
             ));
         }
         xml.push_str("</skills>");
@@ -174,13 +152,24 @@ fn parse_skill(path: &Path, content: &str, builtin: bool) -> Option<SkillInfo> {
         })
         .unwrap_or(true);
 
+    let version = fm_value(&fm, "version");
+    let author = fm_value(&fm, "author");
+    let has_tools = !builtin
+        && path
+            .parent()
+            .map(|p| p.join("manifest.json").exists())
+            .unwrap_or(false);
+
     Some(SkillInfo {
         name,
         description,
+        version,
+        author,
         path: path.to_path_buf(),
         available: bins_ok && env_ok,
         always,
         builtin,
+        has_tools,
     })
 }
 
@@ -250,8 +239,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = SkillsLoader::new(dir.path());
         let skills = loader.list_skills().await.unwrap();
-        // No workspace skills, only built-ins
-        assert!(skills.iter().all(|s| s.builtin));
+        assert!(skills.is_empty());
     }
 
     #[tokio::test]
@@ -341,5 +329,55 @@ mod tests {
         let (fm, body) = split_frontmatter(content);
         assert!(fm.is_none());
         assert_eq!(body, content);
+    }
+
+    #[test]
+    fn test_version_author_parsing() {
+        let content =
+            "---\nname: my-skill\ndescription: Does X\nversion: 1.2.3\nauthor: alice\n---\nBody.\n";
+        let path = PathBuf::from("/tmp/fake/my-skill/SKILL.md");
+        let info = parse_skill(&path, content, false).unwrap();
+        assert_eq!(info.version.as_deref(), Some("1.2.3"));
+        assert_eq!(info.author.as_deref(), Some("alice"));
+        assert!(!info.has_tools);
+    }
+
+    #[tokio::test]
+    async fn test_has_tools_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = setup_skills_dir(&dir).await;
+
+        // Skill without tools
+        let plain_dir = skills_dir.join("plain");
+        tokio::fs::create_dir_all(&plain_dir).await.unwrap();
+        tokio::fs::write(
+            plain_dir.join("SKILL.md"),
+            "---\nname: plain\ndescription: No tools\n---\nBody\n",
+        )
+        .await
+        .unwrap();
+
+        // Skill with tools (has manifest.json)
+        let tool_dir = skills_dir.join("with-tools");
+        tokio::fs::create_dir_all(&tool_dir).await.unwrap();
+        tokio::fs::write(
+            tool_dir.join("SKILL.md"),
+            "---\nname: with-tools\ndescription: Has tools\n---\nBody\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            tool_dir.join("manifest.json"),
+            r#"{"name": "with-tools", "version": "1.0", "tools": []}"#,
+        )
+        .await
+        .unwrap();
+
+        let loader = SkillsLoader::new(dir.path());
+        let skills = loader.list_skills().await.unwrap();
+        let plain = skills.iter().find(|s| s.name == "plain").unwrap();
+        assert!(!plain.has_tools);
+        let with_tools = skills.iter().find(|s| s.name == "with-tools").unwrap();
+        assert!(with_tools.has_tools);
     }
 }

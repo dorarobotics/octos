@@ -49,6 +49,7 @@ impl DeepCrawlTool {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_config(mut self, config: Arc<super::tool_config::ToolConfigStore>) -> Self {
         self.config = Some(config);
         self

@@ -8,7 +8,10 @@ use clap::Args;
 use colored::Colorize;
 use crew_agent::{Agent, AgentConfig, ConsoleReporter, HookExecutor, ToolRegistry};
 use crew_core::{AgentId, Message, MessageRole};
-use crew_llm::{EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain, RetryProvider};
+use crew_llm::{
+    AdaptiveConfig, AdaptiveRouter, EmbeddingProvider, LlmProvider, OpenAIEmbedder, ProviderChain,
+    RetryProvider,
+};
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
 use rustyline::DefaultEditor;
@@ -134,7 +137,19 @@ impl ChatCommand {
                     }
                 }
             }
-            Arc::new(ProviderChain::new(providers))
+            if let Some(ref ar) = config.adaptive_routing {
+                if ar.enabled {
+                    tracing::info!("adaptive routing enabled");
+                    Arc::new(AdaptiveRouter::new(
+                        providers,
+                        AdaptiveConfig::from(ar),
+                    ))
+                } else {
+                    Arc::new(ProviderChain::new(providers))
+                }
+            } else {
+                Arc::new(ProviderChain::new(providers))
+            }
         };
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
@@ -156,12 +171,6 @@ impl ChatCommand {
                 .wrap_err("failed to open tool config store")?,
         );
         tools.inject_tool_config(tool_config.clone());
-
-        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
-        tools.register(
-            crew_agent::DeepCrawlTool::new(data_dir.join("research"))
-                .with_config(tool_config.clone()),
-        );
 
         // Override browser tool with configured timeout if set
         if let Some(gw) = &config.gateway {
@@ -204,16 +213,6 @@ impl ChatCommand {
         );
         tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
         tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
-
-        // Send email tool (configured via config.email)
-        if let Some(ref email_cfg) = config.email {
-            match super::gateway::build_email_sender(email_cfg) {
-                Ok(sender) => {
-                    tools.register(crew_agent::SendEmailTool::new(sender));
-                }
-                Err(e) => eprintln!("Warning: skipping send_email tool: {e}"),
-            }
-        }
 
         // Register MCP tools
         if !config.mcp_servers.is_empty() {

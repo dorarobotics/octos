@@ -333,8 +333,6 @@ impl ServeCommand {
         );
         tools.inject_tool_config(tool_config);
 
-        tools.register(crew_agent::DeepSearchTool::new(data_dir.join("research")));
-
         // MCP tools
         if !config.mcp_servers.is_empty() {
             match crew_agent::McpClient::start(&config.mcp_servers).await {
@@ -347,16 +345,6 @@ impl ServeCommand {
         let plugin_dirs = Config::plugin_dirs(cwd);
         if !plugin_dirs.is_empty() {
             let _ = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs);
-        }
-
-        // Send email tool
-        if let Some(ref email_cfg) = config.email {
-            match super::gateway::build_email_sender(email_cfg) {
-                Ok(sender) => {
-                    tools.register(crew_agent::SendEmailTool::new(sender));
-                }
-                Err(e) => tracing::warn!("skipping send_email tool: {e}"),
-            }
         }
 
         let mut agent =
