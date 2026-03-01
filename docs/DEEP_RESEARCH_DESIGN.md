@@ -253,6 +253,371 @@ The existing `DeepResearchTool` will be retired or renamed to avoid confusion. T
 
 ---
 
+## Search Source Registry (Prerequisite)
+
+Before building the orchestrator, we need a **structured source database** that maps topics, languages, and regions to the right search engines, news portals, and specialized sites. Without this, sub-agents all hit the same DuckDuckGo pipe — real multi-source research is impossible.
+
+### Current State (4 backends, all English-centric)
+
+| Provider | Type | Key Required | Coverage |
+|---|---|---|---|
+| DuckDuckGo | HTML scrape | No | English-biased general |
+| Brave Search | REST API | `BRAVE_API_KEY` | English-biased general |
+| You.com | REST API | `YDC_API_KEY` | English general |
+| Perplexity Sonar | AI-synthesized | `PERPLEXITY_API_KEY` | English general |
+
+### Target: Multi-Source Registry
+
+The registry is a structured data file (`source_registry.toml` or similar) that the orchestrator queries to select which sources each sub-agent should use.
+
+#### 1. General Search Engines (by region)
+
+| Engine | API | Region/Language | Free Tier | Notes |
+|---|---|---|---|---|
+| Google Custom Search | REST | Global, any language | 100 queries/day | `cx` + `gl`/`lr` params for region/language filtering |
+| Google News | RSS/scrape | Global, any language | Free | `hl=ar&gl=AE` for Arabic, `hl=fa&gl=IR` for Farsi, etc. |
+| Bing Web Search | REST | Global, any language | 1K/month | `mkt` param for market, `setLang` for language |
+| Bing News Search | REST | Global, any language | 1K/month | Separate endpoint, structured news results |
+| Baidu | REST/scrape | Chinese | Free (scrape) | Essential for China-focused research |
+| Yandex | REST | Russian, CIS | 1K/day | `lr` param for region, good for Russia/Ukraine topics |
+| Naver | REST | Korean | Requires app | Essential for Korea-focused research |
+| Sogou | Scrape | Chinese | Free | Alternative to Baidu, good for WeChat content |
+| DuckDuckGo | HTML scrape | Global (English-biased) | Free | Current default, no API key needed |
+| Brave Search | REST | Global (English-biased) | 2K/month | Current supported |
+| Searx/SearxNG | Self-hosted | Meta-search (all engines) | Free | Aggregates Google/Bing/DDG/etc., self-hosted privacy |
+
+#### 2. News Portals & Aggregators
+
+| Source | Coverage | Language | Access Method |
+|---|---|---|---|
+| **Google News** | Global | 40+ languages | RSS feeds with `hl`/`gl` params, or scrape |
+| **Bing News** | Global | 20+ languages | REST API with `mkt` param |
+| **Reuters** | Global | English | `web_fetch` (no API) |
+| **AP News** | Global | English | RSS / `web_fetch` |
+| **Al Jazeera** | Middle East | Arabic, English | RSS / `web_fetch` |
+| **Al Arabiya** | Middle East | Arabic | RSS / `web_fetch` |
+| **Haaretz** | Israel | Hebrew, English | `web_fetch` (paywall) |
+| **Times of Israel** | Israel | English | RSS / `web_fetch` |
+| **IRNA** | Iran | Farsi, English | RSS / `web_fetch` |
+| **Fars News** | Iran | Farsi | `web_fetch` |
+| **TASS** | Russia | Russian, English | RSS / `web_fetch` |
+| **Xinhua** | China | Chinese, English | RSS / `web_fetch` |
+| **NHK** | Japan | Japanese, English | RSS / `web_fetch` |
+| **Yonhap** | Korea | Korean, English | RSS / `web_fetch` |
+| **Globo** | Brazil | Portuguese | RSS / `web_fetch` |
+| **EFE** | Spain/LatAm | Spanish | RSS / `web_fetch` |
+| **Deutsche Welle** | Germany | 30 languages | RSS / `web_fetch` |
+| **France 24** | France | French, English, Arabic | RSS / `web_fetch` |
+
+#### 3. Vertical / Domain-Specific Sources
+
+**Sports:**
+| Source | Focus | Language | Access |
+|---|---|---|---|
+| ESPN | US/Global sports | English | RSS / `web_fetch` |
+| BBC Sport | UK/Global | English | RSS / `web_fetch` |
+| Marca | Spanish football | Spanish | RSS / `web_fetch` |
+| AS | Spanish football | Spanish | RSS / `web_fetch` |
+| Mundo Deportivo | Spanish football | Spanish | RSS / `web_fetch` |
+| A Bola | Portuguese football | Portuguese | RSS / `web_fetch` |
+| Record (PT) | Portuguese football | Portuguese | RSS / `web_fetch` |
+| L'Equipe | French sports | French | RSS / `web_fetch` |
+| Gazzetta dello Sport | Italian football | Italian | RSS / `web_fetch` |
+| Kicker | German football | German | RSS / `web_fetch` |
+| Olé | Argentine football | Spanish | RSS / `web_fetch` |
+| Globo Esporte | Brazilian football | Portuguese | RSS / `web_fetch` |
+| The Athletic | Premium analysis | English | `web_fetch` (paywall) |
+| FBref / StatsBomb | Statistics | English | `web_fetch` / API |
+| Transfermarkt | Transfer data | Multi-language | `web_fetch` |
+| WhoScored / SofaScore | Match stats | English | `web_fetch` |
+
+**Finance:**
+| Source | Focus | Access |
+|---|---|---|
+| Bloomberg | Global finance | `web_fetch` (limited) |
+| Reuters Finance | Global markets | `web_fetch` |
+| Yahoo Finance | Stocks/crypto | API (free tier) |
+| Seeking Alpha | Analysis | `web_fetch` |
+| CoinGecko / CoinMarketCap | Crypto | API (free) |
+| 东方财富 (EastMoney) | China markets | `web_fetch` |
+
+**Technology:**
+| Source | Focus | Access |
+|---|---|---|
+| Hacker News | Tech/startups | API (free, no key) |
+| Ars Technica | Tech analysis | RSS / `web_fetch` |
+| TechCrunch | Startups/VC | RSS / `web_fetch` |
+| The Verge | Consumer tech | RSS / `web_fetch` |
+| 36Kr | China tech | `web_fetch` |
+| ITHome | China tech | `web_fetch` |
+
+**Academic / Research:**
+| Source | Focus | Access |
+|---|---|---|
+| Google Scholar | Academic papers | Scrape (no official API) |
+| Semantic Scholar | Academic papers | API (free, no key) |
+| arXiv | Preprints | API (free) |
+| PubMed | Biomedical | API (free) |
+| SSRN | Social sciences | `web_fetch` |
+
+**Government / Think Tanks:**
+| Source | Focus | Access |
+|---|---|---|
+| UN.org | International | `web_fetch` |
+| WHO | Health | `web_fetch` |
+| World Bank | Economics | API (free) |
+| RAND Corporation | Policy analysis | `web_fetch` |
+| Brookings | Policy analysis | `web_fetch` |
+| IISS | Defense/security | `web_fetch` |
+| CFR | Foreign relations | `web_fetch` |
+| CSIS | Strategic studies | `web_fetch` |
+
+**Prediction / OSINT:**
+| Source | Focus | Access |
+|---|---|---|
+| Polymarket | Prediction markets | API / `web_fetch` |
+| Metaculus | Forecasting | API / `web_fetch` |
+| Reddit | Community discussion | API (free, rate-limited) |
+| X/Twitter | Real-time social | API (paid, expensive) |
+
+### Registry Data Model
+
+```toml
+# source_registry.toml
+
+# --- Search Engines ---
+
+[[search_engines]]
+id = "google"
+name = "Google Custom Search"
+type = "api"
+endpoint = "https://www.googleapis.com/customsearch/v1"
+key_env = "GOOGLE_CSE_API_KEY"
+extra_env = { cx = "GOOGLE_CSE_ID" }
+supports_language = true    # gl/lr params
+supports_region = true      # gl param
+rate_limit = "100/day"
+priority = 1                # prefer when available
+
+[[search_engines]]
+id = "google_news"
+name = "Google News"
+type = "rss"
+endpoint = "https://news.google.com/rss/search?q={query}&hl={lang}&gl={region}"
+key_env = ""                # no key needed
+supports_language = true
+supports_region = true
+rate_limit = "none"
+priority = 1
+
+[[search_engines]]
+id = "bing"
+name = "Bing Web Search"
+type = "api"
+endpoint = "https://api.bing.microsoft.com/v7.0/search"
+key_env = "BING_API_KEY"
+supports_language = true    # mkt param
+supports_region = true
+rate_limit = "1000/month"
+priority = 2
+
+[[search_engines]]
+id = "bing_news"
+name = "Bing News Search"
+type = "api"
+endpoint = "https://api.bing.microsoft.com/v7.0/news/search"
+key_env = "BING_API_KEY"
+supports_language = true
+supports_region = true
+rate_limit = "1000/month"
+priority = 2
+
+[[search_engines]]
+id = "baidu"
+name = "Baidu Search"
+type = "scrape"
+endpoint = "https://www.baidu.com/s?wd={query}"
+key_env = ""
+supports_language = false   # Chinese only
+supports_region = false
+languages = ["zh"]
+rate_limit = "none"
+priority = 1                # essential for Chinese content
+
+[[search_engines]]
+id = "yandex"
+name = "Yandex Search"
+type = "api"
+endpoint = "https://yandex.com/search/xml"
+key_env = "YANDEX_API_KEY"
+supports_language = true
+supports_region = true
+languages = ["ru", "uk", "kk", "be"]
+rate_limit = "1000/day"
+priority = 2
+
+# --- Topic → Source Mapping ---
+
+[[topic_sources]]
+topic = "middle_east"
+keywords = ["iran", "iraq", "syria", "lebanon", "israel", "palestine", "saudi", "yemen", "khamenei", "hezbollah", "hamas"]
+search_engines = ["google", "google_news", "bing_news"]
+languages = ["ar", "fa", "he", "en"]
+portals = [
+    { name = "Al Jazeera", url = "https://www.aljazeera.com", lang = "ar" },
+    { name = "Al Jazeera EN", url = "https://www.aljazeera.com/news", lang = "en" },
+    { name = "Al Arabiya", url = "https://www.alarabiya.net", lang = "ar" },
+    { name = "Times of Israel", url = "https://www.timesofisrael.com", lang = "en" },
+    { name = "IRNA", url = "https://www.irna.ir", lang = "fa" },
+    { name = "Fars News", url = "https://www.farsnews.ir", lang = "fa" },
+]
+think_tanks = ["IISS", "RAND", "Brookings", "CFR", "CSIS"]
+
+[[topic_sources]]
+topic = "football"
+keywords = ["world cup", "FIFA", "soccer", "football", "premier league", "la liga", "champions league", "euros"]
+search_engines = ["google", "google_news"]
+languages = ["en", "es", "pt", "fr", "de", "it"]
+portals = [
+    { name = "ESPN FC", url = "https://www.espn.com/soccer/", lang = "en" },
+    { name = "BBC Sport", url = "https://www.bbc.com/sport/football", lang = "en" },
+    { name = "Marca", url = "https://www.marca.com/futbol.html", lang = "es" },
+    { name = "AS", url = "https://as.com/futbol/", lang = "es" },
+    { name = "A Bola", url = "https://www.abola.pt", lang = "pt" },
+    { name = "Globo Esporte", url = "https://ge.globo.com/futebol/", lang = "pt" },
+    { name = "L'Equipe", url = "https://www.lequipe.fr/Football/", lang = "fr" },
+    { name = "Gazzetta", url = "https://www.gazzetta.it/Calcio/", lang = "it" },
+    { name = "Kicker", url = "https://www.kicker.de", lang = "de" },
+    { name = "FBref", url = "https://fbref.com", lang = "en" },
+    { name = "Transfermarkt", url = "https://www.transfermarkt.com", lang = "en" },
+]
+data_sources = ["FBref", "WhoScored", "SofaScore", "Transfermarkt"]
+
+[[topic_sources]]
+topic = "china"
+keywords = ["china", "beijing", "xi jinping", "CPC", "chinese", "中国", "北京"]
+search_engines = ["baidu", "google", "bing"]
+languages = ["zh", "en"]
+portals = [
+    { name = "Xinhua", url = "https://www.xinhuanet.com", lang = "zh" },
+    { name = "SCMP", url = "https://www.scmp.com", lang = "en" },
+    { name = "36Kr", url = "https://36kr.com", lang = "zh" },
+    { name = "ITHome", url = "https://www.ithome.com", lang = "zh" },
+]
+
+[[topic_sources]]
+topic = "russia_ukraine"
+keywords = ["russia", "ukraine", "putin", "zelensky", "moscow", "kyiv", "NATO"]
+search_engines = ["yandex", "google", "google_news"]
+languages = ["ru", "uk", "en"]
+portals = [
+    { name = "TASS", url = "https://tass.com", lang = "en" },
+    { name = "TASS RU", url = "https://tass.ru", lang = "ru" },
+    { name = "Ukrainska Pravda", url = "https://www.pravda.com.ua", lang = "uk" },
+    { name = "Kyiv Independent", url = "https://kyivindependent.com", lang = "en" },
+]
+
+[[topic_sources]]
+topic = "finance"
+keywords = ["stock", "market", "GDP", "inflation", "fed", "interest rate", "crypto", "bitcoin", "IPO"]
+search_engines = ["google", "bing_news"]
+languages = ["en", "zh"]
+portals = [
+    { name = "Bloomberg", url = "https://www.bloomberg.com", lang = "en" },
+    { name = "Reuters Finance", url = "https://www.reuters.com/finance/", lang = "en" },
+    { name = "Yahoo Finance", url = "https://finance.yahoo.com", lang = "en" },
+    { name = "EastMoney", url = "https://www.eastmoney.com", lang = "zh" },
+]
+data_sources = ["Yahoo Finance API", "CoinGecko API", "World Bank API"]
+
+[[topic_sources]]
+topic = "technology"
+keywords = ["AI", "LLM", "GPU", "startup", "tech", "software", "SaaS", "cloud"]
+search_engines = ["google", "bing"]
+languages = ["en", "zh"]
+portals = [
+    { name = "Hacker News", url = "https://news.ycombinator.com", lang = "en" },
+    { name = "Ars Technica", url = "https://arstechnica.com", lang = "en" },
+    { name = "TechCrunch", url = "https://techcrunch.com", lang = "en" },
+    { name = "36Kr", url = "https://36kr.com", lang = "zh" },
+]
+data_sources = ["HN API", "arXiv API", "Semantic Scholar API"]
+
+[[topic_sources]]
+topic = "academic"
+keywords = ["research", "study", "paper", "journal", "peer-reviewed", "clinical trial"]
+search_engines = ["google"]
+languages = ["en"]
+portals = []
+data_sources = ["Google Scholar (scrape)", "Semantic Scholar API", "arXiv API", "PubMed API", "SSRN"]
+```
+
+### How the Orchestrator Uses the Registry
+
+```
+User: "Who will win the 2026 World Cup?"
+
+1. Orchestrator analyzes query → detects topic: "football" + "prediction"
+
+2. Looks up source_registry:
+   - topic "football" → engines: google, google_news
+                       → languages: en, es, pt, fr, de, it
+                       → portals: ESPN, Marca, A Bola, FBref, etc.
+   - topic "prediction" → add: Polymarket, Metaculus
+
+3. Generates sub-agent plan:
+   ┌─ Agent 1: English analysis (Google News en, ESPN, BBC Sport, The Athletic)
+   ├─ Agent 2: Spanish press (Google News es, Marca, AS, Mundo Deportivo)
+   ├─ Agent 3: Portuguese press (Google News pt, A Bola, Globo Esporte)
+   ├─ Agent 4: Statistics (FBref, WhoScored, Transfermarkt — data-heavy)
+   ├─ Agent 5: Prediction markets (Polymarket, Metaculus, betting odds)
+   ├─ Agent 6: FIFA/official + historical analysis (Google Scholar for patterns)
+   └─ Agent 7: French/German/Italian press (L'Equipe, Kicker, Gazzetta)
+
+4. Each agent gets:
+   - Specific search engines to use (with language params)
+   - Specific portals to browse directly via web_fetch
+   - Specific data sources to query via API
+```
+
+### Implementation Priority
+
+**Phase 0 (Now)**: Build the registry data file + lookup logic
+- `source_registry.toml` with topic→source mappings
+- Rust struct to parse and query it
+- Orchestrator reads registry to generate sub-agent assignments
+
+**Phase 1**: Add search engine backends
+- Google Custom Search API (highest priority — global, multi-language)
+- Google News RSS (free, no key, multi-language)
+- Bing Web + News API (complements Google)
+- Baidu scrape (essential for Chinese content)
+
+**Phase 2**: Add vertical APIs
+- Semantic Scholar API (academic)
+- HN API (tech)
+- Yahoo Finance API (finance)
+- arXiv API (preprints)
+
+**Phase 3**: Direct portal browsing
+- Sub-agents use `web_fetch` to browse portals directly
+- RSS feed parsing for news portals
+- Handle paywalls gracefully (use free-tier content, note limitation)
+
+### API Keys Required
+
+| Engine | Key | Free Tier | Priority |
+|---|---|---|---|
+| Google Custom Search | `GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_ID` | 100 queries/day | HIGH |
+| Bing Search | `BING_API_KEY` | 1K queries/month | HIGH |
+| Baidu | None (scrape) | Unlimited | HIGH |
+| Yandex | `YANDEX_API_KEY` | 1K/day | MEDIUM |
+| Semantic Scholar | None | Unlimited (rate-limited) | MEDIUM |
+| Hacker News | None | Unlimited | LOW |
+| arXiv | None | Unlimited | LOW |
+
+---
+
 ## Success Metrics
 
 - **Report length**: from ~6K chars to 10K+ words
