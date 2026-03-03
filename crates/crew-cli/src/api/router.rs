@@ -247,13 +247,24 @@ async fn user_auth_middleware(
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     let token = extract_token(&req);
+    let method = req.method().clone();
+    let uri = req.uri().clone();
 
     match resolve_identity(&state, &token).await {
         Some(identity) => {
             req.extensions_mut().insert(identity);
             Ok(next.run(req).await)
         }
-        None => Err(StatusCode::UNAUTHORIZED),
+        None => {
+            tracing::warn!(
+                method = %method,
+                uri = %uri,
+                token_len = token.len(),
+                token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
+                "user auth rejected"
+            );
+            Err(StatusCode::UNAUTHORIZED)
+        }
     }
 }
 
@@ -264,6 +275,8 @@ async fn admin_auth_middleware(
     next: Next,
 ) -> Result<axum::response::Response, StatusCode> {
     let token = extract_token(&req);
+    let method = req.method().clone();
+    let uri = req.uri().clone();
 
     match resolve_identity(&state, &token).await {
         Some(AuthIdentity::Admin) => {
@@ -280,7 +293,16 @@ async fn admin_auth_middleware(
             });
             Ok(next.run(req).await)
         }
-        _ => Err(StatusCode::UNAUTHORIZED),
+        _ => {
+            tracing::warn!(
+                method = %method,
+                uri = %uri,
+                token_len = token.len(),
+                token_prefix = %if token.len() > 8 { &token[..8] } else { &token },
+                "admin auth rejected"
+            );
+            Err(StatusCode::UNAUTHORIZED)
+        }
     }
 }
 
