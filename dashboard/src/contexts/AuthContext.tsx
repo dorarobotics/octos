@@ -9,6 +9,7 @@ interface AuthContextValue {
   loading: boolean
   sendOtp: (email: string) => Promise<{ ok: boolean; message?: string }>
   verifyOtp: (email: string, code: string) => Promise<boolean>
+  loginWithToken: (token: string) => Promise<boolean>
   logout: () => Promise<void>
 }
 
@@ -59,6 +60,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return false
   }, [])
 
+  const loginWithToken = useCallback(async (adminToken: string) => {
+    // Store the token and try /api/auth/me to validate it
+    localStorage.setItem('crew_auth_token', adminToken)
+    try {
+      const res = await authApi.me()
+      setToken(adminToken)
+      setUser(res.user)
+      return true
+    } catch {
+      localStorage.removeItem('crew_auth_token')
+      return false
+    }
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       await authApi.logout()
@@ -73,7 +88,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, token, isAdmin, loading, sendOtp, verifyOtp, logout }}
+      value={{ user, token, isAdmin, loading, sendOtp, verifyOtp, loginWithToken, logout }}
     >
       {children}
     </AuthContext.Provider>

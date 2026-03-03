@@ -3,11 +3,12 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function LoginPage() {
-  const { user, sendOtp, verifyOtp } = useAuth()
+  const { user, sendOtp, verifyOtp, loginWithToken } = useAuth()
   const navigate = useNavigate()
-  const [step, setStep] = useState<'email' | 'code'>('email')
+  const [step, setStep] = useState<'email' | 'code' | 'token'>('email')
   const [email, setEmail] = useState('')
   const [code, setCode] = useState(['', '', '', '', '', ''])
+  const [adminToken, setAdminToken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
@@ -93,6 +94,25 @@ export default function LoginPage() {
     }
   }
 
+  const handleTokenLogin = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!adminToken.trim()) return
+    setError('')
+    setLoading(true)
+    try {
+      const ok = await loginWithToken(adminToken.trim())
+      if (ok) {
+        navigate('/', { replace: true })
+      } else {
+        setError('Invalid token')
+      }
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-background flex items-center justify-center px-4">
       <div className="w-full max-w-sm">
@@ -105,7 +125,40 @@ export default function LoginPage() {
         </div>
 
         <div className="bg-surface rounded-xl border border-gray-700/50 p-6">
-          {step === 'email' ? (
+          {step === 'token' ? (
+            <form onSubmit={handleTokenLogin}>
+              <label className="block text-sm font-medium text-gray-300 mb-2">
+                Admin token
+              </label>
+              <input
+                type="password"
+                value={adminToken}
+                onChange={(e) => setAdminToken(e.target.value)}
+                placeholder="Enter --auth-token value"
+                className="input w-full mb-4 font-mono"
+                required
+                autoFocus
+                disabled={loading}
+              />
+              {error && (
+                <p className="text-sm text-red-400 mb-3">{error}</p>
+              )}
+              <button
+                type="submit"
+                disabled={loading || !adminToken.trim()}
+                className="w-full px-4 py-2.5 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent-light transition disabled:opacity-50 mb-3"
+              >
+                {loading ? 'Verifying...' : 'Login'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setStep('email'); setError(''); setAdminToken('') }}
+                className="w-full text-sm text-gray-500 hover:text-gray-300 transition"
+              >
+                Login with email instead
+              </button>
+            </form>
+          ) : step === 'email' ? (
             <form onSubmit={handleSendCode}>
               <label className="block text-sm font-medium text-gray-300 mb-2">
                 Email address
@@ -186,6 +239,19 @@ export default function LoginPage() {
             </div>
           )}
         </div>
+
+        {/* Toggle between email and token login */}
+        {step !== 'code' && step !== 'token' && (
+          <div className="text-center mt-4">
+            <button
+              type="button"
+              onClick={() => { setStep('token'); setError('') }}
+              className="text-xs text-gray-600 hover:text-gray-400 transition"
+            >
+              Login with admin token
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
