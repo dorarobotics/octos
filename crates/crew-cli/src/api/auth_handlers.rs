@@ -183,28 +183,30 @@ pub async fn me(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<MeResponse>, StatusCode> {
+    // Handle admin token first — no user_store needed
+    if matches!(&identity, AuthIdentity::Admin) {
+        return Ok(Json(MeResponse {
+            user: User {
+                id: "admin".into(),
+                email: "admin@localhost".into(),
+                name: "Admin".into(),
+                role: UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            },
+            profile: None,
+        }));
+    }
+
+    let user_id = match &identity {
+        AuthIdentity::Admin => unreachable!(),
+        AuthIdentity::User { id, .. } => id.clone(),
+    };
+
     let user_store = state
         .user_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-
-    let user_id = match &identity {
-        AuthIdentity::Admin => {
-            // Admin token user — return a synthetic admin user
-            return Ok(Json(MeResponse {
-                user: User {
-                    id: "admin".into(),
-                    email: "admin@localhost".into(),
-                    name: "Admin".into(),
-                    role: UserRole::Admin,
-                    created_at: chrono::Utc::now(),
-                    last_login_at: None,
-                },
-                profile: None,
-            }));
-        }
-        AuthIdentity::User { id, .. } => id.clone(),
-    };
 
     let user = user_store
         .get(&user_id)
