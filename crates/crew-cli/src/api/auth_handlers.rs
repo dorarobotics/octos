@@ -246,16 +246,12 @@ pub async fn my_profile(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ProfileResponse>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
     let ps = state
         .profile_store
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = ps
-        .get(&user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let profile = resolve_my_profile(&identity, ps)?;
 
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
@@ -284,16 +280,13 @@ pub async fn update_my_profile(
         tracing::warn!(error = %e, body = %body, "failed to parse my profile update request");
         (StatusCode::BAD_REQUEST, format!("Invalid request body: {e}"))
     })?;
-    let user_id = get_user_id(&identity).map_err(|s| (s, "unauthorized".into()))?;
     let ps = state
         .profile_store
         .as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()))?;
 
-    let mut profile = ps
-        .get(&user_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, format!("profile '{user_id}' not found")))?;
+    let mut profile = resolve_my_profile(&identity, ps)
+        .map_err(|s| (s, "profile not found".into()))?;
 
     // Apply updates (same logic as admin::update_profile but scoped)
     if let Some(name) = req.name {
@@ -332,7 +325,6 @@ pub async fn start_my_gateway(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
     let ps = state
         .profile_store
         .as_ref()
@@ -342,10 +334,7 @@ pub async fn start_my_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = ps
-        .get(&user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let profile = resolve_my_profile(&identity, ps)?;
 
     // Validate LLM provider is configured
     if profile.config.provider.is_none() && profile.config.model.is_none() {
@@ -372,13 +361,17 @@ pub async fn stop_my_gateway(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
     let pm = state
         .process_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let stopped = pm.stop(&user_id).await.unwrap_or(false);
+    let stopped = pm.stop(&profile_id).await.unwrap_or(false);
     if stopped {
         Ok(Json(ActionResponse {
             ok: true,
@@ -397,7 +390,6 @@ pub async fn restart_my_gateway(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<ActionResponse>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
     let ps = state
         .profile_store
         .as_ref()
@@ -407,10 +399,7 @@ pub async fn restart_my_gateway(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let profile = ps
-        .get(&user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let profile = resolve_my_profile(&identity, ps)?;
 
     match pm.restart(&profile).await {
         Ok(()) => Ok(Json(ActionResponse {
@@ -429,12 +418,16 @@ pub async fn my_gateway_status(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<crate::process_manager::ProcessStatus>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
     let pm = state
         .process_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(pm.status(&user_id).await))
+    Ok(Json(pm.status(&profile_id).await))
 }
 
 /// GET /api/my/profile/logs
@@ -442,14 +435,18 @@ pub async fn my_gateway_logs(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
     let pm = state
         .process_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let rx = pm
-        .subscribe_logs(&user_id)
+        .subscribe_logs(&profile_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
@@ -475,13 +472,17 @@ pub async fn my_whatsapp_qr(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<crate::process_manager::BridgeQrInfo>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
     let pm = state
         .process_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    pm.bridge_qr(&user_id)
+    pm.bridge_qr(&profile_id)
         .await
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
@@ -492,13 +493,17 @@ pub async fn my_provider_metrics(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let user_id = get_user_id(&identity)?;
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile_id = resolve_my_profile_id(&identity, ps)?;
     let pm = state
         .process_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    match pm.read_metrics(&user_id).await {
+    match pm.read_metrics(&profile_id).await {
         Some(metrics) => Ok(Json(metrics)),
         None => Ok(Json(serde_json::json!(null))),
     }
@@ -506,11 +511,33 @@ pub async fn my_provider_metrics(
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-fn get_user_id(identity: &AuthIdentity) -> Result<String, StatusCode> {
+/// Resolve the profile ID for "my" endpoints.
+/// For regular users, returns their user ID. For admin token, returns the first profile's ID.
+fn resolve_my_profile_id(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+) -> Result<String, StatusCode> {
     match identity {
-        AuthIdentity::Admin => Err(StatusCode::BAD_REQUEST), // Admin should use /api/admin routes
+        AuthIdentity::Admin => {
+            let profiles = ps.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            profiles
+                .first()
+                .map(|p| p.id.clone())
+                .ok_or(StatusCode::NOT_FOUND)
+        }
         AuthIdentity::User { id, .. } => Ok(id.clone()),
     }
+}
+
+/// Resolve the full profile for "my" endpoints.
+fn resolve_my_profile(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+) -> Result<crate::profiles::UserProfile, StatusCode> {
+    let id = resolve_my_profile_id(identity, ps)?;
+    ps.get(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 fn extract_bearer_token(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
