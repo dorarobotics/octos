@@ -12,7 +12,6 @@ use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
-use super::admin_bot_api;
 use super::auth_handlers;
 use super::handlers;
 use super::metrics;
@@ -131,9 +130,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/users", get(user_admin::list_users))
         .route("/api/admin/users", post(user_admin::create_user))
         .route("/api/admin/users/{id}", delete(user_admin::delete_user))
-        // Admin bot config
-        .route("/api/admin/admin-bot", get(admin_bot_api::get_config))
-        .route("/api/admin/admin-bot", put(admin_bot_api::update_config));
+        // System metrics
+        .route("/api/admin/system/metrics", get(admin::system_metrics))
+        // Monitor control
+        .route("/api/admin/monitor/status", get(admin::monitor_status))
+        .route(
+            "/api/admin/monitor/watchdog",
+            post(admin::toggle_watchdog),
+        )
+        .route("/api/admin/monitor/alerts", post(admin::toggle_alerts));
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

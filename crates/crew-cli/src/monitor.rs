@@ -1,4 +1,6 @@
 //! Watchdog auto-restart, periodic health checks, and alert delivery.
+//!
+//! Extracted from admin_bot to run independently in `crew serve`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -288,17 +290,19 @@ impl Monitor {
 
 // ── Alert sender implementations ───────────────────────────────────────
 
-/// Sends alerts to a Telegram chat.
+/// Sends alerts to a Telegram chat via HTTP API (no teloxide dependency).
 pub struct TelegramAlertSender {
-    bot: teloxide::Bot,
-    chat_ids: Vec<teloxide::types::ChatId>,
+    token: String,
+    chat_ids: Vec<i64>,
+    http: reqwest::Client,
 }
 
 impl TelegramAlertSender {
-    pub fn new(bot: teloxide::Bot, chat_ids: Vec<i64>) -> Self {
+    pub fn new(token: String, chat_ids: Vec<i64>) -> Self {
         Self {
-            bot,
-            chat_ids: chat_ids.into_iter().map(teloxide::types::ChatId).collect(),
+            token,
+            chat_ids,
+            http: reqwest::Client::new(),
         }
     }
 }
@@ -306,9 +310,16 @@ impl TelegramAlertSender {
 #[async_trait::async_trait]
 impl AlertSender for TelegramAlertSender {
     async fn send_alert(&self, message: &str) {
-        use teloxide::requests::Requester;
         for chat_id in &self.chat_ids {
-            if let Err(e) = self.bot.send_message(*chat_id, message).await {
+            let url = format!(
+                "https://api.telegram.org/bot{}/sendMessage",
+                self.token
+            );
+            let body = serde_json::json!({
+                "chat_id": chat_id,
+                "text": message,
+            });
+            if let Err(e) = self.http.post(&url).json(&body).send().await {
                 tracing::warn!(chat_id = %chat_id, error = %e, "failed to send Telegram alert");
             }
         }

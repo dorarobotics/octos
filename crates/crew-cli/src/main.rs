@@ -3,8 +3,6 @@
 use clap::Parser;
 use color_eyre::eyre::Result;
 
-#[cfg(feature = "admin-bot")]
-pub mod admin_bot;
 #[cfg(feature = "api")]
 pub mod api;
 pub mod auth;
@@ -13,6 +11,8 @@ pub mod compaction;
 pub mod config;
 pub mod config_watcher;
 pub mod cron_tool;
+#[cfg(feature = "api")]
+pub mod monitor;
 #[cfg(feature = "api")]
 pub mod otp;
 pub mod persona_service;

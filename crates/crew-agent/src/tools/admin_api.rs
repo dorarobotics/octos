@@ -533,6 +533,12 @@ struct UpdateProfileInput {
     name: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// Email sending settings (SMTP or Feishu).
+    #[serde(default)]
+    email: Option<serde_json::Value>,
+    /// Environment variables to set (e.g. API keys, SMTP_PASSWORD).
+    #[serde(default)]
+    env_vars: Option<serde_json::Map<String, serde_json::Value>>,
     /// Whether to auto-restart the gateway after updating. Default true.
     #[serde(default = "default_true")]
     restart: bool,
@@ -564,6 +570,23 @@ impl Tool for UpdateProfileTool {
                 "max_history": { "type": "integer", "description": "Max conversation history messages" },
                 "name": { "type": "string", "description": "Display name for the profile" },
                 "enabled": { "type": "boolean", "description": "Enable/disable auto-start" },
+                "email": {
+                    "type": "object",
+                    "description": "Email sending config. For SMTP: {provider:'smtp', smtp_host, smtp_port, username, password_env, from_address}. For Feishu: {provider:'feishu', feishu_app_id, feishu_app_secret_env, feishu_from_address}.",
+                    "properties": {
+                        "provider": { "type": "string", "enum": ["smtp", "feishu"], "description": "Email provider type" },
+                        "smtp_host": { "type": "string", "description": "SMTP server hostname (e.g. smtp.gmail.com)" },
+                        "smtp_port": { "type": "integer", "description": "SMTP port (465 for TLS, 587 for STARTTLS)" },
+                        "username": { "type": "string", "description": "SMTP login username" },
+                        "password_env": { "type": "string", "description": "Env var name holding SMTP password" },
+                        "from_address": { "type": "string", "description": "Sender email address" }
+                    }
+                },
+                "env_vars": {
+                    "type": "object",
+                    "description": "Environment variables to set (e.g. SMTP_PASSWORD, API keys). Keys are var names, values are secrets.",
+                    "additionalProperties": { "type": "string" }
+                },
                 "restart": { "type": "boolean", "description": "Auto-restart gateway after update (default true)", "default": true }
             },
             "required": ["profile_id"]
@@ -613,6 +636,12 @@ impl Tool for UpdateProfileTool {
         }
         if let Some(mh) = input.max_history {
             gateway.insert("max_history".into(), serde_json::json!(mh));
+        }
+        if let Some(ref email) = input.email {
+            config.insert("email".into(), email.clone());
+        }
+        if let Some(ref env_vars) = input.env_vars {
+            config.insert("env_vars".into(), serde_json::Value::Object(env_vars.clone()));
         }
         if !gateway.is_empty() {
             config.insert("gateway".into(), serde_json::Value::Object(gateway));
@@ -666,6 +695,12 @@ impl Tool for UpdateProfileTool {
                 }
                 if input.api_key_env.is_some() {
                     changes.push("api_key_env=<updated>".into());
+                }
+                if input.email.is_some() {
+                    changes.push("email=<configured>".into());
+                }
+                if input.env_vars.is_some() {
+                    changes.push("env_vars=<updated>".into());
                 }
 
                 let mut msg = format!(

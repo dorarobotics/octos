@@ -58,6 +58,7 @@ export interface ProfileConfig {
   email?: EmailSettings | null
   env_vars: Record<string, string>
   hooks?: HookConfig[]
+  admin_mode?: boolean
 }
 
 export interface UserProfile {
@@ -200,7 +201,7 @@ export interface SharedMetrics {
   providers: SharedProviderMetrics[]
 }
 
-// ── Admin Bot Config ─────────────────────────────────────────────────
+// ── Admin Bot Config (legacy, kept for backwards compat) ─────────────
 
 export interface AdminBotConfig {
   telegram_token_env?: string | null
@@ -218,4 +219,11 @@ export interface AdminBotConfig {
   max_restart_attempts: number
   env_vars: Record<string, string>
   fallback_models?: FallbackModel[]
+}
+
+// ── Monitor Status ──────────────────────────────────────────────────
+
+export interface MonitorStatus {
+  watchdog_enabled: boolean
+  alerts_enabled: boolean
 }

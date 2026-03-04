@@ -23,7 +23,7 @@ NEVER add, remove, enable, or disable cron jobs unless the user **explicitly** a
 
 ### Add a cron-expression job
 ```json
-{"action": "add", "name": "morning", "message": "Good morning check-in", "cron_expr": "0 0 9 * * * *"}
+{"action": "add", "name": "morning", "message": "Good morning check-in", "cron_expr": "0 0 9 * * * *", "timezone": "America/Los_Angeles"}
 ```
 
 ### Add a one-time job
@@ -60,13 +60,26 @@ To deliver responses to a specific channel:
 {"action": "add", "name": "alert", "message": "Check metrics", "every_seconds": 3600, "channel": "telegram", "chat_id": "123456"}
 ```
 
+## Timezone
+
+**IMPORTANT:** Cron expressions are evaluated in UTC by default. You MUST use the `timezone` parameter when the user specifies a local time. Use IANA timezone names.
+
+**Before creating any cron job with a specific time, you MUST confirm the user's timezone.** Ask: "What is your timezone? (e.g. America/Los_Angeles for Pacific Time, Asia/Shanghai for China Standard Time)". Do NOT guess or assume — always ask if you don't know.
+
+Once confirmed, always include `timezone` in the cron tool call:
+```json
+{"action": "add", "name": "daily-report", "message": "Send report", "cron_expr": "0 0 9 * * * *", "timezone": "Asia/Shanghai"}
+```
+
+Common timezones: `America/Los_Angeles` (Pacific), `America/New_York` (Eastern), `Asia/Shanghai` (China), `Asia/Tokyo` (Japan), `Europe/London` (UK), `Europe/Berlin` (Central Europe).
+
 ## Cron Expression Format
 
 Standard 7-field cron: `sec min hour day-of-month month day-of-week year`
 
 | Expression | Meaning |
 |---|---|
-| `0 0 9 * * * *` | Every day at 9:00 AM |
+| `0 0 9 * * * *` | Every day at 9:00 AM (in the configured timezone) |
 | `0 0 */2 * * * *` | Every 2 hours |
 | `0 30 9 * * 1-5 *` | Weekdays at 9:30 AM |
 | `0 0 0 1 * * *` | First of every month |

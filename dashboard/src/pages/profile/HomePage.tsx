@@ -9,7 +9,7 @@ import { CHANNEL_COLORS, CHANNEL_LABELS } from '../../types'
 export default function HomePage() {
   const { isAdmin } = useAuth()
   const {
-    profileId, config, status, isOwn, loading,
+    profileId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
     profileName, setProfileName, enabled, setEnabled,
     save, saving, deleteProfile,
@@ -118,6 +118,19 @@ export default function HomePage() {
               <span className="text-sm text-gray-400">Auto-start gateway when server starts</span>
             </label>
           </div>
+          {isAdmin && !isOwn && (
+            <div>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={config.admin_mode || false}
+                  onChange={(e) => setConfig({ ...config, admin_mode: e.target.checked })}
+                  className="w-4 h-4 rounded bg-surface-dark border-gray-600 text-accent focus:ring-accent"
+                />
+                <span className="text-sm text-gray-400">Admin mode (admin-only tools, no shell/file/web)</span>
+              </label>
+            </div>
+          )}
           <div className="flex gap-3 pt-2">
             <button
               onClick={save}

@@ -43,6 +43,10 @@ pub struct CronJob {
     pub state: CronJobState,
     pub created_at_ms: i64,
     pub delete_after_run: bool,
+    /// IANA timezone for cron expressions (e.g. "America/Los_Angeles").
+    /// If None, defaults to UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
 
 /// Persistent store format for all cron jobs.
@@ -80,8 +84,17 @@ impl CronJob {
             CronSchedule::Cron { expr } => {
                 use std::str::FromStr;
                 if let Ok(schedule) = cron::Schedule::from_str(expr) {
-                    let next = schedule.upcoming(chrono::Utc).next();
-                    self.state.next_run_at_ms = next.map(|t| t.timestamp_millis());
+                    let next_ms = if let Some(tz_name) = &self.timezone {
+                        if let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
+                            schedule.upcoming(tz).next().map(|t| t.timestamp_millis())
+                        } else {
+                            // Invalid timezone, fall back to UTC
+                            schedule.upcoming(chrono::Utc).next().map(|t| t.timestamp_millis())
+                        }
+                    } else {
+                        schedule.upcoming(chrono::Utc).next().map(|t| t.timestamp_millis())
+                    };
+                    self.state.next_run_at_ms = next_ms;
                 } else {
                     self.state.next_run_at_ms = None;
                 }
@@ -119,6 +132,7 @@ mod tests {
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: false,
+            timezone: None,
         }
     }
 
@@ -137,6 +151,7 @@ mod tests {
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: true,
+            timezone: None,
         }
     }
 
@@ -195,6 +210,7 @@ mod tests {
             state: CronJobState::default(),
             created_at_ms: 1000,
             delete_after_run: false,
+            timezone: None,
         };
         job.compute_next_run(0);
         assert!(job.state.next_run_at_ms.is_some());

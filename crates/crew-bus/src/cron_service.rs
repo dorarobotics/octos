@@ -72,6 +72,17 @@ impl CronService {
         schedule: CronSchedule,
         payload: CronPayload,
     ) -> Result<CronJob> {
+        self.add_job_with_tz(name, schedule, payload, None)
+    }
+
+    /// Add a new cron job with an optional IANA timezone.
+    pub fn add_job_with_tz(
+        self: &std::sync::Arc<Self>,
+        name: String,
+        schedule: CronSchedule,
+        payload: CronPayload,
+        timezone: Option<String>,
+    ) -> Result<CronJob> {
         let now_ms = Utc::now().timestamp_millis();
         let id = short_id();
 
@@ -86,6 +97,7 @@ impl CronService {
             state: Default::default(),
             created_at_ms: now_ms,
             delete_after_run,
+            timezone,
         };
         job.compute_next_run(now_ms);
 

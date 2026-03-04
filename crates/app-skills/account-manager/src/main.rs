@@ -220,11 +220,11 @@ fn action_create(profiles_dir: &Path, parent_id: &str, input: &Input) {
     if let Some(ref token) = input.telegram_token {
         let env_name = format!(
             "TELEGRAM_BOT_TOKEN_{}",
-            name.to_uppercase().replace(' ', "_")
+            slugify(name).to_uppercase().replace('-', "_")
         );
         channels.push(json!({
             "type": "telegram",
-            "token_env": env_name,
+            "token_env": &env_name,
             "allowed_senders": ""
         }));
         env_vars.insert(env_name, token.clone());
@@ -455,7 +455,30 @@ fn slugify(s: &str) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    slug.trim_matches('-').to_string()
+    // Collapse consecutive dashes and trim
+    let mut result = String::new();
+    let mut prev_dash = false;
+    for c in slug.trim_matches('-').chars() {
+        if c == '-' {
+            if !prev_dash {
+                result.push(c);
+            }
+            prev_dash = true;
+        } else {
+            result.push(c);
+            prev_dash = false;
+        }
+    }
+    if result.is_empty() {
+        // Non-ASCII name (e.g. Chinese): generate a deterministic short hash
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        format!("{:08x}", hasher.finish() as u32)
+    } else {
+        result
+    }
 }
 
 fn channel_summary(channels: &[serde_json::Value]) -> String {

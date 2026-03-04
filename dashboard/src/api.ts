@@ -10,7 +10,7 @@ import type {
   MeResponse,
   User,
   SharedMetrics,
-  AdminBotConfig,
+  MonitorStatus,
 } from './types'
 
 const BASE = '/api/admin'
@@ -130,14 +130,23 @@ export const api = {
   deleteUser: (id: string) =>
     request<ActionResponse>(`/users/${id}`, { method: 'DELETE' }),
 
-  // Admin bot config
-  getAdminBot: () => request<AdminBotConfig>('/admin-bot'),
+  // Monitor control
+  monitorStatus: () => request<MonitorStatus>('/monitor/status'),
 
-  updateAdminBot: (data: AdminBotConfig) =>
-    request<AdminBotConfig>('/admin-bot', {
-      method: 'PUT',
-      body: JSON.stringify(data),
+  toggleWatchdog: (enabled: boolean) =>
+    request<{ ok: boolean; watchdog_enabled: boolean }>('/monitor/watchdog', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
     }),
+
+  toggleAlerts: (enabled: boolean) =>
+    request<{ ok: boolean; alerts_enabled: boolean }>('/monitor/alerts', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+
+  gatewayStatus: (id: string) =>
+    request<{ running: boolean; pid: number | null }>(`/profiles/${id}/status`),
 }
 
 // ── Auth API (public) ───────────────────────────────────────────────

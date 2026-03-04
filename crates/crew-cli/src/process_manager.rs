@@ -15,7 +15,7 @@ use eyre::{Result, bail};
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-#[cfg(feature = "admin-bot")]
+#[cfg(feature = "api")]
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
@@ -36,8 +36,12 @@ pub struct ProcessManager {
     /// Path to bridge.js. If None, managed bridges are disabled.
     bridge_js_path: Option<PathBuf>,
     /// Optional channel for sending admin alerts when gateways exit.
-    #[cfg(feature = "admin-bot")]
-    alert_tx: std::sync::Mutex<Option<mpsc::Sender<crate::admin_bot::monitor::AdminAlert>>>,
+    #[cfg(feature = "api")]
+    alert_tx: std::sync::Mutex<Option<mpsc::Sender<crate::monitor::AdminAlert>>>,
+    /// Port that `crew serve` is listening on (for admin mode gateways).
+    serve_port: Option<u16>,
+    /// Admin token for API access (passed to admin mode gateways).
+    admin_token: Option<String>,
 }
 
 struct GatewayProcess {
@@ -112,14 +116,23 @@ impl ProcessManager {
             bridges: Arc::new(RwLock::new(HashMap::new())),
             profile_store,
             bridge_js_path: None,
-            #[cfg(feature = "admin-bot")]
+            #[cfg(feature = "api")]
             alert_tx: std::sync::Mutex::new(None),
+            serve_port: None,
+            admin_token: None,
         }
     }
 
-    /// Set the alert sender for admin bot notifications.
-    #[cfg(feature = "admin-bot")]
-    pub fn set_alert_sender(&self, tx: mpsc::Sender<crate::admin_bot::monitor::AdminAlert>) {
+    /// Set the serve port and admin token (for admin mode gateways).
+    pub fn with_serve_config(mut self, port: u16, token: Option<String>) -> Self {
+        self.serve_port = Some(port);
+        self.admin_token = token;
+        self
+    }
+
+    /// Set the alert sender for monitor notifications.
+    #[cfg(feature = "api")]
+    pub fn set_alert_sender(&self, tx: mpsc::Sender<crate::monitor::AdminAlert>) {
         *self.alert_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     }
 
@@ -219,6 +232,16 @@ impl ProcessManager {
             }
         }
 
+        // Admin mode: inject CREW_SERVE_URL and CREW_ADMIN_TOKEN
+        if profile.config.admin_mode {
+            if let Some(port) = self.serve_port {
+                cmd.env("CREW_SERVE_URL", format!("http://127.0.0.1:{}", port));
+            }
+            if let Some(ref token) = self.admin_token {
+                cmd.env("CREW_ADMIN_TOKEN", token);
+            }
+        }
+
         // Pass env vars from profile config, filtering out dangerous ones.
         for (key, value) in &profile.config.env_vars {
             if BLOCKED_ENV_VARS
@@ -314,7 +337,7 @@ impl ProcessManager {
         // Spawn task to wait for process exit or stop signal.
         let profile_id = profile.id.clone();
         let processes = Arc::clone(&self.processes);
-        #[cfg(feature = "admin-bot")]
+        #[cfg(feature = "api")]
         let alert_tx = self
             .alert_tx
             .lock()
@@ -335,9 +358,9 @@ impl ProcessManager {
                             None
                         }
                     };
-                    #[cfg(feature = "admin-bot")]
+                    #[cfg(feature = "api")]
                     if let Some(ref tx) = alert_tx {
-                        let _ = tx.try_send(crate::admin_bot::monitor::AdminAlert::GatewayExited {
+                        let _ = tx.try_send(crate::monitor::AdminAlert::GatewayExited {
                             profile_id: profile_id.clone(),
                             exit_code,
                             timestamp: Utc::now(),

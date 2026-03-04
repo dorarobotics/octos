@@ -76,21 +76,21 @@ impl ServeCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
-        let (config, resolved_config_path) = if let Some(config_path) = &self.config {
-            (Config::from_file(config_path)?, Some(config_path.clone()))
+        let config = if let Some(config_path) = &self.config {
+            Config::from_file(config_path)?
         } else {
             // Resolve config path the same way Config::load does
             let local_config = cwd.join(".crew").join("config.json");
             if local_config.exists() {
-                (Config::from_file(&local_config)?, Some(local_config))
+                Config::from_file(&local_config)?
             } else if let Some(global_config) = Config::global_config_path() {
                 if global_config.exists() {
-                    (Config::from_file(&global_config)?, Some(global_config))
+                    Config::from_file(&global_config)?
                 } else {
-                    (Config::default(), None)
+                    Config::default()
                 }
             } else {
-                (Config::default(), None)
+                Config::default()
             }
         };
 
@@ -152,7 +152,8 @@ impl ServeCommand {
         let bridge_js_path = data_dir.join("whatsapp-bridge").join("bridge.js");
         let process_manager = Arc::new(
             crate::process_manager::ProcessManager::new(profile_store.clone())
-                .with_bridge_js(bridge_js_path),
+                .with_bridge_js(bridge_js_path)
+                .with_serve_config(self.port, auth_token.clone()),
         );
 
         // Initialize user store and auth manager for multi-user support
@@ -182,6 +183,19 @@ impl ServeCommand {
             });
         }
 
+        // Pre-create watchdog/alerts flags for both Monitor and AppState
+        let (watchdog_flag, alerts_flag) = {
+            let wf = config
+                .monitor
+                .as_ref()
+                .map(|m| Arc::new(std::sync::atomic::AtomicBool::new(m.watchdog_enabled)));
+            let af = config
+                .monitor
+                .as_ref()
+                .map(|m| Arc::new(std::sync::atomic::AtomicBool::new(m.alerts_enabled)));
+            (wf, af)
+        };
+
         let state = Arc::new(AppState {
             agent,
             sessions,
@@ -195,8 +209,8 @@ impl ServeCommand {
             auth_manager,
             http_client: reqwest::Client::new(),
             config_path: resolved_config_path,
-            watchdog_enabled: None,
-            alerts_enabled: None,
+            watchdog_enabled: watchdog_flag.clone(),
+            alerts_enabled: alerts_flag.clone(),
         });
 
         // Auto-start enabled profiles
@@ -288,30 +302,74 @@ impl ServeCommand {
             });
         }
 
-        // Start admin bot if configured
-        #[cfg(feature = "admin-bot")]
-        if let Some(ref admin_config) = config.admin_bot {
-            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            match crate::admin_bot::AdminBot::new(
-                admin_config,
-                profile_store.clone(),
-                process_manager.clone(),
-                shutdown,
-                &data_dir,
-            )
-            .await
-            {
-                Ok(admin_bot) => {
-                    tokio::spawn(async move {
-                        if let Err(e) = admin_bot.run().await {
-                            tracing::error!(error = %e, "admin bot error");
+        // Start monitor (watchdog + health checks + alerts)
+        {
+            use crate::monitor::{FeishuAlertSender, Monitor, TelegramAlertSender};
+            use std::sync::atomic::AtomicBool;
+            use std::time::Duration;
+
+            let monitor_cfg = config.monitor.clone();
+
+            if let Some(ref mon_cfg) = monitor_cfg {
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let (alert_tx, alert_rx) = tokio::sync::mpsc::channel(256);
+
+                // Use shared flags from AppState
+                let watchdog_enabled = watchdog_flag
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(mon_cfg.watchdog_enabled)));
+                let alerts_enabled = alerts_flag
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(mon_cfg.alerts_enabled)));
+
+                // Wire alert sender into process manager
+                process_manager.set_alert_sender(alert_tx);
+
+                let mut monitor = Monitor::new(
+                    profile_store.clone(),
+                    process_manager.clone(),
+                    alert_rx,
+                    watchdog_enabled.clone(),
+                    alerts_enabled.clone(),
+                    mon_cfg.max_restart_attempts,
+                    Duration::from_secs(mon_cfg.health_check_interval_secs),
+                    shutdown,
+                );
+
+                // Add Telegram alert sender if configured
+                if let Some(ref token_env) = mon_cfg.telegram_token_env {
+                    if let Ok(token) = std::env::var(token_env) {
+                        if !mon_cfg.telegram_alert_chat_ids.is_empty() {
+                            monitor.add_sender(Box::new(TelegramAlertSender::new(
+                                token,
+                                mon_cfg.telegram_alert_chat_ids.clone(),
+                            )));
                         }
-                    });
-                    tracing::info!("admin bot spawned");
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to start admin bot (continuing without it)");
+
+                // Add Feishu alert sender if configured
+                if let Some(ref app_id_env) = mon_cfg.feishu_app_id_env {
+                    if let Ok(app_id) = std::env::var(app_id_env) {
+                        let secret_env = mon_cfg
+                            .feishu_app_secret_env
+                            .as_deref()
+                            .unwrap_or("FEISHU_APP_SECRET");
+                        if let Ok(app_secret) = std::env::var(secret_env) {
+                            if !mon_cfg.feishu_alert_user_ids.is_empty() {
+                                monitor.add_sender(Box::new(FeishuAlertSender::new(
+                                    app_id,
+                                    app_secret,
+                                    mon_cfg.feishu_alert_user_ids.clone(),
+                                    "cn",
+                                )));
+                            }
+                        }
+                    }
                 }
+
+                tokio::spawn(async move { monitor.run().await });
+                tracing::info!("monitor started (watchdog + health checks + alerts)");
             }
         }
 
