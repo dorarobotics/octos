@@ -96,6 +96,7 @@ impl ServeCommand {
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
         let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
+        tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         // Try to create the LLM provider + agent, but don't fail if no API key.
         // The admin dashboard works without it.
@@ -143,6 +144,7 @@ impl ServeCommand {
         };
 
         // Initialize profile store and process manager for admin dashboard
+        tracing::info!("initializing profile store and process manager");
         let profile_store = Arc::new(
             crate::profiles::ProfileStore::open(&data_dir)
                 .wrap_err("failed to open profile store")?,
@@ -159,6 +161,9 @@ impl ServeCommand {
         );
         let auth_manager = {
             let auth_config = config.dashboard_auth.clone();
+            if auth_config.is_none() {
+                tracing::warn!("no dashboard_auth.smtp configured — OTP codes will be logged to console only");
+            }
             Some(Arc::new(crate::otp::AuthManager::new(
                 auth_config,
                 user_store.clone(),
@@ -195,9 +200,11 @@ impl ServeCommand {
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
         let enabled_count = profiles.iter().filter(|p| p.enabled).count();
+        tracing::info!(total = profiles.len(), enabled = enabled_count, "loaded profiles");
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
+                    tracing::info!(profile = %p.id, "auto-starting gateway");
                     if let Err(e) = process_manager.start(p).await {
                         tracing::warn!(profile = %p.id, error = %e, "failed to auto-start gateway");
                     }
@@ -309,6 +316,12 @@ impl ServeCommand {
         let app = build_router(state);
         let addr = format!("{}:{}", self.host, self.port);
 
+        tracing::info!(address = %addr, "crew-rs API server starting");
+        tracing::info!(dashboard = %format!("http://{}/admin/", addr), "dashboard available");
+        if enabled_count > 0 {
+            tracing::info!(count = enabled_count, "gateway profiles auto-started");
+        }
+
         println!("{}", "crew-rs API server".cyan().bold());
         println!("{}: http://{}", "Listening".green(), addr);
         println!("{}: http://{}/admin/", "Dashboard".green(), addr);
@@ -322,9 +335,26 @@ impl ServeCommand {
         println!();
 
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                println!();
+                println!("{}", "Shutting down server...".yellow());
+            })
+            .await?;
 
-        Ok(())
+        // Stop all gateway child processes before exiting
+        tracing::info!("stopping all gateway child processes");
+        println!("{}", "Stopping gateways...".yellow());
+        let stopped = process_manager.stop_all().await;
+        if stopped > 0 {
+            tracing::info!(count = stopped, "gateways stopped");
+            println!("  stopped {} gateway(s)", stopped);
+        }
+
+        // Force exit — background tokio tasks (profile watcher, auth cleanup,
+        // admin bot) have no shutdown signal and would hang indefinitely.
+        std::process::exit(0);
     }
 
     /// Try to create an Agent + SessionManager. Returns Err if API key is missing etc.

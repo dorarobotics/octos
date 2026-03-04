@@ -54,6 +54,7 @@ pub async fn twilio_webhook_proxy(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    tracing::info!(profile = %profile_id, "webhook proxy: twilio event received");
     let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "request body too large"),

@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -71,6 +72,7 @@ pub async fn send_code(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
+    tracing::info!(email = %req.email, "login OTP requested");
     match auth_mgr.send_otp(&req.email).await {
         Ok(true) => Ok(Json(SendCodeResponse {
             ok: true,
@@ -103,6 +105,7 @@ pub async fn verify(
 
     match auth_mgr.verify_otp(&req.email, &req.code).await {
         Ok(Some(token)) => {
+            tracing::info!(email = %req.email, "user logged in");
             // Get the user to return
             let user_store = state
                 .user_store
@@ -170,6 +173,7 @@ pub async fn logout(
 
     if let Some(token) = extract_bearer_token(&req) {
         auth_mgr.revoke_session(&token).await;
+        tracing::info!("user logged out");
     }
 
     Ok(Json(ActionResponse {
@@ -301,8 +305,12 @@ pub async fn update_my_profile(
     profile.updated_at = chrono::Utc::now();
 
     ps.save_with_merge(&mut profile)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(profile = %profile.id, error = %e, "failed to save user profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
+    tracing::info!(profile = %profile.id, "user profile updated");
     let status = if let Some(ref pm) = state.process_manager {
         pm.status(&profile.id).await
     } else {
@@ -345,14 +353,20 @@ pub async fn start_my_gateway(
     }
 
     match pm.start(&profile).await {
-        Ok(()) => Ok(Json(ActionResponse {
-            ok: true,
-            message: None,
-        })),
-        Err(e) => Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(e.to_string()),
-        })),
+        Ok(()) => {
+            tracing::info!(profile = %profile.id, "user gateway started");
+            Ok(Json(ActionResponse {
+                ok: true,
+                message: None,
+            }))
+        }
+        Err(e) => {
+            tracing::error!(profile = %profile.id, error = %e, "user gateway failed to start");
+            Ok(Json(ActionResponse {
+                ok: false,
+                message: Some(e.to_string()),
+            }))
+        }
     }
 }
 
@@ -373,11 +387,13 @@ pub async fn stop_my_gateway(
 
     let stopped = pm.stop(&profile_id).await.unwrap_or(false);
     if stopped {
+        tracing::info!(profile = %profile_id, "user gateway stopped");
         Ok(Json(ActionResponse {
             ok: true,
             message: None,
         }))
     } else {
+        tracing::warn!(profile = %profile_id, "user stop requested but gateway not running");
         Ok(Json(ActionResponse {
             ok: false,
             message: Some("Gateway not running".into()),
@@ -402,14 +418,20 @@ pub async fn restart_my_gateway(
     let profile = resolve_my_profile(&identity, ps)?;
 
     match pm.restart(&profile).await {
-        Ok(()) => Ok(Json(ActionResponse {
-            ok: true,
-            message: None,
-        })),
-        Err(e) => Ok(Json(ActionResponse {
-            ok: false,
-            message: Some(e.to_string()),
-        })),
+        Ok(()) => {
+            tracing::info!(profile = %profile.id, "user gateway restarted");
+            Ok(Json(ActionResponse {
+                ok: true,
+                message: None,
+            }))
+        }
+        Err(e) => {
+            tracing::error!(profile = %profile.id, error = %e, "user gateway failed to restart");
+            Ok(Json(ActionResponse {
+                ok: false,
+                message: Some(e.to_string()),
+            }))
+        }
     }
 }
 
@@ -445,12 +467,19 @@ pub async fn my_gateway_logs(
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
+    // Get buffered history first, then subscribe for live logs.
+    let history = pm.log_history(&profile_id).await;
     let rx = pm
         .subscribe_logs(&profile_id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    let history_stream = futures::stream::iter(
+        history
+            .into_iter()
+            .map(|line| Ok(Event::default().data(line))),
+    );
+    let live_stream = futures::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
                 Ok(line) => {
@@ -464,7 +493,7 @@ pub async fn my_gateway_logs(
         }
     });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(history_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
 /// GET /api/my/profile/whatsapp/qr

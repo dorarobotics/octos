@@ -8,6 +8,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::routing::{delete, get, post, put};
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 use super::AppState;
 use super::admin;
@@ -177,6 +178,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     public
         .merge(protected)
         .fallback(static_files::static_handler)
+        .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
 }

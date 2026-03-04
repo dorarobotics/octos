@@ -47,7 +47,12 @@ struct GatewayProcess {
     stop_tx: watch::Sender<bool>,
     /// Feishu/Twilio webhook port this gateway is listening on (if any).
     webhook_port: Option<u16>,
+    /// Ring buffer of recent log lines so new subscribers can see history.
+    log_history: Arc<Mutex<Vec<String>>>,
 }
+
+/// Max number of log lines to retain per gateway process.
+const LOG_HISTORY_MAX: usize = 500;
 
 #[allow(dead_code)]
 struct BridgeProcess {
@@ -234,7 +239,10 @@ impl ProcessManager {
 
         let pid = child.id().unwrap_or(0);
         let (log_tx, _) = broadcast::channel::<String>(1024);
+        // Subscribe before spawning readers so we capture all output for startup check.
+        let startup_rx = log_tx.subscribe();
         let (stop_tx, stop_rx) = watch::channel(false);
+        let log_history: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
         let process = GatewayProcess {
             pid,
@@ -242,33 +250,64 @@ impl ProcessManager {
             log_tx: log_tx.clone(),
             stop_tx,
             webhook_port: feishu_port,
+            log_history: log_history.clone(),
         };
 
         procs.insert(profile.id.clone(), process);
         // Release the write lock now that the entry is inserted.
         drop(procs);
 
-        // Spawn task to read stdout and forward to log channel
+        // Spawn task to read stdout and forward to log channel + server console
+        let has_stdout = child.stdout.is_some();
+        let has_stderr = child.stderr.is_some();
+        tracing::info!(
+            profile = %profile.id,
+            pid = pid,
+            stdout = has_stdout,
+            stderr = has_stderr,
+            "spawned gateway, attaching log readers"
+        );
+
         if let Some(stdout) = child.stdout.take() {
             let tx = log_tx.clone();
+            let hist = log_history.clone();
+            let profile_id_label = profile.id.clone();
             tokio::spawn(async move {
+                tracing::debug!(profile = %profile_id_label, "stdout reader started");
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(line);
+                    tracing::info!(profile = %profile_id_label, "{line}");
+                    let _ = tx.send(line.clone());
+                    let mut buf = hist.lock().await;
+                    buf.push(line);
+                    if buf.len() > LOG_HISTORY_MAX {
+                        buf.remove(0);
+                    }
                 }
+                tracing::debug!(profile = %profile_id_label, "stdout reader ended");
             });
         }
 
-        // Spawn task to read stderr and forward to log channel
+        // Spawn task to read stderr and forward to log channel + server console
         if let Some(stderr) = child.stderr.take() {
             let tx = log_tx.clone();
+            let hist = log_history.clone();
+            let profile_id_label = profile.id.clone();
             tokio::spawn(async move {
+                tracing::debug!(profile = %profile_id_label, "stderr reader started");
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = tx.send(format!("[stderr] {line}"));
+                    tracing::warn!(profile = %profile_id_label, "{line}");
+                    let _ = tx.send(line.clone());
+                    let mut buf = hist.lock().await;
+                    buf.push(line);
+                    if buf.len() > LOG_HISTORY_MAX {
+                        buf.remove(0);
+                    }
                 }
+                tracing::debug!(profile = %profile_id_label, "stderr reader ended");
             });
         }
 
@@ -312,6 +351,35 @@ impl ProcessManager {
                 }
             }
         });
+
+        // Wait briefly to catch immediate startup failures (e.g. missing API key,
+        // config errors). If the process exits within this window, report the error
+        // instead of returning Ok.  We check in a loop so we detect exit quickly
+        // while still giving stderr time to flush.
+        let mut startup_rx = startup_rx;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let procs = self.processes.read().await;
+            if !procs.contains_key(&profile.id) {
+                // Process already exited and was removed by the monitor task.
+                drop(procs); // release read lock
+                // Give reader tasks time to flush remaining pipe data to the
+                // broadcast channel before we drain it.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                // Drain log lines captured by our early subscriber.
+                let mut lines = Vec::new();
+                while let Ok(line) = startup_rx.try_recv() {
+                    lines.push(line);
+                }
+                let detail = if lines.is_empty() {
+                    "gateway exited immediately (no output captured)".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                tracing::error!(profile = %profile.id, "gateway failed to start:\n{detail}");
+                bail!("gateway failed to start:\n{detail}");
+            }
+        }
 
         tracing::info!(profile = %profile.id, pid = pid, "gateway started");
         Ok(())
@@ -372,6 +440,15 @@ impl ProcessManager {
         procs.get(profile_id).map(|p| p.log_tx.subscribe())
     }
 
+    /// Get buffered log history for a profile. Returns empty vec if not running.
+    pub async fn log_history(&self, profile_id: &str) -> Vec<String> {
+        let procs = self.processes.read().await;
+        match procs.get(profile_id) {
+            Some(p) => p.log_history.lock().await.clone(),
+            None => Vec::new(),
+        }
+    }
+
     /// Get the status of all profiles.
     pub async fn all_statuses(&self) -> HashMap<String, ProcessStatus> {
         let procs = self.processes.read().await;
@@ -392,6 +469,11 @@ impl ProcessManager {
     }
 
     /// Stop all running gateways (and their bridges).
+    ///
+    /// Kills child processes directly by PID rather than relying on async
+    /// monitor tasks, because the caller may call `std::process::exit()`
+    /// immediately after this returns (which would abort tokio tasks before
+    /// they can execute `child.kill()`).
     pub async fn stop_all(&self) -> usize {
         // Stop all bridges first
         let bridge_ids: Vec<String> = {
@@ -408,8 +490,14 @@ impl ProcessManager {
         };
         let count = processes.len();
         for (id, proc) in processes {
+            // Signal monitor task (best-effort, may not run before exit)
             let _ = proc.stop_tx.send(true);
-            tracing::info!(profile = %id, "gateway stopped");
+            // Kill directly by PID so the child dies even if tokio exits
+            // immediately after this method returns (e.g. std::process::exit).
+            let _ = std::process::Command::new("kill")
+                .arg(proc.pid.to_string())
+                .status();
+            tracing::info!(profile = %id, pid = proc.pid, "gateway killed");
         }
         count
     }

@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use chrono::Utc;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -203,8 +204,12 @@ pub async fn create_profile(
 
     store
         .save(&profile)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(profile = %profile.id, error = %e, "failed to create profile");
+            (StatusCode::BAD_REQUEST, e.to_string())
+        })?;
 
+    tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
     Ok((
         StatusCode::CREATED,
@@ -255,8 +260,12 @@ pub async fn update_profile(
 
     store
         .save_with_merge(&mut profile)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(profile = %id, error = %e, "failed to update profile");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
 
+    tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
     Ok(Json(ProfileResponse {
         profile: mask_secrets(&profile),
@@ -297,6 +306,7 @@ pub async fn delete_profile(
         return Err((StatusCode::NOT_FOUND, format!("profile '{id}' not found")));
     }
 
+    tracing::info!(profile = %id, "profile deleted");
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("profile '{id}' deleted")),
@@ -332,10 +342,12 @@ pub async fn start_gateway(
         ));
     }
 
-    pm.start(&profile)
-        .await
-        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    if let Err(e) = pm.start(&profile).await {
+        tracing::error!(profile = %id, error = %e, "admin gateway failed to start");
+        return Err((StatusCode::CONFLICT, e.to_string()));
+    }
 
+    tracing::info!(profile = %id, "admin gateway started");
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("gateway '{id}' started")),
@@ -358,12 +370,14 @@ pub async fn stop_gateway(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if !stopped {
+        tracing::warn!(profile = %id, "stop requested but gateway not running");
         return Err((
             StatusCode::NOT_FOUND,
             format!("gateway '{id}' is not running"),
         ));
     }
 
+    tracing::info!(profile = %id, "admin gateway stopped");
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("gateway '{id}' stopped")),
@@ -389,10 +403,12 @@ pub async fn restart_gateway(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, format!("profile '{id}' not found")))?;
 
-    pm.restart(&profile)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(e) = pm.restart(&profile).await {
+        tracing::error!(profile = %id, error = %e, "admin gateway failed to restart");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
 
+    tracing::info!(profile = %id, "admin gateway restarted");
     Ok(Json(ActionResponse {
         ok: true,
         message: Some(format!("gateway '{id}' restarted")),
@@ -441,12 +457,20 @@ pub async fn gateway_logs(
         "admin not configured".into(),
     ))?;
 
+    // Get buffered history first, then subscribe for live logs.
+    let history = pm.log_history(&id).await;
     let rx = pm.subscribe_logs(&id).await.ok_or((
         StatusCode::NOT_FOUND,
         format!("gateway '{id}' is not running"),
     ))?;
 
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    // Emit history lines first, then stream live.
+    let history_stream = futures::stream::iter(
+        history
+            .into_iter()
+            .map(|line| Ok(Event::default().data(line))),
+    );
+    let live_stream = futures::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
                 Ok(line) => {
@@ -460,7 +484,7 @@ pub async fn gateway_logs(
         }
     });
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(history_stream.chain(live_stream)).keep_alive(KeepAlive::default()))
 }
 
 /// GET /api/admin/profiles/:id/whatsapp/qr
@@ -562,21 +586,30 @@ pub async fn test_provider(
     )
     .await
     {
-        Ok(Ok(resp)) => Ok(Json(TestProviderResponse {
-            ok: true,
-            message: resp.content.unwrap_or_default(),
-            error: None,
-        })),
-        Ok(Err(e)) => Ok(Json(TestProviderResponse {
-            ok: false,
-            message: String::new(),
-            error: Some(format!("{e:#}")),
-        })),
-        Err(_) => Ok(Json(TestProviderResponse {
-            ok: false,
-            message: String::new(),
-            error: Some("Request timed out after 30 seconds".into()),
-        })),
+        Ok(Ok(resp)) => {
+            tracing::info!(provider = %req.provider, model = %req.model, "test-provider succeeded");
+            Ok(Json(TestProviderResponse {
+                ok: true,
+                message: resp.content.unwrap_or_default(),
+                error: None,
+            }))
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(provider = %req.provider, model = %req.model, error = %e, "test-provider failed");
+            Ok(Json(TestProviderResponse {
+                ok: false,
+                message: String::new(),
+                error: Some(format!("{e:#}")),
+            }))
+        }
+        Err(_) => {
+            tracing::warn!(provider = %req.provider, model = %req.model, "test-provider timed out");
+            Ok(Json(TestProviderResponse {
+                ok: false,
+                message: String::new(),
+                error: Some("Request timed out after 30 seconds".into()),
+            }))
+        }
     }
 }
 
@@ -602,14 +635,17 @@ fn resolve_saved_key(
         "profile store not configured".into(),
     ))?;
 
-    let user_id = match identity {
+    let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            // Admin: use profile_id from request if available
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Admin must provide api_key directly".into(),
-            ));
+            // Admin: resolve from first profile (same as /api/my/* endpoints)
+            let profiles = ps
+                .list()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            profiles
+                .first()
+                .map(|p| p.id.clone())
+                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -617,7 +653,7 @@ fn resolve_saved_key(
     };
 
     let profile = ps
-        .get(&user_id)
+        .get(&profile_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
@@ -781,13 +817,17 @@ fn resolve_saved_search_key(
         "profile store not configured".into(),
     ))?;
 
-    let user_id = match identity {
+    let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Admin must provide api_key directly".into(),
-            ));
+            // Admin: resolve from first profile (same as /api/my/* endpoints)
+            let profiles = ps
+                .list()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            profiles
+                .first()
+                .map(|p| p.id.clone())
+                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -795,7 +835,7 @@ fn resolve_saved_search_key(
     };
 
     let profile = ps
-        .get(&user_id)
+        .get(&profile_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "profile not found".into()))?;
 
@@ -843,15 +883,18 @@ pub async fn start_all(
         .list()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    tracing::info!("start-all requested");
     let mut started = 0;
     for p in &profiles {
         if p.enabled {
-            if pm.start(p).await.is_ok() {
-                started += 1;
+            match pm.start(p).await {
+                Ok(()) => started += 1,
+                Err(e) => tracing::warn!(profile = %p.id, error = %e, "start-all: failed to start"),
             }
         }
     }
 
+    tracing::info!(count = started, "start-all completed");
     Ok(Json(BulkActionResponse {
         ok: true,
         count: started,
@@ -867,7 +910,9 @@ pub async fn stop_all(
         "admin not configured".into(),
     ))?;
 
+    tracing::info!("stop-all requested");
     let count = pm.stop_all().await;
+    tracing::info!(count = count, "stop-all completed");
     Ok(Json(BulkActionResponse { ok: true, count }))
 }
 

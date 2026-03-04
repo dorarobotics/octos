@@ -107,6 +107,7 @@ impl AuthManager {
             let user = self.user_store.get_by_email(&email_lower)?;
             if user.is_none() {
                 // Return Ok(true) to avoid email enumeration — caller shows same message
+                tracing::warn!(email = %email_lower, "OTP skipped — user not found and self-registration is disabled");
                 return Ok(true);
             }
         }
@@ -143,8 +144,8 @@ impl AuthManager {
                 return Err(e);
             }
         } else {
-            // Dev mode: log to console
-            tracing::info!(email = %email_lower, code = %code, "OTP code (no SMTP configured)");
+            // Dev mode: log to console — email will NOT be delivered
+            tracing::warn!(email = %email_lower, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
         }
 
         Ok(true)

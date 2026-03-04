@@ -64,6 +64,7 @@ pub async fn create_user(
 
     // Check if email already registered
     if let Ok(Some(_)) = us.get_by_email(&req.email) {
+        tracing::warn!(email = %req.email, "create_user: email already registered");
         return Err(StatusCode::CONFLICT);
     }
 
@@ -86,7 +87,12 @@ pub async fn create_user(
     };
 
     us.save(&user)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            tracing::error!(email = %user.email, error = %e, "create_user: failed to save user");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    tracing::info!(user_id = %user.id, email = %user.email, role = ?user.role, "create_user: user created");
 
     // Also create a default profile for the user
     if let Some(ref ps) = state.profile_store {
@@ -130,11 +136,20 @@ pub async fn delete_user(
 
     // Delete user
     match us.delete(&id) {
-        Ok(true) => Ok(Json(ActionResponse {
-            ok: true,
-            message: None,
-        })),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(true) => {
+            tracing::info!(user_id = %id, "delete_user: user deleted");
+            Ok(Json(ActionResponse {
+                ok: true,
+                message: None,
+            }))
+        }
+        Ok(false) => {
+            tracing::warn!(user_id = %id, "delete_user: user not found");
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(e) => {
+            tracing::error!(user_id = %id, error = %e, "delete_user: failed to delete");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }

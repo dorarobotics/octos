@@ -43,11 +43,18 @@ pub async fn chat(
     ))?;
 
     if req.message.len() > MAX_MESSAGE_LEN {
+        tracing::warn!(len = req.message.len(), "chat: message exceeds size limit");
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("message exceeds {}KB limit", MAX_MESSAGE_LEN / 1024),
         ));
     }
+
+    tracing::info!(
+        session = req.session_id.as_deref().unwrap_or("default"),
+        msg_len = req.message.len(),
+        "chat: processing message"
+    );
 
     let session_key = SessionKey::new("api", req.session_id.as_deref().unwrap_or("default"));
 
@@ -60,7 +67,16 @@ pub async fn chat(
     let response = agent
         .process_message(&req.message, &history, vec![])
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "chat: LLM processing failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?;
+
+    tracing::info!(
+        input_tokens = response.token_usage.input_tokens,
+        output_tokens = response.token_usage.output_tokens,
+        "chat: response generated"
+    );
 
     // Save to session
     {

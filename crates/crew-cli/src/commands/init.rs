@@ -71,6 +71,10 @@ impl Executable for InitCommand {
             println!("  1. anthropic (Claude)");
             println!("  2. openai (GPT-4)");
             println!("  3. gemini (Google Gemini)");
+            println!("  4. zhipu (GLM)");
+            println!("  5. deepseek (DeepSeek)");
+            println!("  6. dashscope (Qwen)");
+            println!("  7. moonshot (Kimi)");
             println!();
             print!("Select provider [1]: ");
             io::stdout().flush()?;
@@ -81,6 +85,10 @@ impl Executable for InitCommand {
                 "" | "1" => "anthropic",
                 "2" => "openai",
                 "3" => "gemini",
+                "4" => "zhipu",
+                "5" => "deepseek",
+                "6" => "dashscope",
+                "7" => "moonshot",
                 _ => {
                     println!("{}", "Invalid selection, using anthropic".yellow());
                     "anthropic"
@@ -92,6 +100,10 @@ impl Executable for InitCommand {
                 "anthropic" => "claude-sonnet-4-20250514",
                 "openai" => "gpt-4o",
                 "gemini" => "gemini-2.0-flash",
+                "zhipu" => "glm-4.7",
+                "deepseek" => "deepseek-chat",
+                "dashscope" => "qwen-max",
+                "moonshot" => "kimi-k2.5",
                 _ => "claude-sonnet-4-20250514",
             };
 
@@ -113,6 +125,23 @@ impl Executable for InitCommand {
                     println!("  - gemini-2.0-flash-lite");
                     println!("  - gemini-1.5-pro");
                 }
+                "zhipu" => {
+                    println!("  - glm-4.7 (recommended)");
+                    println!("  - glm-4.5");
+                    println!("  - glm-4-flash");
+                }
+                "deepseek" => {
+                    println!("  - deepseek-chat (recommended)");
+                    println!("  - deepseek-reasoner");
+                }
+                "dashscope" => {
+                    println!("  - qwen-max (recommended)");
+                    println!("  - qwen-turbo");
+                    println!("  - qwq-plus");
+                }
+                "moonshot" => {
+                    println!("  - kimi-k2.5 (recommended)");
+                }
                 _ => {}
             }
             println!();
@@ -132,6 +161,10 @@ impl Executable for InitCommand {
                 "anthropic" => "ANTHROPIC_API_KEY",
                 "openai" => "OPENAI_API_KEY",
                 "gemini" => "GEMINI_API_KEY",
+                "zhipu" => "ZHIPU_API_KEY",
+                "deepseek" => "DEEPSEEK_API_KEY",
+                "dashscope" => "DASHSCOPE_API_KEY",
+                "moonshot" => "MOONSHOT_API_KEY",
                 _ => "API_KEY",
             };
 
