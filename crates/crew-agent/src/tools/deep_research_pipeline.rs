@@ -642,19 +642,36 @@ async fn invoke_deep_search(binary: &Path, query: &str, depth: u8, cwd: &Path) -
         .spawn()
         .wrap_err_with(|| format!("failed to spawn deep-search: {}", binary.display()))?;
 
+    let child_pid = child.id();
+
     if let Some(mut stdin) = child.stdin.take() {
         let data = serde_json::to_vec(&args)?;
         stdin.write_all(&data).await?;
     }
 
-    // 10 minute timeout
-    let result = tokio::time::timeout(
+    // 10 minute timeout. wait_with_output() consumes child, so save PID
+    // for killing on timeout to prevent orphaned processes.
+    let result = match tokio::time::timeout(
         std::time::Duration::from_secs(600),
         child.wait_with_output(),
     )
     .await
-    .wrap_err("deep-search timed out after 600s")?
-    .wrap_err("deep-search execution failed")?;
+    {
+        Ok(result) => result.wrap_err("deep-search execution failed")?,
+        Err(_) => {
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // Kill the process group (deep-search may spawn Chrome, etc.)
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &format!("-{pid}")])
+                    .status();
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+            eyre::bail!("deep-search timed out after 600s");
+        }
+    };
 
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);

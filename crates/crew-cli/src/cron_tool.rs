@@ -57,6 +57,8 @@ struct Input {
     job_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 #[async_trait]
@@ -67,9 +69,18 @@ impl Tool for CronTool {
 
     fn description(&self) -> &str {
         "Schedule recurring or one-time tasks. Actions: add, list, remove, enable, disable. \
+         The 'message' is an instruction sent to you (the agent) when the job fires — you will \
+         process it through your full tool chain (call tools, check data, reason about results). \
+         This means you can schedule complex tasks like 'Check system metrics and report only \
+         if CPU > 80% or memory > 90%' — the message is your task, not the final output. \
+         Respond with [SILENT] to suppress delivery when no action is needed. \
          When adding a job, 'channel' and 'chat_id' are auto-filled from the current \
          conversation — you do NOT need to ask the user for them. Just call add with \
          'message' and 'every_seconds' (or 'cron_expr'). \
+         IMPORTANT: cron expressions are evaluated in UTC by default. Use the 'timezone' \
+         parameter (IANA name like 'America/Los_Angeles', 'Asia/Shanghai') so the user's \
+         local time is interpreted correctly. Always set timezone when the user specifies \
+         a local time. \
          Use 'every_seconds' for recurring reminders, not 'at_ms'. \
          To remove jobs, use 'name' for fuzzy matching (preferred) or 'job_id' for exact match."
     }
@@ -85,7 +96,7 @@ impl Tool for CronTool {
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message to deliver when the job fires (required for 'add')"
+                    "description": "Instruction for the agent to process when the job fires. This is NOT sent directly to the user — instead, you (the agent) receive it as a task, execute tools as needed, and compose a response. Respond with [SILENT] to suppress output. Required for 'add'."
                 },
                 "every_seconds": {
                     "type": "integer",
@@ -114,6 +125,10 @@ impl Tool for CronTool {
                 "job_id": {
                     "type": "string",
                     "description": "Job ID for 'remove' (or use 'name' to match by name)"
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "IANA timezone for cron_expr (e.g. 'America/Los_Angeles', 'Asia/Shanghai', 'Europe/London'). Cron expressions are in UTC by default — always set this when the user specifies a local time."
                 }
             },
             "required": ["action"]
@@ -214,7 +229,7 @@ impl CronTool {
         };
 
         let name = input.name.unwrap_or_else(|| "unnamed".into());
-        let job = self.service.add_job(name, schedule, payload)?;
+        let job = self.service.add_job_with_tz(name, schedule, payload, input.timezone)?;
 
         Ok(ToolResult {
             output: format!("Created job '{}' (id: {}), {desc}.", job.name, job.id),
@@ -347,10 +362,11 @@ impl CronTool {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let end: String = s.chars().take(max).collect();
+        format!("{end}...")
     }
 }
 

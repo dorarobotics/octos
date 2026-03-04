@@ -127,11 +127,26 @@ impl Tool for ShellTool {
             .map(|s| Duration::from_secs(s.clamp(MIN_TIMEOUT, MAX_TIMEOUT)))
             .unwrap_or(self.timeout);
 
-        // Execute command (through sandbox)
+        // Execute command (through sandbox).
+        // Spawn the child, grab its PID, then timeout on wait_with_output().
+        // If timeout fires, kill by PID to prevent orphaned processes.
+        // (wait_with_output() takes ownership of child, so we save the PID first.)
         let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let result = timeout(timeout_duration, cmd.output()).await;
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    output: format!("Failed to execute command: {e}"),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+        let child_pid = child.id();
+
+        let result = timeout(timeout_duration, child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -178,14 +193,31 @@ impl Tool for ShellTool {
                 success: false,
                 ..Default::default()
             }),
-            Err(_) => Ok(ToolResult {
-                output: format!(
-                    "Command timed out after {} seconds",
-                    timeout_duration.as_secs()
-                ),
-                success: false,
-                ..Default::default()
-            }),
+            Err(_) => {
+                // Kill the child process and all its children to prevent orphans.
+                // wait_with_output() consumed the Child, so we kill via PID.
+                // Use negative PID to kill the entire process group, then
+                // fall back to killing just the PID if group kill fails.
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    // Try to kill the process group first (catches child processes)
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &format!("-{pid}")])
+                        .status();
+                    // Also kill the process directly as fallback
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .status();
+                }
+                Ok(ToolResult {
+                    output: format!(
+                        "Command timed out after {} seconds",
+                        timeout_duration.as_secs()
+                    ),
+                    success: false,
+                    ..Default::default()
+                })
+            }
         }
     }
 }

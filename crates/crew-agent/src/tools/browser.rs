@@ -44,6 +44,7 @@ impl BrowserSession {
 
         let mut builder = BrowserConfig::builder()
             .user_data_dir(temp_dir.path())
+            .arg("--headless=new")
             .arg("--disable-dev-shm-usage")
             .arg("--disable-extensions")
             .arg("--disable-background-networking");
@@ -87,6 +88,17 @@ impl BrowserSession {
 
     async fn shutdown(mut self) {
         let _ = self.browser.close().await;
+        self._handler.abort();
+    }
+}
+
+/// Defense-in-depth: if the session is dropped without calling `shutdown()`
+/// (e.g., the owning future was cancelled by a timeout), abort the handler
+/// task so Chrome is not left orphaned. `Browser::drop` sends a kill signal
+/// to the child process, and aborting the handler ensures the event loop
+/// task is cleaned up.
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
         self._handler.abort();
     }
 }

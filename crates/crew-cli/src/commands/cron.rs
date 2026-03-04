@@ -236,6 +236,7 @@ fn cmd_add(
         state: Default::default(),
         created_at_ms: Utc::now().timestamp_millis(),
         delete_after_run,
+        timezone: None,
     };
     job.compute_next_run(Utc::now().timestamp_millis());
 
@@ -295,9 +296,10 @@ fn short_id() -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let end: String = s.chars().take(max.saturating_sub(3)).collect();
+        format!("{end}...")
     }
 }

@@ -112,22 +112,39 @@ impl Tool for PluginTool {
             // Drop stdin to signal EOF
         }
 
-        let result = tokio::time::timeout(self.timeout, child.wait_with_output())
-            .await
-            .wrap_err_with(|| {
-                format!(
+        // wait_with_output() takes ownership of child, so save the PID
+        // for killing on timeout.
+        let result = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                return Err(eyre::eyre!(
+                    "plugin '{}' tool '{}' execution failed: {e}",
+                    self.plugin_name,
+                    self.tool_def.name
+                ));
+            }
+            Err(_) => {
+                // Kill the child process by PID to prevent orphaned processes.
+                // child was consumed by wait_with_output(), so kill via PID.
+                #[cfg(unix)]
+                if child_pid > 0 {
+                    // Kill the process group (catches child processes like Chrome)
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &format!("-{child_pid}")])
+                        .status();
+                    // Also kill the process directly as fallback
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &child_pid.to_string()])
+                        .status();
+                }
+                return Err(eyre::eyre!(
                     "plugin '{}' tool '{}' timed out after {}s",
                     self.plugin_name,
                     self.tool_def.name,
                     self.timeout.as_secs()
-                )
-            })?
-            .wrap_err_with(|| {
-                format!(
-                    "plugin '{}' tool '{}' execution failed",
-                    self.plugin_name, self.tool_def.name
-                )
-            })?;
+                ));
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);

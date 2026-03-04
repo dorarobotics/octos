@@ -117,8 +117,8 @@ pub struct Agent {
     pub id: AgentId,
     /// LLM provider for generating responses.
     llm: Arc<dyn LlmProvider>,
-    /// Tool registry for executing tool calls.
-    tools: ToolRegistry,
+    /// Tool registry for executing tool calls (Arc for sharing with spawned tool tasks).
+    tools: Arc<ToolRegistry>,
     /// Episode store for memory.
     memory: Arc<EpisodeStore>,
     /// Embedding provider for hybrid memory search.
@@ -150,7 +150,7 @@ impl Agent {
         Self {
             id,
             llm,
-            tools,
+            tools: Arc::new(tools),
             memory,
             embedder: None,
             system_prompt: RwLock::new(system_prompt),
@@ -710,159 +710,191 @@ impl Agent {
             "executing tools in parallel"
         );
 
-        // Execute all tool calls concurrently via join_all.
-        // The LLM issued these calls in a single response, so they are independent.
-        let futures: Vec<_> = response
+        // Spawn each tool as a separate tokio task so that if the agent-level
+        // timeout fires, the tasks keep running and can perform their own cleanup
+        // (e.g., browser tool kills Chrome, spawn tool finishes gracefully).
+        // Without tokio::spawn, timeout would drop the futures mid-flight,
+        // orphaning child processes (Chrome, shell commands, etc.).
+        let handles: Vec<_> = response
             .tool_calls
             .iter()
-            .map(|tool_call| async {
-                let tool_start = Instant::now();
-                debug!(tool = %tool_call.name, tool_id = %tool_call.id, "executing tool");
+            .map(|tool_call| {
+                // Clone Arc-wrapped fields so the spawned task is 'static
+                let tools = self.tools.clone();
+                let reporter = self.reporter.clone();
+                let hooks = self.hooks.clone();
+                let hook_ctx = self.hook_ctx();
+                let tc_name = tool_call.name.clone();
+                let tc_id = tool_call.id.clone();
+                let tc_args = tool_call.arguments.clone();
 
-                self.reporter.report(ProgressEvent::ToolStarted {
-                    name: tool_call.name.clone(),
-                    tool_id: tool_call.id.clone(),
-                });
+                tokio::spawn(async move {
+                    let tool_start = Instant::now();
+                    debug!(tool = %tc_name, tool_id = %tc_id, "executing tool");
 
-                // Before-tool hook: may deny execution
-                if let Some(ref hooks) = self.hooks {
-                    let ctx = self.hook_ctx();
-                    let payload = HookPayload::before_tool(
-                        &tool_call.name,
-                        tool_call.arguments.clone(),
-                        &tool_call.id,
-                        ctx.as_ref(),
-                    );
-                    if let HookResult::Deny(reason) =
-                        hooks.run(HookEvent::BeforeToolCall, &payload).await
-                    {
-                        let deny_msg = if reason.is_empty() {
-                            format!("[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.", tool_call.name)
-                        } else {
-                            format!("[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.", tool_call.name, reason)
-                        };
-                        return (
-                            Message {
-                                role: MessageRole::Tool,
-                                content: deny_msg,
-                                media: vec![],
-                                tool_calls: None,
-                                tool_call_id: Some(tool_call.id.clone()),
-                                reasoning_content: None,
-                                timestamp: chrono::Utc::now(),
-                            },
-                            None,
-                            None,
+                    reporter.report(ProgressEvent::ToolStarted {
+                        name: tc_name.clone(),
+                        tool_id: tc_id.clone(),
+                    });
+
+                    // Before-tool hook: may deny execution
+                    if let Some(ref hooks) = hooks {
+                        let payload = HookPayload::before_tool(
+                            &tc_name,
+                            tc_args.clone(),
+                            &tc_id,
+                            hook_ctx.as_ref(),
                         );
-                    }
-                }
-
-                let result = self
-                    .tools
-                    .execute(&tool_call.name, &tool_call.arguments)
-                    .await;
-
-                let duration = tool_start.elapsed();
-
-                let (content, file_modified, tool_tokens, tool_success) = match result {
-                    Ok(tool_result) => {
-                        debug!(
-                            tool = %tool_call.name,
-                            success = tool_result.success,
-                            duration_ms = duration.as_millis() as u64,
-                            "tool completed"
-                        );
-
-                        if let Some(ref file) = tool_result.file_modified {
-                            info!(tool = %tool_call.name, file = %file.display(), "file modified");
-                            self.reporter.report(ProgressEvent::FileModified {
-                                path: file.display().to_string(),
-                            });
+                        if let HookResult::Deny(reason) =
+                            hooks.run(HookEvent::BeforeToolCall, &payload).await
+                        {
+                            let deny_msg = if reason.is_empty() {
+                                format!("[HOOK DENIED] Tool '{}' was blocked by a lifecycle hook. Do not retry.", tc_name)
+                            } else {
+                                format!("[HOOK DENIED] Tool '{}' was blocked: {}. Do not retry.", tc_name, reason)
+                            };
+                            return (
+                                Message {
+                                    role: MessageRole::Tool,
+                                    content: deny_msg,
+                                    media: vec![],
+                                    tool_calls: None,
+                                    tool_call_id: Some(tc_id),
+                                    reasoning_content: None,
+                                    timestamp: chrono::Utc::now(),
+                                },
+                                None,
+                                None,
+                            );
                         }
-
-                        let output_preview =
-                            crew_core::truncated_utf8(&tool_result.output, 200, "...");
-
-                        self.reporter.report(ProgressEvent::ToolCompleted {
-                            name: tool_call.name.clone(),
-                            tool_id: tool_call.id.clone(),
-                            success: tool_result.success,
-                            output_preview,
-                            duration,
-                        });
-
-                        let success = tool_result.success;
-                        (
-                            tool_result.output,
-                            tool_result.file_modified,
-                            tool_result.tokens_used,
-                            success,
-                        )
                     }
-                    Err(e) => {
-                        warn!(
-                            tool = %tool_call.name,
-                            error = %e,
-                            duration_ms = duration.as_millis() as u64,
-                            "tool failed"
+
+                    let result = tools.execute(&tc_name, &tc_args).await;
+
+                    let duration = tool_start.elapsed();
+
+                    let (content, file_modified, tool_tokens, tool_success) = match result {
+                        Ok(tool_result) => {
+                            debug!(
+                                tool = %tc_name,
+                                success = tool_result.success,
+                                duration_ms = duration.as_millis() as u64,
+                                "tool completed"
+                            );
+
+                            if let Some(ref file) = tool_result.file_modified {
+                                info!(tool = %tc_name, file = %file.display(), "file modified");
+                                reporter.report(ProgressEvent::FileModified {
+                                    path: file.display().to_string(),
+                                });
+                            }
+
+                            let output_preview =
+                                crew_core::truncated_utf8(&tool_result.output, 200, "...");
+
+                            reporter.report(ProgressEvent::ToolCompleted {
+                                name: tc_name.clone(),
+                                tool_id: tc_id.clone(),
+                                success: tool_result.success,
+                                output_preview,
+                                duration,
+                            });
+
+                            let success = tool_result.success;
+                            (
+                                tool_result.output,
+                                tool_result.file_modified,
+                                tool_result.tokens_used,
+                                success,
+                            )
+                        }
+                        Err(e) => {
+                            warn!(
+                                tool = %tc_name,
+                                error = %e,
+                                duration_ms = duration.as_millis() as u64,
+                                "tool failed"
+                            );
+
+                            reporter.report(ProgressEvent::ToolCompleted {
+                                name: tc_name.clone(),
+                                tool_id: tc_id.clone(),
+                                success: false,
+                                output_preview: e.to_string(),
+                                duration,
+                            });
+
+                            (format!("Error: {e}"), None, None, false)
+                        }
+                    };
+
+                    // After-tool hook (fire-and-forget)
+                    if let Some(ref hooks) = hooks {
+                        let payload = HookPayload::after_tool(
+                            &tc_name,
+                            &tc_id,
+                            crew_core::truncated_utf8(&content, 500, "..."),
+                            tool_success,
+                            duration.as_millis() as u64,
+                            hook_ctx.as_ref(),
                         );
-
-                        self.reporter.report(ProgressEvent::ToolCompleted {
-                            name: tool_call.name.clone(),
-                            tool_id: tool_call.id.clone(),
-                            success: false,
-                            output_preview: e.to_string(),
-                            duration,
-                        });
-
-                        (format!("Error: {e}"), None, None, false)
+                        let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
                     }
-                };
 
-                // After-tool hook (fire-and-forget)
-                if let Some(ref hooks) = self.hooks {
-                    let ctx = self.hook_ctx();
-                    let payload = HookPayload::after_tool(
-                        &tool_call.name,
-                        &tool_call.id,
-                        crew_core::truncated_utf8(&content, 500, "..."),
-                        tool_success,
-                        duration.as_millis() as u64,
-                        ctx.as_ref(),
-                    );
-                    let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
-                }
+                    let content = crate::sanitize::sanitize_tool_output(&content);
 
-                let content = crate::sanitize::sanitize_tool_output(&content);
-
-                (
-                    Message {
-                        role: MessageRole::Tool,
-                        content,
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: Some(tool_call.id.clone()),
-                        reasoning_content: None,
-                        timestamp: chrono::Utc::now(),
-                    },
-                    file_modified,
-                    tool_tokens,
-                )
+                    (
+                        Message {
+                            role: MessageRole::Tool,
+                            content,
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: Some(tc_id),
+                            reasoning_content: None,
+                            timestamp: chrono::Utc::now(),
+                        },
+                        file_modified,
+                        tool_tokens,
+                    )
+                })
             })
             .collect();
 
         let tool_timeout_secs = self.config.tool_timeout_secs;
         let tool_timeout = Duration::from_secs(tool_timeout_secs);
-        let results = match tokio::time::timeout(tool_timeout, futures::future::join_all(futures)).await {
-            Ok(results) => results,
+        let results: Vec<_> = match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
+            Ok(results) => {
+                // Unwrap JoinHandle results — panics in tool tasks become errors
+                results
+                    .into_iter()
+                    .map(|r| r.unwrap_or_else(|e| {
+                        // Task panicked — return a placeholder error tuple
+                        (
+                            Message {
+                                role: MessageRole::Tool,
+                                content: format!("Tool task panicked: {e}"),
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            },
+                            None,
+                            None,
+                        )
+                    }))
+                    .collect()
+            }
             Err(_) => {
                 tracing::error!(
                     timeout_secs = tool_timeout_secs,
                     tool_count = response.tool_calls.len(),
                     tools = %tool_names.join(", "),
-                    "tool execution timed out — returning error for all pending tools"
+                    "tool execution timed out — spawned tasks continue running for cleanup"
                 );
-                // Return timeout error messages for each tool call
+                // Note: spawned tasks are NOT aborted — they continue running so
+                // tools can perform their own cleanup (browser kills Chrome, etc.).
+                // They will eventually complete via their own internal timeouts.
                 let mut messages = Vec::with_capacity(response.tool_calls.len());
                 for tc in &response.tool_calls {
                     messages.push(Message {
