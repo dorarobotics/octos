@@ -122,6 +122,37 @@ impl SessionKey {
     pub fn new(channel: &str, chat_id: &str) -> Self {
         Self(format!("{channel}:{chat_id}"))
     }
+
+    /// Create a session key with a topic suffix (e.g., `telegram:12345#research`).
+    /// Empty topic produces the same key as `new()`.
+    pub fn with_topic(channel: &str, chat_id: &str, topic: &str) -> Self {
+        if topic.is_empty() {
+            Self::new(channel, chat_id)
+        } else {
+            Self(format!("{channel}:{chat_id}#{topic}"))
+        }
+    }
+
+    /// Base key without topic: `"telegram:12345#foo"` → `"telegram:12345"`.
+    pub fn base_key(&self) -> &str {
+        self.0.split('#').next().unwrap_or(&self.0)
+    }
+
+    /// Topic suffix if present: `"telegram:12345#foo"` → `Some("foo")`.
+    pub fn topic(&self) -> Option<&str> {
+        self.0.split_once('#').map(|(_, t)| t)
+    }
+
+    /// Channel name: `"telegram:12345#foo"` → `"telegram"`.
+    pub fn channel(&self) -> &str {
+        self.base_key().split(':').next().unwrap_or("")
+    }
+
+    /// Chat ID: `"telegram:12345#foo"` → `"12345"`.
+    pub fn chat_id(&self) -> &str {
+        let base = self.base_key();
+        base.split_once(':').map(|(_, id)| id).unwrap_or(base)
+    }
 }
 
 impl std::fmt::Display for SessionKey {
@@ -211,6 +242,32 @@ mod tests {
         let json = serde_json::to_string(&key).unwrap();
         let parsed: SessionKey = serde_json::from_str(&json).unwrap();
         assert_eq!(key, parsed);
+    }
+
+    #[test]
+    fn test_session_key_with_topic() {
+        let key = SessionKey::with_topic("telegram", "12345", "research");
+        assert_eq!(key.0, "telegram:12345#research");
+        assert_eq!(key.base_key(), "telegram:12345");
+        assert_eq!(key.topic(), Some("research"));
+        assert_eq!(key.channel(), "telegram");
+        assert_eq!(key.chat_id(), "12345");
+    }
+
+    #[test]
+    fn test_session_key_with_empty_topic() {
+        let key = SessionKey::with_topic("telegram", "12345", "");
+        assert_eq!(key.0, "telegram:12345");
+        assert_eq!(key.topic(), None);
+    }
+
+    #[test]
+    fn test_session_key_base_key_no_topic() {
+        let key = SessionKey::new("whatsapp", "abc");
+        assert_eq!(key.base_key(), "whatsapp:abc");
+        assert_eq!(key.topic(), None);
+        assert_eq!(key.channel(), "whatsapp");
+        assert_eq!(key.chat_id(), "abc");
     }
 
     #[test]

@@ -26,6 +26,12 @@ struct SessionMeta {
     session_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_key: Option<String>,
+    /// Topic name for multi-session support (e.g. "research", "code").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    /// Short summary of the session (first user message, truncated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -36,6 +42,10 @@ pub struct Session {
     pub key: SessionKey,
     /// Parent session key if this session was forked.
     pub parent_key: Option<SessionKey>,
+    /// Topic name for multi-session support.
+    pub topic: Option<String>,
+    /// Short summary of the session content.
+    pub summary: Option<String>,
     pub messages: Vec<Message>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -44,9 +54,12 @@ pub struct Session {
 impl Session {
     fn new(key: SessionKey) -> Self {
         let now = Utc::now();
+        let topic = key.topic().map(|t| t.to_string());
         Self {
             key,
             parent_key: None,
+            topic,
+            summary: None,
             messages: vec![],
             created_at: now,
             updated_at: now,
@@ -248,6 +261,8 @@ impl SessionManager {
         Some(Session {
             key: key.clone(),
             parent_key: meta.parent_key.map(SessionKey),
+            topic: meta.topic,
+            summary: meta.summary,
             messages,
             created_at: meta.created_at,
             updated_at: meta.updated_at,
@@ -260,10 +275,10 @@ impl SessionManager {
         let path = self.session_path(key);
 
         // Prepare metadata outside spawn_blocking (needs cache access)
-        let parent_key = self
-            .cache
-            .peek(&key.0)
-            .and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
+        let session_peek = self.cache.peek(&key.0);
+        let parent_key = session_peek.and_then(|s| s.parent_key.as_ref().map(|k| k.0.clone()));
+        let topic = session_peek.and_then(|s| s.topic.clone());
+        let summary = session_peek.and_then(|s| s.summary.clone());
         let key_str = key.0.clone();
         let msg_json = serde_json::to_string(message)?;
 
@@ -282,6 +297,8 @@ impl SessionManager {
                     schema_version: CURRENT_SESSION_SCHEMA,
                     session_key: key_str,
                     parent_key,
+                    topic,
+                    summary,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 };
@@ -311,6 +328,8 @@ impl SessionManager {
             schema_version: CURRENT_SESSION_SCHEMA,
             session_key: key.0.clone(),
             parent_key: session.parent_key.as_ref().map(|k| k.0.clone()),
+            topic: session.topic.clone(),
+            summary: session.summary.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
         };
@@ -362,6 +381,8 @@ impl SessionManager {
         let session = Session {
             key: new_key.clone(),
             parent_key: Some(parent_key.clone()),
+            topic: None,
+            summary: None,
             messages,
             created_at: now,
             updated_at: now,
@@ -397,6 +418,215 @@ impl SessionManager {
     pub fn capacity(&self) -> usize {
         self.cache.cap().get()
     }
+}
+
+/// Entry describing a session for listing purposes.
+#[derive(Debug, Clone)]
+pub struct SessionListEntry {
+    /// Topic name (None = default session).
+    pub topic: Option<String>,
+    /// Number of messages in the session.
+    pub message_count: usize,
+    /// Last updated timestamp.
+    pub updated_at: DateTime<Utc>,
+    /// Short summary of the session.
+    pub summary: Option<String>,
+}
+
+impl SessionManager {
+    /// List all sessions belonging to a specific chat (base key without topic).
+    ///
+    /// Scans the sessions directory for files matching the base key or base key + topic suffix.
+    /// Returns entries sorted by updated_at descending (most recent first).
+    pub fn list_sessions_for_chat(&self, base_key: &str) -> Vec<SessionListEntry> {
+        let mut entries = Vec::new();
+        let Ok(dir) = std::fs::read_dir(&self.sessions_dir) else {
+            return entries;
+        };
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Skip oversized files
+            if path
+                .metadata()
+                .map(|m| m.len() > MAX_SESSION_FILE_SIZE)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let decoded = Self::decode_session_name(name);
+
+            // Check if this session belongs to the given base key
+            let session_base = decoded.split('#').next().unwrap_or(&decoded);
+            if session_base != base_key {
+                continue;
+            }
+
+            // Read first line (metadata) and count remaining lines
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut lines = content.lines();
+            let Some(meta_line) = lines.next() else {
+                continue;
+            };
+            let meta: SessionMeta = match serde_json::from_str(meta_line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let message_count = lines.filter(|l| !l.trim().is_empty()).count();
+            let topic = decoded.split_once('#').map(|(_, t)| t.to_string());
+
+            entries.push(SessionListEntry {
+                topic,
+                message_count,
+                updated_at: meta.updated_at,
+                summary: meta.summary,
+            });
+        }
+
+        entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        entries
+    }
+
+    /// Update the summary field for a session (rewrites metadata line).
+    pub async fn update_summary(&mut self, key: &SessionKey, summary: String) -> Result<()> {
+        let session = self.get_or_create(key);
+        session.summary = Some(summary);
+        self.rewrite(key).await
+    }
+}
+
+/// Tracks which topic is active per chat, enabling multi-session switching.
+///
+/// Persisted as JSON in `data_dir/active_sessions.json`.
+pub struct ActiveSessionStore {
+    path: PathBuf,
+    /// base_key → active topic (empty string = default session)
+    active: std::collections::HashMap<String, String>,
+    /// base_key → previous topic (for /back command)
+    previous: std::collections::HashMap<String, String>,
+}
+
+impl ActiveSessionStore {
+    /// Open or create the active session store.
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join("active_sessions.json");
+        let (active, previous) = if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            let stored: StoredActiveSessions =
+                serde_json::from_str(&data).unwrap_or_default();
+            (stored.active, stored.previous)
+        } else {
+            (Default::default(), Default::default())
+        };
+        Ok(Self {
+            path,
+            active,
+            previous,
+        })
+    }
+
+    /// Resolve the full SessionKey for a base key, applying the active topic.
+    pub fn resolve_session_key(&self, base_key: &str) -> SessionKey {
+        let topic = self.active.get(base_key).map(|s| s.as_str()).unwrap_or("");
+        if topic.is_empty() {
+            SessionKey(base_key.to_string())
+        } else {
+            SessionKey(format!("{base_key}#{topic}"))
+        }
+    }
+
+    /// Get the active topic for a base key (empty string = default).
+    pub fn get_active_topic(&self, base_key: &str) -> &str {
+        self.active.get(base_key).map(|s| s.as_str()).unwrap_or("")
+    }
+
+    /// Switch to a new topic. Records the previous topic for /back.
+    pub fn switch_to(&mut self, base_key: &str, topic: &str) -> Result<()> {
+        let prev = self
+            .active
+            .get(base_key)
+            .cloned()
+            .unwrap_or_default();
+        self.previous.insert(base_key.to_string(), prev);
+        self.active
+            .insert(base_key.to_string(), topic.to_string());
+        self.save()
+    }
+
+    /// Switch back to the previous topic. Returns the topic switched to.
+    pub fn go_back(&mut self, base_key: &str) -> Result<Option<String>> {
+        let prev = self.previous.remove(base_key);
+        if let Some(ref topic) = prev {
+            let current = self.active.get(base_key).cloned().unwrap_or_default();
+            self.previous.insert(base_key.to_string(), current);
+            self.active
+                .insert(base_key.to_string(), topic.clone());
+            self.save()?;
+        }
+        Ok(prev)
+    }
+
+    /// Remove tracking for a topic (e.g. when deleted).
+    /// If the deleted topic was active, switches to default.
+    pub fn remove_topic(&mut self, base_key: &str, topic: &str) -> Result<()> {
+        if self.get_active_topic(base_key) == topic {
+            self.active.insert(base_key.to_string(), String::new());
+        }
+        if self.previous.get(base_key).map(|s| s.as_str()) == Some(topic) {
+            self.previous.remove(base_key);
+        }
+        self.save()
+    }
+
+    fn save(&self) -> Result<()> {
+        let stored = StoredActiveSessions {
+            active: self.active.clone(),
+            previous: self.previous.clone(),
+        };
+        let json = serde_json::to_string_pretty(&stored)?;
+
+        // Atomic write-then-rename
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredActiveSessions {
+    #[serde(default)]
+    active: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    previous: std::collections::HashMap<String, String>,
+}
+
+/// Validate a topic name. Returns Err with a message if invalid.
+pub fn validate_topic_name(topic: &str) -> std::result::Result<(), &'static str> {
+    if topic.is_empty() {
+        return Err("topic name cannot be empty");
+    }
+    if topic.len() > 50 {
+        return Err("topic name too long (max 50 characters)");
+    }
+    if topic.contains('#') || topic.contains(':') || topic.contains('/') {
+        return Err("topic name cannot contain #, :, or /");
+    }
+    if topic.chars().any(|c| c.is_control()) {
+        return Err("topic name cannot contain control characters");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -809,5 +1039,133 @@ mod tests {
         let name = path.file_stem().unwrap().to_str().unwrap();
         // Short keys should not have hash suffix (no underscore + hex)
         assert!(!name.contains('_') || name.len() < 200);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_for_chat() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Create default session + two topic sessions
+        let base = SessionKey::new("telegram", "12345");
+        let research = SessionKey::with_topic("telegram", "12345", "research");
+        let code = SessionKey::with_topic("telegram", "12345", "code");
+        // Unrelated session
+        let other = SessionKey::new("telegram", "99999");
+
+        mgr.add_message(&base, make_message(MessageRole::User, "hello default"))
+            .await
+            .unwrap();
+        mgr.add_message(&research, make_message(MessageRole::User, "hello research"))
+            .await
+            .unwrap();
+        mgr.add_message(&code, make_message(MessageRole::User, "hello code"))
+            .await
+            .unwrap();
+        mgr.add_message(&other, make_message(MessageRole::User, "unrelated"))
+            .await
+            .unwrap();
+
+        let entries = mgr.list_sessions_for_chat("telegram:12345");
+        assert_eq!(entries.len(), 3);
+
+        let topics: Vec<Option<String>> = entries.iter().map(|e| e.topic.clone()).collect();
+        assert!(topics.contains(&None)); // default
+        assert!(topics.contains(&Some("research".into())));
+        assert!(topics.contains(&Some("code".into())));
+
+        // Each has 1 message
+        for e in &entries {
+            assert_eq!(e.message_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_topic_persists() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::with_topic("telegram", "12345", "research");
+
+        {
+            let mut mgr = SessionManager::open(tmp.path()).unwrap();
+            mgr.add_message(&key, make_message(MessageRole::User, "topic data"))
+                .await
+                .unwrap();
+        }
+
+        // Reload and verify topic
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let session = mgr.get_or_create(&key);
+        assert_eq!(session.topic.as_deref(), Some("research"));
+    }
+
+    #[tokio::test]
+    async fn test_update_summary() {
+        let tmp = TempDir::new().unwrap();
+        let key = SessionKey::new("telegram", "12345");
+
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        mgr.add_message(&key, make_message(MessageRole::User, "hello"))
+            .await
+            .unwrap();
+        mgr.update_summary(&key, "A test session".into())
+            .await
+            .unwrap();
+
+        // Reload and verify summary
+        let mut mgr2 = SessionManager::open(tmp.path()).unwrap();
+        let session = mgr2.get_or_create(&key);
+        assert_eq!(session.summary.as_deref(), Some("A test session"));
+    }
+
+    #[test]
+    fn test_active_session_store() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
+
+        // Default: no topic
+        assert_eq!(store.get_active_topic("telegram:12345"), "");
+        let key = store.resolve_session_key("telegram:12345");
+        assert_eq!(key.0, "telegram:12345");
+
+        // Switch to "research"
+        store.switch_to("telegram:12345", "research").unwrap();
+        assert_eq!(store.get_active_topic("telegram:12345"), "research");
+        let key = store.resolve_session_key("telegram:12345");
+        assert_eq!(key.0, "telegram:12345#research");
+
+        // Switch to "code"
+        store.switch_to("telegram:12345", "code").unwrap();
+        assert_eq!(store.get_active_topic("telegram:12345"), "code");
+
+        // Go back -> should return "research"
+        let prev = store.go_back("telegram:12345").unwrap();
+        assert_eq!(prev, Some("research".into()));
+        assert_eq!(store.get_active_topic("telegram:12345"), "research");
+    }
+
+    #[test]
+    fn test_active_session_store_persistence() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mut store = ActiveSessionStore::open(tmp.path()).unwrap();
+            store.switch_to("telegram:12345", "research").unwrap();
+        }
+
+        // Reload
+        let store = ActiveSessionStore::open(tmp.path()).unwrap();
+        assert_eq!(store.get_active_topic("telegram:12345"), "research");
+    }
+
+    #[test]
+    fn test_validate_topic_name() {
+        assert!(validate_topic_name("research").is_ok());
+        assert!(validate_topic_name("my-code").is_ok());
+        assert!(validate_topic_name("work_notes").is_ok());
+        assert!(validate_topic_name("").is_err());
+        assert!(validate_topic_name("a#b").is_err());
+        assert!(validate_topic_name("a:b").is_err());
+        assert!(validate_topic_name("a/b").is_err());
+        assert!(validate_topic_name(&"x".repeat(51)).is_err());
     }
 }

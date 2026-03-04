@@ -13,7 +13,8 @@ use crew_agent::{
     SpawnTool, TokenTracker, /* TakePhotoTool, */ ToolRegistry,
 };
 use crew_bus::{
-    ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager, create_bus,
+    ActiveSessionStore, ChannelManager, CliChannel, CronService, HeartbeatService, SessionManager,
+    create_bus, validate_topic_name,
 };
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
 use crew_llm::{
@@ -633,6 +634,12 @@ impl GatewayCommand {
                 .with_max_sessions(gw_config.max_sessions),
         ));
 
+        // Active session store for multi-session support
+        let active_sessions = Arc::new(Mutex::new(
+            ActiveSessionStore::open(&data_dir)
+                .wrap_err("failed to open active session store")?,
+        ));
+
         // Create channel manager and register channels
         let mut channel_mgr = ChannelManager::new();
         for entry in &gw_config.channels {
@@ -1049,16 +1056,233 @@ impl GatewayCommand {
                 (inbound.channel.clone(), inbound.chat_id.clone())
             };
 
-            let session_key = inbound.session_key();
+            // Resolve session key with active topic
+            let base_session_key = inbound.session_key();
+            let base_key_str = base_session_key.0.clone();
+            let session_key = {
+                let store = active_sessions.lock().await;
+                store.resolve_session_key(&base_key_str)
+            };
 
-            // Handle /new command inline — clear current session history
-            if inbound.content.trim() == "/new" {
-                match session_mgr.lock().await.clear(&session_key).await {
-                    Ok(()) => {
+            let cmd = inbound.content.trim();
+
+            // Handle /new command — clear current session or create named session
+            if cmd == "/new" || cmd.starts_with("/new ") {
+                let name = cmd.strip_prefix("/new").unwrap_or("").trim();
+                if name.is_empty() {
+                    // Clear current session (existing behavior)
+                    match session_mgr.lock().await.clear(&session_key).await {
+                        Ok(()) => {
+                            let msg = OutboundMessage {
+                                channel: reply_channel.clone(),
+                                chat_id: reply_chat_id.clone(),
+                                content: "Session cleared.".to_string(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            };
+                            let _ = agent_handle.send_outbound(msg).await;
+                        }
+                        Err(e) => {
+                            warn!("session clear failed: {e}");
+                        }
+                    }
+                } else {
+                    // Create/switch to named session
+                    if let Err(reason) = validate_topic_name(name) {
                         let msg = OutboundMessage {
                             channel: reply_channel.clone(),
                             chat_id: reply_chat_id.clone(),
-                            content: "Session cleared.".to_string(),
+                            content: format!("Invalid session name: {reason}"),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        };
+                        let _ = agent_handle.send_outbound(msg).await;
+                    } else {
+                        active_sessions
+                            .lock()
+                            .await
+                            .switch_to(&base_key_str, name)
+                            .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
+                        let msg = OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: format!("Switched to session: {name}"),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        };
+                        let _ = agent_handle.send_outbound(msg).await;
+                    }
+                }
+                continue;
+            }
+
+            // Handle /s command — switch to a named session
+            if cmd == "/s" || cmd.starts_with("/s ") {
+                let name = cmd.strip_prefix("/s").unwrap_or("").trim();
+                if name.is_empty() {
+                    // Switch to default session
+                    active_sessions
+                        .lock()
+                        .await
+                        .switch_to(&base_key_str, "")
+                        .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: "Switched to default session.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                } else if let Err(reason) = validate_topic_name(name) {
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: format!("Invalid session name: {reason}"),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                } else {
+                    active_sessions
+                        .lock()
+                        .await
+                        .switch_to(&base_key_str, name)
+                        .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
+
+                    // Show last 2 messages as context preview
+                    let new_key = SessionKey::with_topic(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        name,
+                    );
+                    let preview = {
+                        let mut mgr = session_mgr.lock().await;
+                        let session = mgr.get_or_create(&new_key);
+                        let history = session.get_history(2);
+                        if history.is_empty() {
+                            String::new()
+                        } else {
+                            let mut lines = String::from("\n---\n");
+                            for m in history {
+                                let role = m.role.as_str();
+                                let text: String = m.content.chars().take(100).collect();
+                                lines.push_str(&format!("[{role}] {text}\n"));
+                            }
+                            lines
+                        }
+                    };
+
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: format!("Switched to session: {name}{preview}"),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                }
+                continue;
+            }
+
+            // Handle /sessions command — list all sessions for this chat
+            if cmd == "/sessions" {
+                let entries = session_mgr
+                    .lock()
+                    .await
+                    .list_sessions_for_chat(&base_key_str);
+                let active_topic = active_sessions
+                    .lock()
+                    .await
+                    .get_active_topic(&base_key_str)
+                    .to_string();
+
+                if entries.is_empty() {
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: "No sessions found.".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                } else {
+                    let mut lines = format!("{} session(s):\n\n", entries.len());
+                    for entry in &entries {
+                        let name = entry
+                            .topic
+                            .as_deref()
+                            .unwrap_or("(default)");
+                        let is_active = match &entry.topic {
+                            Some(t) => t == &active_topic,
+                            None => active_topic.is_empty(),
+                        };
+                        let marker = if is_active { " *" } else { "" };
+                        let summary = entry
+                            .summary
+                            .as_deref()
+                            .unwrap_or("");
+                        let time = entry
+                            .updated_at
+                            .format("%m/%d %H:%M")
+                            .to_string();
+                        lines.push_str(&format!(
+                            "{name}{marker}  ({} msgs, {time})",
+                            entry.message_count,
+                        ));
+                        if !summary.is_empty() {
+                            lines.push_str(&format!(" - {summary}"));
+                        }
+                        lines.push('\n');
+                    }
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: lines,
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                }
+                continue;
+            }
+
+            // Handle /back command — switch to previous session
+            if cmd == "/back" {
+                let result = active_sessions
+                    .lock()
+                    .await
+                    .go_back(&base_key_str);
+                match result {
+                    Ok(Some(topic)) => {
+                        let label = if topic.is_empty() {
+                            "(default)".to_string()
+                        } else {
+                            topic
+                        };
+                        let msg = OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: format!("Switched back to session: {label}"),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        };
+                        let _ = agent_handle.send_outbound(msg).await;
+                    }
+                    Ok(None) => {
+                        let msg = OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: "No previous session to switch to.".to_string(),
                             reply_to: None,
                             media: vec![],
                             metadata: serde_json::json!({}),
@@ -1066,7 +1290,51 @@ impl GatewayCommand {
                         let _ = agent_handle.send_outbound(msg).await;
                     }
                     Err(e) => {
-                        warn!("session clear failed: {e}");
+                        warn!("go_back failed: {e}");
+                    }
+                }
+                continue;
+            }
+
+            // Handle /delete command — delete a named session
+            if cmd.starts_with("/delete ") {
+                let name = cmd.strip_prefix("/delete").unwrap_or("").trim();
+                if name.is_empty() {
+                    let msg = OutboundMessage {
+                        channel: reply_channel.clone(),
+                        chat_id: reply_chat_id.clone(),
+                        content: "Usage: /delete <session-name>".to_string(),
+                        reply_to: None,
+                        media: vec![],
+                        metadata: serde_json::json!({}),
+                    };
+                    let _ = agent_handle.send_outbound(msg).await;
+                } else {
+                    let del_key = SessionKey::with_topic(
+                        &inbound.channel,
+                        &inbound.chat_id,
+                        name,
+                    );
+                    match session_mgr.lock().await.clear(&del_key).await {
+                        Ok(()) => {
+                            active_sessions
+                                .lock()
+                                .await
+                                .remove_topic(&base_key_str, name)
+                                .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
+                            let msg = OutboundMessage {
+                                channel: reply_channel.clone(),
+                                chat_id: reply_chat_id.clone(),
+                                content: format!("Deleted session: {name}"),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({}),
+                            };
+                            let _ = agent_handle.send_outbound(msg).await;
+                        }
+                        Err(e) => {
+                            warn!("delete session failed: {e}");
+                        }
                     }
                 }
                 continue;
@@ -1357,6 +1625,16 @@ async fn process_session_message(
                 };
                 if let Err(e) = mgr.add_message(session_key, user_msg).await {
                     warn!(session = %session_key, error = %e, "failed to persist user message");
+                }
+
+                // Auto-generate summary from first user message
+                {
+                    let session = mgr.get_or_create(session_key);
+                    if session.summary.is_none() && !inbound.content.trim().is_empty() {
+                        let summary: String =
+                            inbound.content.chars().take(100).collect();
+                        session.summary = Some(summary);
+                    }
                 }
 
                 // Only save non-empty assistant messages to session history
@@ -1674,8 +1952,232 @@ async fn handle_account_command(
             }
         }
 
+        // /account update <sub-id> key=value key=value ...
+        // Keys: telegram-token, telegram-senders, whatsapp (true/false),
+        //       feishu-app-id, feishu-app-secret, system-prompt, enabled (true/false)
+        "update" => {
+            let rest = parts.get(1).copied().unwrap_or("").trim();
+            let mut tokens = rest.splitn(2, ' ');
+            let sub_id = tokens.next().unwrap_or("").trim();
+            let kv_str = tokens.next().unwrap_or("").trim();
+            if sub_id.is_empty() || kv_str.is_empty() {
+                return "Usage: /account update <sub-id> key=value [key=value ...]\n\
+                    Keys: telegram-token, telegram-senders, whatsapp, \
+                    feishu-app-id, feishu-app-secret, system-prompt, enabled\n\
+                    Example: /account update my--bot telegram-token=123:ABC enabled=true"
+                    .to_string();
+            }
+            // Verify it's a sub-account of this parent
+            let mut profile = match store.get(sub_id) {
+                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+                Ok(Some(_)) => {
+                    return format!("'{sub_id}' is not a sub-account of this profile.")
+                }
+                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
+                Err(e) => return format!("Error: {e}"),
+            };
+
+            let mut changed = Vec::new();
+
+            // Parse key=value pairs (simple split on '=')
+            for pair in kv_str.split_whitespace() {
+                let mut kv = pair.splitn(2, '=');
+                let key = kv.next().unwrap_or("");
+                let val = kv.next().unwrap_or("");
+                match key {
+                    "telegram-token" => {
+                        let env_name = format!(
+                            "TELEGRAM_BOT_TOKEN_{}",
+                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        );
+                        profile
+                            .config
+                            .channels
+                            .retain(|ch| !matches!(ch, crate::profiles::ChannelCredentials::Telegram { .. }));
+                        profile
+                            .config
+                            .channels
+                            .push(crate::profiles::ChannelCredentials::Telegram {
+                                token_env: env_name.clone(),
+                                allowed_senders: String::new(),
+                            });
+                        profile.config.env_vars.insert(env_name, val.to_string());
+                        changed.push("telegram channel");
+                    }
+                    "telegram-senders" => {
+                        let mut found = false;
+                        for ch in &mut profile.config.channels {
+                            if let crate::profiles::ChannelCredentials::Telegram {
+                                allowed_senders, ..
+                            } = ch
+                            {
+                                *allowed_senders = val.to_string();
+                                found = true;
+                            }
+                        }
+                        if found {
+                            changed.push("telegram senders");
+                        } else {
+                            return "No Telegram channel to update senders on. Set telegram-token first.".to_string();
+                        }
+                    }
+                    "whatsapp" => {
+                        profile
+                            .config
+                            .channels
+                            .retain(|ch| !matches!(ch, crate::profiles::ChannelCredentials::WhatsApp { .. }));
+                        if val == "true" || val == "1" {
+                            profile
+                                .config
+                                .channels
+                                .push(crate::profiles::ChannelCredentials::WhatsApp {
+                                    bridge_url: String::new(),
+                                });
+                            changed.push("whatsapp enabled");
+                        } else {
+                            changed.push("whatsapp disabled");
+                        }
+                    }
+                    "feishu-app-id" | "feishu-app-secret" => {
+                        // Collect both if provided; create/replace Feishu channel
+                        let id_env = format!(
+                            "LARK_APP_ID_{}",
+                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        );
+                        let secret_env = format!(
+                            "LARK_APP_SECRET_{}",
+                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        );
+                        if key == "feishu-app-id" {
+                            profile.config.env_vars.insert(id_env.clone(), val.to_string());
+                        } else {
+                            profile.config.env_vars.insert(secret_env.clone(), val.to_string());
+                        }
+                        // Ensure Feishu channel exists
+                        if !profile.config.channels.iter().any(|ch| {
+                            matches!(ch, crate::profiles::ChannelCredentials::Feishu { .. })
+                        }) {
+                            profile.config.channels.push(
+                                crate::profiles::ChannelCredentials::Feishu {
+                                    app_id_env: id_env,
+                                    app_secret_env: secret_env,
+                                    mode: "webhook".to_string(),
+                                    region: String::new(),
+                                    webhook_port: None,
+                                    verification_token_env: String::new(),
+                                    encrypt_key_env: String::new(),
+                                },
+                            );
+                        }
+                        changed.push("feishu channel");
+                    }
+                    "system-prompt" => {
+                        profile.config.gateway.system_prompt = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                        changed.push("system prompt");
+                    }
+                    "enabled" => {
+                        let en = val == "true" || val == "1";
+                        profile.enabled = en;
+                        changed.push(if en { "enabled" } else { "disabled" });
+                    }
+                    _ => {
+                        return format!("Unknown key: {key}\nValid keys: telegram-token, telegram-senders, whatsapp, feishu-app-id, feishu-app-secret, system-prompt, enabled");
+                    }
+                }
+            }
+
+            if changed.is_empty() {
+                return "Nothing to update.".to_string();
+            }
+
+            profile.updated_at = chrono::Utc::now();
+            match store.save(&profile) {
+                Ok(()) => {
+                    let mut msg = format!("Updated sub-account: {sub_id}");
+                    for c in &changed {
+                        msg.push_str(&format!("\n  - {c}"));
+                    }
+                    msg.push_str("\nGateway will auto-restart to pick up changes.");
+                    msg
+                }
+                Err(e) => format!("Error saving: {e}"),
+            }
+        }
+
+        // /account start <sub-id> — enable and trigger gateway start
+        "start" | "enable" => {
+            let sub_id = parts.get(1).copied().unwrap_or("").trim();
+            if sub_id.is_empty() {
+                return "Usage: /account start <sub-id>".to_string();
+            }
+            let mut profile = match store.get(sub_id) {
+                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+                Ok(Some(_)) => {
+                    return format!("'{sub_id}' is not a sub-account of this profile.")
+                }
+                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
+                Err(e) => return format!("Error: {e}"),
+            };
+            profile.enabled = true;
+            profile.updated_at = chrono::Utc::now();
+            match store.save(&profile) {
+                Ok(()) => format!("Enabled sub-account: {sub_id}\nGateway will start within ~5 seconds."),
+                Err(e) => format!("Error saving: {e}"),
+            }
+        }
+
+        // /account stop <sub-id> — disable and trigger gateway stop
+        "stop" | "disable" => {
+            let sub_id = parts.get(1).copied().unwrap_or("").trim();
+            if sub_id.is_empty() {
+                return "Usage: /account stop <sub-id>".to_string();
+            }
+            let mut profile = match store.get(sub_id) {
+                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+                Ok(Some(_)) => {
+                    return format!("'{sub_id}' is not a sub-account of this profile.")
+                }
+                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
+                Err(e) => return format!("Error: {e}"),
+            };
+            profile.enabled = false;
+            profile.updated_at = chrono::Utc::now();
+            match store.save(&profile) {
+                Ok(()) => format!("Disabled sub-account: {sub_id}\nGateway will stop within ~5 seconds."),
+                Err(e) => format!("Error saving: {e}"),
+            }
+        }
+
+        // /account restart <sub-id> — touch profile to trigger gateway restart
+        "restart" => {
+            let sub_id = parts.get(1).copied().unwrap_or("").trim();
+            if sub_id.is_empty() {
+                return "Usage: /account restart <sub-id>".to_string();
+            }
+            let mut profile = match store.get(sub_id) {
+                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
+                Ok(Some(_)) => {
+                    return format!("'{sub_id}' is not a sub-account of this profile.")
+                }
+                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
+                Err(e) => return format!("Error: {e}"),
+            };
+            if !profile.enabled {
+                return format!("Sub-account '{sub_id}' is disabled. Use /account start {sub_id} first.");
+            }
+            profile.updated_at = chrono::Utc::now();
+            match store.save(&profile) {
+                Ok(()) => format!("Restarting sub-account: {sub_id}\nGateway will restart within ~5 seconds."),
+                Err(e) => format!("Error saving: {e}"),
+            }
+        }
+
         other => format!(
-            "Unknown sub-command: {other}\nUsage: /account [list|create|delete]\n  /account list — list sub-accounts\n  /account create <name> — create sub-account\n  /account delete <sub-id> — delete sub-account"
+            "Unknown sub-command: {other}\nUsage: /account [list|create|update|delete|start|stop|restart]\n  /account list — list sub-accounts\n  /account create <name> — create sub-account\n  /account update <sub-id> key=value ... — update config\n  /account start <sub-id> — enable & start gateway\n  /account stop <sub-id> — disable & stop gateway\n  /account restart <sub-id> — restart gateway\n  /account delete <sub-id> — delete sub-account"
         ),
     }
 }

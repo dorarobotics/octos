@@ -267,9 +267,37 @@ impl ServeCommand {
                             if hash == *old_hash {
                                 continue; // no change
                             }
-                            // File changed — check if gateway is running
                             let status = pm.status(&profile.id).await;
-                            if status.running {
+
+                            // Handle enable/disable transitions
+                            if !old_profile.enabled && profile.enabled && !status.running {
+                                // disabled → enabled: start gateway
+                                tracing::info!(
+                                    profile = %profile.id,
+                                    "profile enabled, starting gateway"
+                                );
+                                if let Err(e) = pm.start(profile).await {
+                                    tracing::warn!(
+                                        profile = %profile.id,
+                                        error = %e,
+                                        "failed to start gateway after enable"
+                                    );
+                                }
+                            } else if old_profile.enabled && !profile.enabled && status.running {
+                                // enabled → disabled: stop gateway
+                                tracing::info!(
+                                    profile = %profile.id,
+                                    "profile disabled, stopping gateway"
+                                );
+                                if let Err(e) = pm.stop(&profile.id).await {
+                                    tracing::warn!(
+                                        profile = %profile.id,
+                                        error = %e,
+                                        "failed to stop gateway after disable"
+                                    );
+                                }
+                            } else if status.running {
+                                // Config changed while running — check if restart needed
                                 match diff_profiles(old_profile, profile) {
                                     ProfileChange::RestartRequired(fields) => {
                                         tracing::info!(
@@ -286,7 +314,6 @@ impl ServeCommand {
                                         }
                                     }
                                     ProfileChange::HotReloadable => {
-                                        // Gateway's own ConfigWatcher handles hot-reload
                                         tracing::debug!(
                                             profile = %profile.id,
                                             "profile changed (hot-reloadable only), gateway watcher will handle"
@@ -294,6 +321,32 @@ impl ServeCommand {
                                     }
                                     ProfileChange::Unchanged => {}
                                 }
+                            } else if profile.enabled && !status.running {
+                                // Profile changed & enabled but not running — start it
+                                tracing::info!(
+                                    profile = %profile.id,
+                                    "profile changed and enabled but not running, starting gateway"
+                                );
+                                if let Err(e) = pm.start(profile).await {
+                                    tracing::warn!(
+                                        profile = %profile.id,
+                                        error = %e,
+                                        "failed to start gateway"
+                                    );
+                                }
+                            }
+                        } else if profile.enabled {
+                            // New profile detected — auto-start its gateway
+                            tracing::info!(
+                                profile = %profile.id,
+                                "new profile detected, starting gateway"
+                            );
+                            if let Err(e) = pm.start(profile).await {
+                                tracing::warn!(
+                                    profile = %profile.id,
+                                    error = %e,
+                                    "failed to auto-start gateway for new profile"
+                                );
                             }
                         }
                         known.insert(profile.id.clone(), (hash, profile.clone()));

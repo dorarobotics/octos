@@ -34,7 +34,9 @@ pub use cli_channel::CliChannel;
 pub use cron_service::CronService;
 pub use cron_types::{CronJob, CronPayload, CronSchedule, CronStore};
 pub use heartbeat::HeartbeatService;
-pub use session::{Session, SessionManager};
+pub use session::{
+    ActiveSessionStore, Session, SessionListEntry, SessionManager, validate_topic_name,
+};
 
 #[cfg(feature = "discord")]
 pub use discord_channel::DiscordChannel;
