@@ -147,10 +147,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/system/metrics", get(admin::system_metrics))
         // Monitor control
         .route("/api/admin/monitor/status", get(admin::monitor_status))
-        .route(
-            "/api/admin/monitor/watchdog",
-            post(admin::toggle_watchdog),
-        )
+        .route("/api/admin/monitor/watchdog", post(admin::toggle_watchdog))
         .route("/api/admin/monitor/alerts", post(admin::toggle_alerts))
         // Platform skills management
         .route(
@@ -198,7 +195,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/admin/platform-skills/ominix-api/models/remove",
             post(admin::platform_models_remove),
-        );
+        )
+        // System update
+        .route("/api/admin/system/version", get(admin::system_version))
+        .route("/api/admin/system/update", post(admin::system_update));
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

@@ -166,8 +166,7 @@ impl Tool for ProfileStatusTool {
             .await
         {
             Ok(profile) => Ok(ToolResult {
-                output: serde_json::to_string_pretty(&profile)
-                    .unwrap_or_else(|_| "{}".into()),
+                output: serde_json::to_string_pretty(&profile).unwrap_or_else(|_| "{}".into()),
                 success: true,
                 ..Default::default()
             }),
@@ -406,10 +405,7 @@ impl Tool for EnableProfileTool {
         let body = serde_json::json!({ "enabled": input.enabled });
         match self
             .ctx
-            .put(
-                &format!("/api/admin/profiles/{}", input.profile_id),
-                &body,
-            )
+            .put(&format!("/api/admin/profiles/{}", input.profile_id), &body)
             .await
         {
             Ok(_) => {
@@ -567,7 +563,10 @@ impl Tool for UpdateProfileTool {
             config.insert("email".into(), email.clone());
         }
         if let Some(ref env_vars) = input.env_vars {
-            config.insert("env_vars".into(), serde_json::Value::Object(env_vars.clone()));
+            config.insert(
+                "env_vars".into(),
+                serde_json::Value::Object(env_vars.clone()),
+            );
         }
         if !gateway.is_empty() {
             config.insert("gateway".into(), serde_json::Value::Object(gateway));
@@ -578,7 +577,9 @@ impl Tool for UpdateProfileTool {
 
         if body.is_empty() {
             return Ok(ToolResult {
-                output: "No fields to update. Specify at least one field (provider, model, name, etc.).".into(),
+                output:
+                    "No fields to update. Specify at least one field (provider, model, name, etc.)."
+                        .into(),
                 success: false,
                 ..Default::default()
             });

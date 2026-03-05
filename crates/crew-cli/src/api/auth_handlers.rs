@@ -282,15 +282,18 @@ pub async fn update_my_profile(
 ) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
     let req: super::admin::UpdateProfileRequest = serde_json::from_str(&body).map_err(|e| {
         tracing::warn!(error = %e, body = %body, "failed to parse my profile update request");
-        (StatusCode::BAD_REQUEST, format!("Invalid request body: {e}"))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid request body: {e}"),
+        )
     })?;
-    let ps = state
-        .profile_store
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "admin not configured".into()))?;
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
 
-    let mut profile = resolve_my_profile(&identity, ps)
-        .map_err(|s| (s, "profile not found".into()))?;
+    let mut profile =
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
 
     // Apply updates (same logic as admin::update_profile but scoped)
     if let Some(name) = req.name {
@@ -304,11 +307,10 @@ pub async fn update_my_profile(
     }
     profile.updated_at = chrono::Utc::now();
 
-    ps.save_with_merge(&mut profile)
-        .map_err(|e| {
-            tracing::error!(profile = %profile.id, error = %e, "failed to save user profile");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    ps.save_with_merge(&mut profile).map_err(|e| {
+        tracing::error!(profile = %profile.id, error = %e, "failed to save user profile");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     tracing::info!(profile = %profile.id, "user profile updated");
     let status = if let Some(ref pm) = state.process_manager {

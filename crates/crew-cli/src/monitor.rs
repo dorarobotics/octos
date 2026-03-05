@@ -311,10 +311,7 @@ impl TelegramAlertSender {
 impl AlertSender for TelegramAlertSender {
     async fn send_alert(&self, message: &str) {
         for chat_id in &self.chat_ids {
-            let url = format!(
-                "https://api.telegram.org/bot{}/sendMessage",
-                self.token
-            );
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
             let body = serde_json::json!({
                 "chat_id": chat_id,
                 "text": message,

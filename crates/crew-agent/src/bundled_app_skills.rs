@@ -53,11 +53,9 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
 /// Platform skills: bootstrapped once by `crew serve` (admin bot) at startup,
 /// shared across all gateway profiles. Only installed when their backend is reachable.
 /// Same tuple format as BUNDLED_APP_SKILLS: (dir_name, binary_name, skill_md, manifest_json).
-pub const PLATFORM_SKILLS: &[(&str, &str, &str, &str)] = &[
-    (
-        "asr",
-        "asr",
-        include_str!("../../platform-skills/asr/SKILL.md"),
-        include_str!("../../platform-skills/asr/manifest.json"),
-    ),
-];
+pub const PLATFORM_SKILLS: &[(&str, &str, &str, &str)] = &[(
+    "asr",
+    "asr",
+    include_str!("../../platform-skills/asr/SKILL.md"),
+    include_str!("../../platform-skills/asr/manifest.json"),
+)];

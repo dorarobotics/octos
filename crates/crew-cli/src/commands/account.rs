@@ -220,7 +220,11 @@ impl Executable for AccountCommand {
                 if let Some(ref token) = telegram_token {
                     let env_name = format!(
                         "TELEGRAM_BOT_TOKEN_{}",
-                        profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        profile
+                            .name
+                            .to_uppercase()
+                            .replace(' ', "_")
+                            .replace('-', "_")
                     );
                     // Remove existing Telegram channel if any
                     profile
@@ -228,13 +232,10 @@ impl Executable for AccountCommand {
                         .channels
                         .retain(|ch| !matches!(ch, ChannelCredentials::Telegram { .. }));
                     let senders = telegram_senders.clone().unwrap_or_default();
-                    profile
-                        .config
-                        .channels
-                        .push(ChannelCredentials::Telegram {
-                            token_env: env_name.clone(),
-                            allowed_senders: senders,
-                        });
+                    profile.config.channels.push(ChannelCredentials::Telegram {
+                        token_env: env_name.clone(),
+                        allowed_senders: senders,
+                    });
                     profile.config.env_vars.insert(env_name, token.clone());
                     changed.push("telegram channel");
                 } else if let Some(ref senders) = telegram_senders {
@@ -252,7 +253,9 @@ impl Executable for AccountCommand {
                     if found {
                         changed.push("telegram senders");
                     } else {
-                        bail!("no Telegram channel to update senders on. Add --telegram-token first.");
+                        bail!(
+                            "no Telegram channel to update senders on. Add --telegram-token first."
+                        );
                     }
                 }
 
@@ -263,12 +266,9 @@ impl Executable for AccountCommand {
                         .channels
                         .retain(|ch| !matches!(ch, ChannelCredentials::WhatsApp { .. }));
                     if enable_wa {
-                        profile
-                            .config
-                            .channels
-                            .push(ChannelCredentials::WhatsApp {
-                                bridge_url: String::new(),
-                            });
+                        profile.config.channels.push(ChannelCredentials::WhatsApp {
+                            bridge_url: String::new(),
+                        });
                         changed.push("whatsapp enabled");
                     } else {
                         changed.push("whatsapp disabled");
@@ -282,11 +282,19 @@ impl Executable for AccountCommand {
 
                     let id_env = format!(
                         "LARK_APP_ID_{}",
-                        profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        profile
+                            .name
+                            .to_uppercase()
+                            .replace(' ', "_")
+                            .replace('-', "_")
                     );
                     let secret_env = format!(
                         "LARK_APP_SECRET_{}",
-                        profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                        profile
+                            .name
+                            .to_uppercase()
+                            .replace(' ', "_")
+                            .replace('-', "_")
                     );
 
                     // Remove existing Feishu channel if any
@@ -330,7 +338,9 @@ impl Executable for AccountCommand {
                 }
 
                 if changed.is_empty() {
-                    println!("Nothing to update. Use flags like --telegram-token, --enabled, --system-prompt.");
+                    println!(
+                        "Nothing to update. Use flags like --telegram-token, --enabled, --system-prompt."
+                    );
                     return Ok(());
                 }
 

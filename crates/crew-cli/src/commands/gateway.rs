@@ -117,7 +117,10 @@ impl GatewayCommand {
         };
 
         let mut profile_id: Option<String> = None;
-        eprintln!("[gateway] loading config (profile={:?})", self.profile.as_deref().map(|p| p.display().to_string()));
+        eprintln!(
+            "[gateway] loading config (profile={:?})",
+            self.profile.as_deref().map(|p| p.display().to_string())
+        );
         let mut admin_mode = false;
         let config = if let Some(ref profile_path) = self.profile {
             // Load config from profile JSON (single source of truth)
@@ -190,7 +193,10 @@ impl GatewayCommand {
         // Create LLM provider (reuses the shared create_provider from chat.rs)
         use super::chat::create_provider;
         let base_provider = create_provider(&provider_name, &config, model, base_url)?;
-        eprintln!("[gateway] LLM provider created, model={}", base_provider.model_id());
+        eprintln!(
+            "[gateway] LLM provider created, model={}",
+            base_provider.model_id()
+        );
 
         let model_id = base_provider.model_id().to_string();
         let llm: Arc<dyn LlmProvider> = if self.no_retry {
@@ -241,7 +247,9 @@ impl GatewayCommand {
         // Expose data_dir to skill binaries (e.g. mofa-fm voice storage)
         // SAFETY: called before spawning any threads; single-threaded at this point
         #[allow(unsafe_code)]
-        unsafe { std::env::set_var("CREW_DATA_DIR", &data_dir); }
+        unsafe {
+            std::env::set_var("CREW_DATA_DIR", &data_dir);
+        }
 
         // Open ProfileStore for /account commands (if crew-home is available)
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
@@ -292,9 +300,8 @@ impl GatewayCommand {
         let ominix_client: Option<Arc<OminixClient>> = {
             let api_url = std::env::var("OMINIX_API_URL").ok();
             if let Some(ref url) = api_url {
-                let client = OminixClient::new(url).with_language(
-                    voice_config.as_ref().and_then(|vc| vc.asr_language.clone()),
-                );
+                let client = OminixClient::new(url)
+                    .with_language(voice_config.as_ref().and_then(|vc| vc.asr_language.clone()));
                 if client.health().await {
                     println!("{}: OminiX ({})", "Transcriber".green(), url);
                     Some(Arc::new(client))
@@ -430,8 +437,7 @@ impl GatewayCommand {
             // Register admin API tools (calls REST API on crew serve)
             let serve_url = std::env::var("CREW_SERVE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-            let admin_token =
-                std::env::var("CREW_ADMIN_TOKEN").unwrap_or_default();
+            let admin_token = std::env::var("CREW_ADMIN_TOKEN").unwrap_or_default();
             let admin_ctx = Arc::new(crew_agent::AdminApiContext {
                 http: reqwest::Client::new(),
                 serve_url,
@@ -556,9 +562,10 @@ impl GatewayCommand {
 
             // Spawn tool (background subagents)
             let worker_prompt = super::load_prompt("worker", crew_agent::DEFAULT_WORKER_PROMPT);
-            let mut spawn = SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_inbound_tx)
-                .with_provider_policy(tools.provider_policy().cloned())
-                .with_worker_prompt(worker_prompt);
+            let mut spawn =
+                SpawnTool::new(llm.clone(), memory.clone(), cwd.clone(), spawn_inbound_tx)
+                    .with_provider_policy(tools.provider_policy().cloned())
+                    .with_worker_prompt(worker_prompt);
             if let Some(ref router) = provider_router {
                 spawn = spawn.with_provider_router(router.clone());
             }
@@ -697,8 +704,7 @@ impl GatewayCommand {
 
         // Active session store for multi-session support
         let active_sessions = Arc::new(Mutex::new(
-            ActiveSessionStore::open(&data_dir)
-                .wrap_err("failed to open active session store")?,
+            ActiveSessionStore::open(&data_dir).wrap_err("failed to open active session store")?,
         ));
 
         // Create channel manager and register channels
@@ -1085,7 +1091,10 @@ impl GatewayCommand {
                             Ok(text) => {
                                 // Store transcript in metadata for status indicator display
                                 if let Some(obj) = inbound.metadata.as_object_mut() {
-                                    obj.insert("voice_transcript".into(), serde_json::Value::String(text.clone()));
+                                    obj.insert(
+                                        "voice_transcript".into(),
+                                        serde_json::Value::String(text.clone()),
+                                    );
                                 }
                                 let prefix = format!("[Voice transcription: {text}]\n\n");
                                 inbound.content = format!("{prefix}{}", inbound.content);
@@ -1189,9 +1198,7 @@ impl GatewayCommand {
                     if let Some(ref mid) = callback_message_id {
                         if let Some(ch) = channel_mgr.get_channel(&reply_channel) {
                             if let Err(e) = ch
-                                .edit_message_with_metadata(
-                                    &reply_chat_id, mid, &text, &keyboard,
-                                )
+                                .edit_message_with_metadata(&reply_chat_id, mid, &text, &keyboard)
                                 .await
                             {
                                 warn!("failed to edit session picker: {e}");
@@ -1295,11 +1302,7 @@ impl GatewayCommand {
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
 
                     // Show last 2 messages as context preview
-                    let new_key = SessionKey::with_topic(
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        name,
-                    );
+                    let new_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
                     let preview = {
                         let mut mgr = session_mgr.lock().await;
                         let session = mgr.get_or_create(&new_key);
@@ -1370,10 +1373,7 @@ impl GatewayCommand {
 
             // Handle /back command — switch to previous session
             if cmd == "/back" {
-                let result = active_sessions
-                    .lock()
-                    .await
-                    .go_back(&base_key_str);
+                let result = active_sessions.lock().await.go_back(&base_key_str);
                 match result {
                     Ok(Some(topic)) => {
                         let label = if topic.is_empty() {
@@ -1423,11 +1423,7 @@ impl GatewayCommand {
                     };
                     let _ = agent_handle.send_outbound(msg).await;
                 } else {
-                    let del_key = SessionKey::with_topic(
-                        &inbound.channel,
-                        &inbound.chat_id,
-                        name,
-                    );
+                    let del_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
                     match session_mgr.lock().await.clear(&del_key).await {
                         Ok(()) => {
                             active_sessions
@@ -1500,8 +1496,7 @@ impl GatewayCommand {
             }
 
             // Handle /skills command inline — skill management
-            if inbound.content.trim() == "/skills"
-                || inbound.content.trim().starts_with("/skills ")
+            if inbound.content.trim() == "/skills" || inbound.content.trim().starts_with("/skills ")
             {
                 let args = inbound
                     .content
@@ -1509,13 +1504,9 @@ impl GatewayCommand {
                     .strip_prefix("/skills")
                     .unwrap_or("")
                     .trim();
-                let response = handle_skills_command(
-                    args,
-                    profile_id.as_deref(),
-                    &data_dir,
-                    &profile_store,
-                )
-                .await;
+                let response =
+                    handle_skills_command(args, profile_id.as_deref(), &data_dir, &profile_store)
+                        .await;
                 let msg = OutboundMessage {
                     channel: reply_channel.clone(),
                     chat_id: reply_chat_id.clone(),
@@ -1617,14 +1608,18 @@ impl GatewayCommand {
                         timeout_secs = session_timeout_secs,
                         "session processing timed out"
                     );
-                    if out_tx.send(OutboundMessage {
-                        channel: reply_channel.to_string(),
-                        chat_id: reply_chat_id.to_string(),
-                        content: "Processing timed out. Please try again.".to_string(),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    }).await.is_err() {
+                    if out_tx
+                        .send(OutboundMessage {
+                            channel: reply_channel.to_string(),
+                            chat_id: reply_chat_id.to_string(),
+                            content: "Processing timed out. Please try again.".to_string(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({}),
+                        })
+                        .await
+                        .is_err()
+                    {
                         tracing::error!(session = %session_key, "outbound channel closed (timeout msg)");
                     }
                 }
@@ -1731,7 +1726,8 @@ async fn process_session_message(
             pt.set_status_bridge(bridge);
         }
 
-        let voice_transcript = inbound.metadata
+        let voice_transcript = inbound
+            .metadata
             .get("voice_transcript")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
@@ -1779,8 +1775,7 @@ async fn process_session_message(
                 {
                     let session = mgr.get_or_create(session_key);
                     if session.summary.is_none() && !inbound.content.trim().is_empty() {
-                        let summary: String =
-                            inbound.content.chars().take(100).collect();
+                        let summary: String = inbound.content.chars().take(100).collect();
                         session.summary = Some(summary);
                     }
                 }
@@ -1936,10 +1931,7 @@ fn build_session_keyboard(
 }
 
 /// Build an HTML-formatted text listing sessions.
-fn build_session_text(
-    entries: &[crew_bus::SessionListEntry],
-    active_topic: &str,
-) -> String {
+fn build_session_text(entries: &[crew_bus::SessionListEntry], active_topic: &str) -> String {
     if entries.is_empty() {
         return "No sessions yet. Send a message to start one.".to_string();
     }
@@ -1952,10 +1944,7 @@ fn build_session_text(
         let topic = entry.topic.as_deref().unwrap_or("");
         let display_name = if topic.is_empty() { "default" } else { topic };
         let marker = if topic == active_topic { " ✦" } else { "" };
-        let summary = entry
-            .summary
-            .as_deref()
-            .unwrap_or("(no summary)");
+        let summary = entry.summary.as_deref().unwrap_or("(no summary)");
         let count = entry.message_count;
         // HTML-escape user content to prevent parse errors
         let safe_name = html_escape(display_name);
@@ -2208,9 +2197,7 @@ async fn handle_account_command(
             // Verify it's a sub-account of this parent
             let mut profile = match store.get(sub_id) {
                 Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => {
-                    return format!("'{sub_id}' is not a sub-account of this profile.")
-                }
+                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
                 Ok(None) => return format!("Sub-account '{sub_id}' not found."),
                 Err(e) => return format!("Error: {e}"),
             };
@@ -2226,19 +2213,21 @@ async fn handle_account_command(
                     "telegram-token" => {
                         let env_name = format!(
                             "TELEGRAM_BOT_TOKEN_{}",
-                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                            profile
+                                .name
+                                .to_uppercase()
+                                .replace(' ', "_")
+                                .replace('-', "_")
                         );
-                        profile
-                            .config
-                            .channels
-                            .retain(|ch| !matches!(ch, crate::profiles::ChannelCredentials::Telegram { .. }));
-                        profile
-                            .config
-                            .channels
-                            .push(crate::profiles::ChannelCredentials::Telegram {
+                        profile.config.channels.retain(|ch| {
+                            !matches!(ch, crate::profiles::ChannelCredentials::Telegram { .. })
+                        });
+                        profile.config.channels.push(
+                            crate::profiles::ChannelCredentials::Telegram {
                                 token_env: env_name.clone(),
                                 allowed_senders: String::new(),
-                            });
+                            },
+                        );
                         profile.config.env_vars.insert(env_name, val.to_string());
                         changed.push("telegram channel");
                     }
@@ -2246,7 +2235,8 @@ async fn handle_account_command(
                         let mut found = false;
                         for ch in &mut profile.config.channels {
                             if let crate::profiles::ChannelCredentials::Telegram {
-                                allowed_senders, ..
+                                allowed_senders,
+                                ..
                             } = ch
                             {
                                 *allowed_senders = val.to_string();
@@ -2260,17 +2250,15 @@ async fn handle_account_command(
                         }
                     }
                     "whatsapp" => {
-                        profile
-                            .config
-                            .channels
-                            .retain(|ch| !matches!(ch, crate::profiles::ChannelCredentials::WhatsApp { .. }));
+                        profile.config.channels.retain(|ch| {
+                            !matches!(ch, crate::profiles::ChannelCredentials::WhatsApp { .. })
+                        });
                         if val == "true" || val == "1" {
-                            profile
-                                .config
-                                .channels
-                                .push(crate::profiles::ChannelCredentials::WhatsApp {
+                            profile.config.channels.push(
+                                crate::profiles::ChannelCredentials::WhatsApp {
                                     bridge_url: String::new(),
-                                });
+                                },
+                            );
                             changed.push("whatsapp enabled");
                         } else {
                             changed.push("whatsapp disabled");
@@ -2280,16 +2268,30 @@ async fn handle_account_command(
                         // Collect both if provided; create/replace Feishu channel
                         let id_env = format!(
                             "LARK_APP_ID_{}",
-                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                            profile
+                                .name
+                                .to_uppercase()
+                                .replace(' ', "_")
+                                .replace('-', "_")
                         );
                         let secret_env = format!(
                             "LARK_APP_SECRET_{}",
-                            profile.name.to_uppercase().replace(' ', "_").replace('-', "_")
+                            profile
+                                .name
+                                .to_uppercase()
+                                .replace(' ', "_")
+                                .replace('-', "_")
                         );
                         if key == "feishu-app-id" {
-                            profile.config.env_vars.insert(id_env.clone(), val.to_string());
+                            profile
+                                .config
+                                .env_vars
+                                .insert(id_env.clone(), val.to_string());
                         } else {
-                            profile.config.env_vars.insert(secret_env.clone(), val.to_string());
+                            profile
+                                .config
+                                .env_vars
+                                .insert(secret_env.clone(), val.to_string());
                         }
                         // Ensure Feishu channel exists
                         if !profile.config.channels.iter().any(|ch| {
@@ -2323,7 +2325,9 @@ async fn handle_account_command(
                         changed.push(if en { "enabled" } else { "disabled" });
                     }
                     _ => {
-                        return format!("Unknown key: {key}\nValid keys: telegram-token, telegram-senders, whatsapp, feishu-app-id, feishu-app-secret, system-prompt, enabled");
+                        return format!(
+                            "Unknown key: {key}\nValid keys: telegram-token, telegram-senders, whatsapp, feishu-app-id, feishu-app-secret, system-prompt, enabled"
+                        );
                     }
                 }
             }
@@ -2354,16 +2358,16 @@ async fn handle_account_command(
             }
             let mut profile = match store.get(sub_id) {
                 Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => {
-                    return format!("'{sub_id}' is not a sub-account of this profile.")
-                }
+                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
                 Ok(None) => return format!("Sub-account '{sub_id}' not found."),
                 Err(e) => return format!("Error: {e}"),
             };
             profile.enabled = true;
             profile.updated_at = chrono::Utc::now();
             match store.save(&profile) {
-                Ok(()) => format!("Enabled sub-account: {sub_id}\nGateway will start within ~5 seconds."),
+                Ok(()) => {
+                    format!("Enabled sub-account: {sub_id}\nGateway will start within ~5 seconds.")
+                }
                 Err(e) => format!("Error saving: {e}"),
             }
         }
@@ -2376,16 +2380,16 @@ async fn handle_account_command(
             }
             let mut profile = match store.get(sub_id) {
                 Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => {
-                    return format!("'{sub_id}' is not a sub-account of this profile.")
-                }
+                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
                 Ok(None) => return format!("Sub-account '{sub_id}' not found."),
                 Err(e) => return format!("Error: {e}"),
             };
             profile.enabled = false;
             profile.updated_at = chrono::Utc::now();
             match store.save(&profile) {
-                Ok(()) => format!("Disabled sub-account: {sub_id}\nGateway will stop within ~5 seconds."),
+                Ok(()) => {
+                    format!("Disabled sub-account: {sub_id}\nGateway will stop within ~5 seconds.")
+                }
                 Err(e) => format!("Error saving: {e}"),
             }
         }
@@ -2398,18 +2402,20 @@ async fn handle_account_command(
             }
             let mut profile = match store.get(sub_id) {
                 Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => {
-                    return format!("'{sub_id}' is not a sub-account of this profile.")
-                }
+                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
                 Ok(None) => return format!("Sub-account '{sub_id}' not found."),
                 Err(e) => return format!("Error: {e}"),
             };
             if !profile.enabled {
-                return format!("Sub-account '{sub_id}' is disabled. Use /account start {sub_id} first.");
+                return format!(
+                    "Sub-account '{sub_id}' is disabled. Use /account start {sub_id} first."
+                );
             }
             profile.updated_at = chrono::Utc::now();
             match store.save(&profile) {
-                Ok(()) => format!("Restarting sub-account: {sub_id}\nGateway will restart within ~5 seconds."),
+                Ok(()) => format!(
+                    "Restarting sub-account: {sub_id}\nGateway will restart within ~5 seconds."
+                ),
                 Err(e) => format!("Error saving: {e}"),
             }
         }
@@ -2487,7 +2493,10 @@ async fn handle_skills_command(
                         parts.push(format!("Installed: {}", result.installed.join(", ")));
                     }
                     if !result.deps_installed.is_empty() {
-                        parts.push(format!("Dependencies: {}", result.deps_installed.join(", ")));
+                        parts.push(format!(
+                            "Dependencies: {}",
+                            result.deps_installed.join(", ")
+                        ));
                     }
                     if !result.skipped.is_empty() {
                         parts.push(format!(

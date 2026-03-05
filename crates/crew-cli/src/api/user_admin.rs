@@ -86,11 +86,10 @@ pub async fn create_user(
         last_login_at: None,
     };
 
-    us.save(&user)
-        .map_err(|e| {
-            tracing::error!(email = %user.email, error = %e, "create_user: failed to save user");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    us.save(&user).map_err(|e| {
+        tracing::error!(email = %user.email, error = %e, "create_user: failed to save user");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     tracing::info!(user_id = %user.id, email = %user.email, role = ?user.role, "create_user: user created");
 

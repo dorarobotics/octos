@@ -21,6 +21,8 @@ pub mod process_manager;
 pub mod profiles;
 pub mod status_indicator;
 #[cfg(feature = "api")]
+pub mod updater;
+#[cfg(feature = "api")]
 pub mod user_store;
 
 use commands::{Args, Executable};

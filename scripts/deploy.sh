@@ -10,11 +10,11 @@ SSH="sshpass -p $REMOTE_PW ssh -o PubkeyAuthentication=no $REMOTE"
 REMOTE_BIN="/Users/cloud/.cargo/bin"
 PLIST="io.ominix.crew-serve"
 
-BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager asr)
+BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager asr clock weather)
 
 echo "==> Building release binaries..."
 cargo build --release -p crew-cli --features telegram,whatsapp,feishu,twilio,api
-cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p asr
+cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p asr -p clock -p weather
 
 # Build ominix-api if source is available
 OMINIX_DIR="${OMINIX_DIR:-$HOME/home/OminiX-MLX}"
@@ -106,10 +106,24 @@ PEOF
 fi
 
 echo "==> Ensuring ffmpeg is installed (required for OGG/Opus ASR)..."
-$SSH "/opt/homebrew/bin/brew list ffmpeg &>/dev/null || /opt/homebrew/bin/brew install ffmpeg" || echo "  WARN: could not install ffmpeg"
+$SSH 'command -v ffmpeg &>/dev/null && echo "  ffmpeg: already installed" || {
+    if command -v brew &>/dev/null; then
+        brew install ffmpeg
+    elif command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y ffmpeg
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm ffmpeg
+    elif command -v apk &>/dev/null; then
+        sudo apk add ffmpeg
+    else
+        echo "  WARN: no supported package manager found, install ffmpeg manually"
+    fi
+}' || echo "  WARN: could not install ffmpeg"
 
 echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
-for skill in news deep-search deep-crawl send-email account-manager asr; do
+for skill in news deep-search deep-crawl send-email account-manager asr clock weather; do
     $SSH "rm -rf /Users/cloud/.crew/skills/${skill}" 2>/dev/null || true
 done
 

@@ -74,8 +74,8 @@ impl Tool for ManageSkillsTool {
         })
     }
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let input: ManageSkillsInput = serde_json::from_value(args.clone())
-            .map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+        let input: ManageSkillsInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
 
         match input.action.as_str() {
             "list" => {
@@ -122,10 +122,7 @@ impl Tool for ManageSkillsTool {
                     .name
                     .as_deref()
                     .ok_or_else(|| eyre::eyre!("name is required for remove"))?;
-                let path = format!(
-                    "/api/admin/profiles/{}/skills/{}",
-                    input.profile_id, name
-                );
+                let path = format!("/api/admin/profiles/{}/skills/{}", input.profile_id, name);
                 match self.ctx.delete(&path).await {
                     Ok(resp) => Ok(ToolResult {
                         output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
@@ -140,9 +137,7 @@ impl Tool for ManageSkillsTool {
                 }
             }
             other => Ok(ToolResult {
-                output: format!(
-                    "Unknown action: {other}. Use list, install, or remove."
-                ),
+                output: format!("Unknown action: {other}. Use list, install, or remove."),
                 success: false,
                 ..Default::default()
             }),

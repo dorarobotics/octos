@@ -166,7 +166,10 @@ impl Agent {
     pub fn with_config(mut self, config: AgentConfig) -> Self {
         // Apply worker_prompt override if provided
         if let Some(ref wp) = config.worker_prompt {
-            *self.system_prompt.write().unwrap_or_else(|e| e.into_inner()) = wp.clone();
+            *self
+                .system_prompt
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = wp.clone();
         }
         self.config = config;
         self
@@ -862,54 +865,60 @@ impl Agent {
 
         let tool_timeout_secs = self.config.tool_timeout_secs;
         let tool_timeout = Duration::from_secs(tool_timeout_secs);
-        let results: Vec<_> = match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
-            Ok(results) => {
-                // Unwrap JoinHandle results — panics in tool tasks become errors
-                results
-                    .into_iter()
-                    .map(|r| r.unwrap_or_else(|e| {
-                        // Task panicked — return a placeholder error tuple
-                        (
-                            Message {
-                                role: MessageRole::Tool,
-                                content: format!("Tool task panicked: {e}"),
-                                media: vec![],
-                                tool_calls: None,
-                                tool_call_id: None,
-                                reasoning_content: None,
-                                timestamp: chrono::Utc::now(),
-                            },
-                            None,
-                            None,
-                        )
-                    }))
-                    .collect()
-            }
-            Err(_) => {
-                tracing::error!(
-                    timeout_secs = tool_timeout_secs,
-                    tool_count = response.tool_calls.len(),
-                    tools = %tool_names.join(", "),
-                    "tool execution timed out — spawned tasks continue running for cleanup"
-                );
-                // Note: spawned tasks are NOT aborted — they continue running so
-                // tools can perform their own cleanup (browser kills Chrome, etc.).
-                // They will eventually complete via their own internal timeouts.
-                let mut messages = Vec::with_capacity(response.tool_calls.len());
-                for tc in &response.tool_calls {
-                    messages.push(Message {
-                        role: MessageRole::Tool,
-                        content: format!("Tool '{}' timed out after {} seconds", tc.name, tool_timeout_secs),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        reasoning_content: None,
-                        timestamp: chrono::Utc::now(),
-                    });
+        let results: Vec<_> =
+            match tokio::time::timeout(tool_timeout, futures::future::join_all(handles)).await {
+                Ok(results) => {
+                    // Unwrap JoinHandle results — panics in tool tasks become errors
+                    results
+                        .into_iter()
+                        .map(|r| {
+                            r.unwrap_or_else(|e| {
+                                // Task panicked — return a placeholder error tuple
+                                (
+                                    Message {
+                                        role: MessageRole::Tool,
+                                        content: format!("Tool task panicked: {e}"),
+                                        media: vec![],
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        reasoning_content: None,
+                                        timestamp: chrono::Utc::now(),
+                                    },
+                                    None,
+                                    None,
+                                )
+                            })
+                        })
+                        .collect()
                 }
-                return Ok((messages, vec![], TokenUsage::default()));
-            }
-        };
+                Err(_) => {
+                    tracing::error!(
+                        timeout_secs = tool_timeout_secs,
+                        tool_count = response.tool_calls.len(),
+                        tools = %tool_names.join(", "),
+                        "tool execution timed out — spawned tasks continue running for cleanup"
+                    );
+                    // Note: spawned tasks are NOT aborted — they continue running so
+                    // tools can perform their own cleanup (browser kills Chrome, etc.).
+                    // They will eventually complete via their own internal timeouts.
+                    let mut messages = Vec::with_capacity(response.tool_calls.len());
+                    for tc in &response.tool_calls {
+                        messages.push(Message {
+                            role: MessageRole::Tool,
+                            content: format!(
+                                "Tool '{}' timed out after {} seconds",
+                                tc.name, tool_timeout_secs
+                            ),
+                            media: vec![],
+                            tool_calls: None,
+                            tool_call_id: Some(tc.id.clone()),
+                            reasoning_content: None,
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                    return Ok((messages, vec![], TokenUsage::default()));
+                }
+            };
 
         // Log completion of all parallel tools
         let result_sizes: Vec<usize> = results.iter().map(|(m, _, _)| m.content.len()).collect();

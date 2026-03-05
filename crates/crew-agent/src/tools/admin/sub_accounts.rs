@@ -92,9 +92,7 @@ impl Tool for ListSubAccountsTool {
                         .and_then(|v| v.as_array())
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|c| {
-                                    c.get("type").and_then(|t| t.as_str())
-                                })
+                                .filter_map(|c| c.get("type").and_then(|t| t.as_str()))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         })
@@ -199,10 +197,7 @@ impl Tool for CreateSubAccountTool {
         match self
             .ctx
             .post(
-                &format!(
-                    "/api/admin/profiles/{}/accounts",
-                    input.profile_id
-                ),
+                &format!("/api/admin/profiles/{}/accounts", input.profile_id),
                 Some(&body),
             )
             .await
