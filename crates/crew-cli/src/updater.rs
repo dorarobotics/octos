@@ -33,6 +33,7 @@ pub struct UpdateResult {
 pub struct Updater {
     bin_dir: PathBuf,
     http: reqwest::Client,
+    github_token: Option<String>,
 }
 
 impl Updater {
@@ -44,12 +45,30 @@ impl Updater {
             .ok_or_else(|| eyre::eyre!("exe has no parent dir"))?
             .to_path_buf();
 
+        let github_token = std::env::var("GITHUB_TOKEN").ok();
+
         let http = reqwest::Client::builder()
             .user_agent("crew-updater/1.0")
             .build()
             .wrap_err("failed to build HTTP client")?;
 
-        Ok(Self { bin_dir, http })
+        Ok(Self {
+            bin_dir,
+            http,
+            github_token,
+        })
+    }
+
+    /// Build a GET request with optional GitHub token auth.
+    fn github_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self
+            .http
+            .get(url)
+            .header("Accept", "application/vnd.github+json");
+        if let Some(token) = &self.github_token {
+            req = req.bearer_auth(token);
+        }
+        req
     }
 
     /// Check the latest release on GitHub.
@@ -59,9 +78,7 @@ impl Updater {
             GITHUB_REPO
         );
         let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
+            .github_get(&url)
             .send()
             .await
             .wrap_err("failed to fetch latest release")?
@@ -80,9 +97,7 @@ impl Updater {
             GITHUB_REPO, tag
         );
         let resp: serde_json::Value = self
-            .http
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
+            .github_get(&url)
             .send()
             .await
             .wrap_err("failed to fetch release")?
@@ -184,9 +199,14 @@ impl Updater {
 
     /// Stream-download a URL to a file path.
     async fn download_file(&self, url: &str, dest: &Path) -> Result<()> {
-        let resp = self
+        let mut req = self
             .http
             .get(url)
+            .header("Accept", "application/octet-stream");
+        if let Some(token) = &self.github_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send()
             .await?
             .error_for_status()
