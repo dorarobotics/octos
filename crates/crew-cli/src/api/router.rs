@@ -126,6 +126,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/profiles/{id}/accounts",
             post(admin::create_sub_account),
         )
+        // Skill management
+        .route(
+            "/api/admin/profiles/{id}/skills",
+            get(admin::list_profile_skills),
+        )
+        .route(
+            "/api/admin/profiles/{id}/skills",
+            post(admin::install_profile_skill),
+        )
+        .route(
+            "/api/admin/profiles/{id}/skills/{name}",
+            delete(admin::remove_profile_skill),
+        )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
         .route("/api/admin/users", post(user_admin::create_user))
@@ -138,7 +151,54 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/admin/monitor/watchdog",
             post(admin::toggle_watchdog),
         )
-        .route("/api/admin/monitor/alerts", post(admin::toggle_alerts));
+        .route("/api/admin/monitor/alerts", post(admin::toggle_alerts))
+        // Platform skills management
+        .route(
+            "/api/admin/platform-skills",
+            get(admin::list_platform_skills),
+        )
+        .route(
+            "/api/admin/platform-skills/{name}/install",
+            post(admin::install_platform_skill),
+        )
+        .route(
+            "/api/admin/platform-skills/{name}",
+            delete(admin::remove_platform_skill),
+        )
+        .route(
+            "/api/admin/platform-skills/{name}/health",
+            get(admin::platform_skill_health),
+        )
+        // ominix-api service management
+        .route(
+            "/api/admin/platform-skills/ominix-api/start",
+            post(admin::platform_service_start),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/stop",
+            post(admin::platform_service_stop),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/restart",
+            post(admin::platform_service_restart),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/logs",
+            get(admin::platform_service_logs),
+        )
+        // Model management (proxy to ominix-api)
+        .route(
+            "/api/admin/platform-skills/ominix-api/models",
+            get(admin::platform_models_catalog),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/models/download",
+            post(admin::platform_models_download),
+        )
+        .route(
+            "/api/admin/platform-skills/ominix-api/models/remove",
+            post(admin::platform_models_remove),
+        );
 
     // Determine whether auth middleware is needed
     let has_auth = state.auth_token.is_some() || state.auth_manager.is_some();

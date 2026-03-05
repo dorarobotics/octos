@@ -421,16 +421,44 @@ impl Channel for TelegramChannel {
             };
 
             for (i, path) in msg.media.iter().enumerate() {
-                let file = InputFile::file(std::path::PathBuf::from(path));
-                let mut req = self.bot.send_document(ChatId(chat_id), file);
-                // Only attach caption to the first file
-                if i == 0 {
-                    if let Some(ref cap) = caption {
-                        req = req.caption(cap).parse_mode(ParseMode::Html);
+                let file_path = std::path::PathBuf::from(path);
+                let file = InputFile::file(&file_path);
+                let lower = path.to_lowercase();
+
+                if lower.ends_with(".ogg") || lower.ends_with(".oga") || lower.ends_with(".opus") {
+                    // Send as voice message (shows as audio bubble in Telegram)
+                    let mut req = self.bot.send_voice(ChatId(chat_id), file);
+                    if i == 0 {
+                        if let Some(ref cap) = caption {
+                            req = req.caption(cap).parse_mode(ParseMode::Html);
+                        }
                     }
+                    req.await
+                        .wrap_err_with(|| format!("failed to send voice: {path}"))?;
+                } else if lower.ends_with(".mp3")
+                    || lower.ends_with(".wav")
+                    || lower.ends_with(".m4a")
+                {
+                    // Send as audio file (shows with player controls)
+                    let mut req = self.bot.send_audio(ChatId(chat_id), file);
+                    if i == 0 {
+                        if let Some(ref cap) = caption {
+                            req = req.caption(cap).parse_mode(ParseMode::Html);
+                        }
+                    }
+                    req.await
+                        .wrap_err_with(|| format!("failed to send audio: {path}"))?;
+                } else {
+                    // Send as document (generic file)
+                    let mut req = self.bot.send_document(ChatId(chat_id), file);
+                    if i == 0 {
+                        if let Some(ref cap) = caption {
+                            req = req.caption(cap).parse_mode(ParseMode::Html);
+                        }
+                    }
+                    req.await
+                        .wrap_err_with(|| format!("failed to send document: {path}"))?;
                 }
-                req.await
-                    .wrap_err_with(|| format!("failed to send document: {path}"))?;
             }
         } else {
             let html = markdown_to_telegram_html(&msg.content);
@@ -469,6 +497,17 @@ impl Channel for TelegramChannel {
             .send_chat_action(ChatId(id), teloxide::types::ChatAction::Typing)
             .await
             .wrap_err("failed to send typing action")?;
+        Ok(())
+    }
+
+    async fn send_listening(&self, chat_id: &str) -> Result<()> {
+        let id: i64 = chat_id
+            .parse()
+            .wrap_err_with(|| format!("invalid Telegram chat_id: {chat_id}"))?;
+        self.bot
+            .send_chat_action(ChatId(id), teloxide::types::ChatAction::RecordVoice)
+            .await
+            .wrap_err("failed to send record_voice action")?;
         Ok(())
     }
 

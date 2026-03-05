@@ -245,7 +245,7 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write_file;
 
-pub mod admin_api;
+pub mod admin;
 pub mod browser;
 pub mod tool_config;
 

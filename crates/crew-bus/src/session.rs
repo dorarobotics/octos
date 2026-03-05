@@ -112,6 +112,8 @@ impl SessionManager {
     }
 
     /// List all sessions (ID + message count) from disk.
+    ///
+    /// Counts lines efficiently using `BufRead` to avoid loading entire files.
     pub fn list_sessions(&self) -> Vec<(String, usize)> {
         let mut result = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.sessions_dir) {
@@ -127,8 +129,13 @@ impl SessionManager {
                         let count = if too_large {
                             0
                         } else {
-                            std::fs::read_to_string(&path)
-                                .map(|c| c.lines().count())
+                            // Count lines without reading the whole file into a String
+                            std::fs::File::open(&path)
+                                .ok()
+                                .map(|f| {
+                                    use std::io::BufRead;
+                                    std::io::BufReader::new(f).lines().count()
+                                })
                                 .unwrap_or(0)
                         };
                         // Decode percent-encoded filename back to session key
@@ -250,6 +257,17 @@ impl SessionManager {
         let meta_line = lines.next()?;
         let meta: SessionMeta = serde_json::from_str(meta_line).ok()?;
 
+        // Reject files from a newer schema we don't understand
+        if meta.schema_version > CURRENT_SESSION_SCHEMA {
+            warn!(
+                key = %key,
+                file_version = meta.schema_version,
+                current_version = CURRENT_SESSION_SCHEMA,
+                "session file has newer schema version, skipping"
+            );
+            return None;
+        }
+
         // Remaining lines are messages
         let messages: Vec<Message> = lines
             .filter(|line| !line.trim().is_empty())
@@ -291,7 +309,21 @@ impl SessionManager {
                 .open(&path)?;
 
             // Check file size after open to avoid TOCTOU race with exists() check
-            let is_new = file.metadata()?.len() == 0;
+            let file_len = file.metadata()?.len();
+            let is_new = file_len == 0;
+
+            // Refuse to append if the file is already at the size limit.
+            // The session should be compacted before it reaches this point.
+            if !is_new && file_len >= MAX_SESSION_FILE_SIZE {
+                warn!(
+                    key = key_str,
+                    size = file_len,
+                    limit = MAX_SESSION_FILE_SIZE,
+                    "session file at size limit, skipping append"
+                );
+                return Ok(());
+            }
+
             if is_new {
                 let meta = SessionMeta {
                     schema_version: CURRENT_SESSION_SCHEMA,
@@ -417,6 +449,48 @@ impl SessionManager {
     /// Number of sessions the LRU cache can hold.
     pub fn capacity(&self) -> usize {
         self.cache.cap().get()
+    }
+
+    /// Delete session files that haven't been updated in `max_age` days.
+    ///
+    /// Returns the number of files removed. Only touches disk files;
+    /// stale entries still in the LRU cache are also evicted.
+    pub fn purge_stale(&mut self, max_age_days: u64) -> usize {
+        let cutoff = Utc::now() - chrono::Duration::days(max_age_days as i64);
+        let mut removed = 0;
+
+        let Ok(dir) = std::fs::read_dir(&self.sessions_dir) else {
+            return 0;
+        };
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            // Read only the first line (metadata) to check updated_at
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(meta_line) = content.lines().next() else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<SessionMeta>(meta_line) else {
+                continue;
+            };
+
+            if meta.updated_at < cutoff {
+                // Evict from LRU cache if present
+                self.cache.pop(&meta.session_key);
+                if std::fs::remove_file(&path).is_ok() {
+                    debug!(key = meta.session_key, "purged stale session");
+                    removed += 1;
+                }
+            }
+        }
+
+        removed
     }
 }
 
@@ -1167,5 +1241,86 @@ mod tests {
         assert!(validate_topic_name("a:b").is_err());
         assert!(validate_topic_name("a/b").is_err());
         assert!(validate_topic_name(&"x".repeat(51)).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_append_respects_file_size_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "big");
+
+        // Write a seed message
+        mgr.add_message(&key, make_message(MessageRole::User, "seed"))
+            .await
+            .unwrap();
+
+        // Manually inflate the file to just under the limit
+        let path = mgr.session_path(&key);
+        let padding = "x".repeat((MAX_SESSION_FILE_SIZE as usize) - 10);
+        std::fs::write(&path, padding).unwrap();
+
+        // Append should silently skip (file is at limit)
+        mgr.add_message(&key, make_message(MessageRole::User, "should not append"))
+            .await
+            .unwrap();
+
+        // File should not have grown significantly
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < MAX_SESSION_FILE_SIZE + 1000);
+    }
+
+    #[test]
+    fn test_load_rejects_future_schema_version() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = SessionManager::open(tmp.path()).unwrap();
+        let key = SessionKey::new("cli", "future");
+
+        // Write a session file with schema version 999
+        let meta = serde_json::json!({
+            "schema_version": 999,
+            "session_key": "cli:future",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        });
+        let path = mgr.session_path(&key);
+        let content = format!("{}\n", serde_json::to_string(&meta).unwrap());
+        std::fs::write(&path, content).unwrap();
+
+        // Should refuse to load
+        assert!(mgr.load_from_disk(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_purge_stale_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = SessionManager::open(tmp.path()).unwrap();
+
+        // Create a session
+        let key = SessionKey::new("cli", "old-session");
+        mgr.add_message(&key, make_message(MessageRole::User, "old"))
+            .await
+            .unwrap();
+
+        // Manually backdate the session metadata to 100 days ago
+        let path = mgr.session_path(&key);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        let mut meta: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let old_date = (Utc::now() - chrono::Duration::days(100))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        meta["updated_at"] = serde_json::Value::String(old_date);
+        lines[0] = &serde_json::to_string(&meta).unwrap();
+        // Need to own the string for lines[0]
+        let meta_str = serde_json::to_string(&meta).unwrap();
+        let new_content = format!("{}\n{}\n", meta_str, content.lines().skip(1).collect::<Vec<_>>().join("\n"));
+        std::fs::write(&path, new_content).unwrap();
+
+        // Purge sessions older than 90 days
+        let removed = mgr.purge_stale(90);
+        assert_eq!(removed, 1);
+
+        // File should be gone
+        assert!(!path.exists());
     }
 }

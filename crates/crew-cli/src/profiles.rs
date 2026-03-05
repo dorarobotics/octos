@@ -636,6 +636,7 @@ pub(crate) fn config_from_profile(
                 feishu_region: e.feishu_region.clone(),
             }),
         adaptive_routing: None,
+        voice: None,
         #[cfg(feature = "api")]
         dashboard_auth: None,
         #[cfg(feature = "api")]

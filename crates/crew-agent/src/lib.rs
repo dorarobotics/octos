@@ -39,7 +39,7 @@ pub use tools::{
     SendFileTool, ShellTool, SpawnTool, SynthesizeResearchTool, TakePhotoTool, Tool,
     ToolConfigStore, ToolPolicy, ToolRegistry, ToolResult, WebFetchTool, WebSearchTool,
     WriteFileTool,
-    admin_api::{AdminApiContext, register_admin_api_tools},
+    admin::{AdminApiContext, register_admin_api_tools},
 };
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ function formatUptime(secs: number | null): string {
 }
 
 export default function ProfileCard({ profile, subAccounts = [], onStart, onStop }: Props) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   const channels = profile.config.channels || []
   const provider = profile.config.provider || 'anthropic'
   const model = profile.config.model || 'default'

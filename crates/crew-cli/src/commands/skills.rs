@@ -5,9 +5,28 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::Executable;
+
+// ── Public types for programmatic access ─────────────────────────────
+
+/// Information about an installed skill (for programmatic use).
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillEntry {
+    pub name: String,
+    pub version: Option<String>,
+    pub tool_count: usize,
+    pub source_repo: Option<String>,
+}
+
+/// Result of a skill installation operation.
+#[derive(Debug, Serialize)]
+pub struct InstallResult {
+    pub installed: Vec<String>,
+    pub skipped: Vec<String>,
+    pub deps_installed: Vec<String>,
+}
 
 const DEFAULT_REGISTRY_URL: &str =
     "https://raw.githubusercontent.com/humanagency-org/skill-registry/main/registry.json";
@@ -75,6 +94,11 @@ pub struct SkillsCommand {
     #[arg(short, long)]
     pub cwd: Option<PathBuf>,
 
+    /// Profile ID — install/manage skills in the profile's data directory
+    /// (shared by the profile and its sub-accounts).
+    #[arg(long)]
+    pub profile: Option<String>,
+
     #[command(subcommand)]
     pub subcommand: SkillsSubcommand,
 }
@@ -128,7 +152,15 @@ impl Executable for SkillsCommand {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
-        let skills_dir = cwd.join(".crew").join("skills");
+
+        // Resolve skills directory: per-profile or global
+        let skills_dir = if let Some(ref profile_id) = self.profile {
+            let data_dir = super::resolve_data_dir(None)?;
+            let store = crate::profiles::ProfileStore::open(&data_dir)?;
+            resolve_profile_skills_dir(&store, profile_id)?
+        } else {
+            cwd.join(".crew").join("skills")
+        };
 
         match self.subcommand {
             SkillsSubcommand::List => cmd_list(&skills_dir),
@@ -148,6 +180,136 @@ impl Executable for SkillsCommand {
         }
     }
 }
+
+// ── Public API for programmatic access ───────────────────────────────
+
+/// Resolve the skills directory for a profile.
+/// Sub-accounts resolve to their parent profile's skills dir.
+pub fn resolve_profile_skills_dir(
+    store: &crate::profiles::ProfileStore,
+    profile_id: &str,
+) -> Result<PathBuf> {
+    let profile = store
+        .get(profile_id)?
+        .ok_or_else(|| eyre::eyre!("profile '{profile_id}' not found"))?;
+    let target = if let Some(ref parent_id) = profile.parent_id {
+        store
+            .get(parent_id)?
+            .ok_or_else(|| eyre::eyre!("parent profile '{parent_id}' not found"))?
+    } else {
+        profile
+    };
+    let data_dir = store.resolve_data_dir(&target);
+    std::fs::create_dir_all(data_dir.join("skills")).ok();
+    Ok(data_dir.join("skills"))
+}
+
+/// List installed skills in a directory (returns structured data).
+pub fn list_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
+    if !skills_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries: Vec<_> = std::fs::read_dir(skills_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("SKILL.md").exists())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut skills = Vec::new();
+    for entry in &entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let version = std::fs::read_to_string(entry.path().join("SKILL.md"))
+            .ok()
+            .and_then(|c| extract_fm_value(&c, "version"));
+
+        let tool_count = if entry.path().join("manifest.json").exists() {
+            std::fs::read_to_string(entry.path().join("manifest.json"))
+                .ok()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+                .and_then(|v| v.get("tools")?.as_array().map(|a| a.len()))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        let source_repo = entry
+            .path()
+            .join(".source")
+            .exists()
+            .then(|| {
+                std::fs::read_to_string(entry.path().join(".source"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<SourceInfo>(&s).ok())
+                    .map(|s| s.repo)
+            })
+            .flatten();
+
+        skills.push(SkillEntry {
+            name,
+            version,
+            tool_count,
+            source_repo,
+        });
+    }
+    Ok(skills)
+}
+
+/// Install skills from a GitHub repo (blocking — uses git clone).
+pub fn install_skill(
+    skills_dir: &Path,
+    repo: &str,
+    force: bool,
+    branch: &str,
+) -> Result<InstallResult> {
+    let spec = RepoSpec::parse(repo)?;
+
+    match install_via_git_result(skills_dir, &spec, force, branch) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            let is_git_missing = e.to_string().contains("git not found");
+            if is_git_missing && spec.subdir.is_some() {
+                install_via_http(skills_dir, &spec, force, branch)?;
+                let name = spec
+                    .subdir
+                    .as_deref()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                Ok(InstallResult {
+                    installed: vec![name],
+                    skipped: vec![],
+                    deps_installed: vec![],
+                })
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Remove an installed skill by name.
+pub fn remove_skill(skills_dir: &Path, name: &str) -> Result<()> {
+    // Reject path traversal attempts
+    if name.contains('/')
+        || name.contains('\\')
+        || name == ".."
+        || name == "."
+        || name.contains('\0')
+    {
+        eyre::bail!("Invalid skill name: {name}");
+    }
+    let dest = skills_dir.join(name);
+    if !dest.exists() {
+        eyre::bail!("Skill '{name}' not found in {}", skills_dir.display());
+    }
+    std::fs::remove_dir_all(&dest)?;
+    Ok(())
+}
+
+// ── CLI command handlers (print to stdout) ───────────────────────────
 
 fn cmd_list(skills_dir: &Path) -> Result<()> {
     println!("{}", "Installed Skills".cyan().bold());
@@ -346,28 +508,47 @@ impl RepoSpec {
 }
 
 fn cmd_install(skills_dir: &Path, repo: &str, force: bool, branch: &str) -> Result<()> {
-    let spec = RepoSpec::parse(repo)?;
+    let result = install_skill(skills_dir, repo, force, branch)?;
 
-    // Try git clone first, fall back to HTTP for single-skill installs
-    match install_via_git(skills_dir, &spec, force, branch) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // If git is not available and we have a subdir target, try HTTP fallback
-            let is_git_missing = e.to_string().contains("git not found");
-            if is_git_missing && spec.subdir.is_some() {
-                println!(
-                    "{}",
-                    "git not found, falling back to HTTP fetch...".yellow()
-                );
-                install_via_http(skills_dir, &spec, force, branch)
-            } else {
-                Err(e)
-            }
-        }
+    // Print summary
+    println!();
+    if !result.installed.is_empty() {
+        println!(
+            "{} Installed {} skill(s): {}",
+            "OK".green(),
+            result.installed.len(),
+            result.installed.join(", ").cyan()
+        );
     }
+    if !result.deps_installed.is_empty() {
+        println!(
+            "{} Installed {} shared dep(s): {}",
+            "OK".green(),
+            result.deps_installed.len(),
+            result.deps_installed.join(", ").dimmed()
+        );
+    }
+    if !result.skipped.is_empty() {
+        println!(
+            "{} Skipped {} existing: {}",
+            "SKIP".yellow(),
+            result.skipped.len(),
+            result.skipped.join(", ")
+        );
+    }
+    if result.installed.is_empty() && result.deps_installed.is_empty() && result.skipped.is_empty()
+    {
+        println!("{} No skills found in repository", "WARN".yellow());
+    }
+    Ok(())
 }
 
-fn install_via_git(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &str) -> Result<()> {
+fn install_via_git_result(
+    skills_dir: &Path,
+    spec: &RepoSpec,
+    force: bool,
+    branch: &str,
+) -> Result<InstallResult> {
     // Clone to a temp directory
     let tmp = tempfile::tempdir().wrap_err("failed to create temp directory")?;
     let clone_dir = tmp.path().join(&spec.repo);
@@ -531,37 +712,11 @@ fn install_via_git(skills_dir: &Path, spec: &RepoSpec, force: bool, branch: &str
         write_source_info(&dest, spec, branch)?;
     }
 
-    // Summary
-    println!();
-    if !installed.is_empty() {
-        println!(
-            "{} Installed {} skill(s): {}",
-            "OK".green(),
-            installed.len(),
-            installed.join(", ").cyan()
-        );
-    }
-    if !deps_installed.is_empty() {
-        println!(
-            "{} Installed {} shared dep(s): {}",
-            "OK".green(),
-            deps_installed.len(),
-            deps_installed.join(", ").dimmed()
-        );
-    }
-    if !skipped.is_empty() {
-        println!(
-            "{} Skipped {} existing: {}",
-            "SKIP".yellow(),
-            skipped.len(),
-            skipped.join(", ")
-        );
-    }
-    if installed.is_empty() && deps_installed.is_empty() && skipped.is_empty() {
-        println!("{} No skills found in repository", "WARN".yellow());
-    }
-
-    Ok(())
+    Ok(InstallResult {
+        installed,
+        skipped,
+        deps_installed,
+    })
 }
 
 /// HTTP fallback: fetch a single SKILL.md (original behavior).
@@ -1033,12 +1188,7 @@ fn maybe_npm_install(dir: &Path) -> Result<()> {
 }
 
 fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
-    let dest = skills_dir.join(name);
-    if !dest.exists() {
-        eyre::bail!("Skill '{name}' not found in {}", skills_dir.display());
-    }
-
-    std::fs::remove_dir_all(&dest)?;
+    remove_skill(skills_dir, name)?;
     println!("{} Removed skill '{}'", "OK".green(), name.cyan());
     Ok(())
 }

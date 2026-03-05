@@ -12,6 +12,9 @@ members = [
     "crates/app-skills/deep-crawl",
     "crates/app-skills/send-email",
     "crates/app-skills/account-manager",
+    "crates/app-skills/time",
+    "crates/app-skills/weather",
+    "crates/platform-skills/asr",
     "crates/crew-pipeline",
 ]
 

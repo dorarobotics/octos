@@ -105,12 +105,12 @@ pub async fn maybe_compact_with_config(
         .content
         .unwrap_or_else(|| "[Summary unavailable]".to_string());
 
-    // Replace old messages with a summary message + keep recent
+    // Build the compacted message list before mutating in-memory state,
+    // so a failed rewrite doesn't leave the session truncated.
     let session = session_mgr.get_or_create(key);
     let recent: Vec<Message> = session.messages[to_summarize..].to_vec();
 
-    session.messages.clear();
-    session.messages.push(Message {
+    let summary_msg = Message {
         role: MessageRole::System,
         content: format!("[Conversation summary]\n{summary}"),
         media: vec![],
@@ -118,12 +118,25 @@ pub async fn maybe_compact_with_config(
         tool_call_id: None,
         reasoning_content: None,
         timestamp: Utc::now(),
-    });
-    session.messages.extend(recent);
+    };
+
+    let mut compacted = Vec::with_capacity(1 + recent.len());
+    compacted.push(summary_msg);
+    compacted.extend(recent);
+
+    // Replace in-memory state and rewrite to disk atomically.
+    // rewrite() uses write-then-rename, so disk is safe on crash.
+    // We swap messages so we can restore on rewrite failure.
+    let session = session_mgr.get_or_create(key);
+    let original_messages = std::mem::replace(&mut session.messages, compacted);
     session.updated_at = Utc::now();
 
-    // Rewrite the JSONL file
-    session_mgr.rewrite(key).await?;
+    if let Err(e) = session_mgr.rewrite(key).await {
+        // Restore original messages on disk write failure
+        let session = session_mgr.get_or_create(key);
+        session.messages = original_messages;
+        return Err(e);
+    }
 
     debug!(
         session = %key,

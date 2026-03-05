@@ -1,0 +1,243 @@
+//! Platform skills: server-level OminiX ASR/TTS engine management via ominix-api.
+//!
+//! Actions: status, health, start, stop, restart, logs, models, download_model,
+//!          install, remove.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use eyre::Result;
+use serde::Deserialize;
+
+use super::{AdminApiContext, Tool, ToolResult};
+
+pub struct PlatformSkillsTool {
+    ctx: Arc<AdminApiContext>,
+}
+
+impl PlatformSkillsTool {
+    pub fn new(ctx: Arc<AdminApiContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[derive(Deserialize)]
+struct PlatformSkillsInput {
+    action: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    lines: Option<usize>,
+}
+
+#[async_trait]
+impl Tool for PlatformSkillsTool {
+    fn name(&self) -> &str {
+        "admin_platform_skills"
+    }
+    fn description(&self) -> &str {
+        "Manage OminiX platform services — on-device ASR (speech-to-text) and TTS (text-to-speech) engines. Shared across all profiles.\n\
+         Actions:\n\
+         - status: List OminiX skills with installation, model, and backend health info\n\
+         - health: Detailed backend health check for a service (name required)\n\
+         - start: Start the OminiX engine service via launchd\n\
+         - stop: Stop the OminiX engine service\n\
+         - restart: Restart the OminiX engine service\n\
+         - logs: View recent OminiX engine log output (optional: lines, default 50)\n\
+         - models: List available OminiX models catalog with download status\n\
+         - download_model: Download a model by model_id (e.g. 'Qwen3-ASR-1.7B-8bit')\n\
+         - remove_model: Remove a downloaded model by model_id\n\
+         - install: Bootstrap an OminiX skill binary\n\
+         - remove: Uninstall an OminiX skill"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["status", "health", "start", "stop", "restart", "logs",
+                             "models", "download_model", "remove_model",
+                             "install", "remove"],
+                    "description": "Action to perform on OminiX platform skills (ASR/TTS engine)"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Service name (e.g. 'ominix-api', 'asr'). Required for health/install/remove."
+                },
+                "model_id": {
+                    "type": "string",
+                    "description": "Model identifier for download_model/remove_model (e.g. 'Qwen3-ASR-1.7B-8bit', 'Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit')"
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of log lines to return (for 'logs' action, default 50, max 200)"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let input: PlatformSkillsInput = serde_json::from_value(args.clone())
+            .map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        match input.action.as_str() {
+            "status" => {
+                match self.ctx.get("/api/admin/platform-skills").await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Failed to get platform skills status: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "health" => {
+                let name = input.name.as_deref()
+                    .ok_or_else(|| eyre::eyre!("'name' is required for health"))?;
+                let path = format!("/api/admin/platform-skills/{name}/health");
+                match self.ctx.get(&path).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Health check failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "start" | "stop" | "restart" => {
+                let path = format!("/api/admin/platform-skills/ominix-api/{}", input.action);
+                match self.ctx.post(&path, None).await {
+                    Ok(resp) => {
+                        let msg = resp.get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Done");
+                        Ok(ToolResult {
+                            output: msg.to_string(),
+                            success: true,
+                            ..Default::default()
+                        })
+                    }
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Failed to {} ominix-api: {e}", input.action),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "logs" => {
+                let lines = input.lines.unwrap_or(50).min(200);
+                let path = format!("/api/admin/platform-skills/ominix-api/logs?lines={lines}");
+                match self.ctx.get(&path).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Failed to get logs: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "install" => {
+                let name = input.name.as_deref()
+                    .ok_or_else(|| eyre::eyre!("'name' is required for install"))?;
+                let path = format!("/api/admin/platform-skills/{name}/install");
+                match self.ctx.post(&path, None).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Install failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "remove" => {
+                let name = input.name.as_deref()
+                    .ok_or_else(|| eyre::eyre!("'name' is required for remove"))?;
+                let path = format!("/api/admin/platform-skills/{name}");
+                match self.ctx.delete(&path).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Remove failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "models" => {
+                match self.ctx.get("/api/admin/platform-skills/ominix-api/models").await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Failed to get model catalog: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "download_model" => {
+                let model_id = input.model_id.as_deref()
+                    .ok_or_else(|| eyre::eyre!("'model_id' is required for download_model"))?;
+                let body = serde_json::json!({ "model_id": model_id });
+                match self.ctx.post("/api/admin/platform-skills/ominix-api/models/download", Some(&body)).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Download failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            "remove_model" => {
+                let model_id = input.model_id.as_deref()
+                    .ok_or_else(|| eyre::eyre!("'model_id' is required for remove_model"))?;
+                let body = serde_json::json!({ "model_id": model_id });
+                match self.ctx.post("/api/admin/platform-skills/ominix-api/models/remove", Some(&body)).await {
+                    Ok(resp) => Ok(ToolResult {
+                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                        success: true,
+                        ..Default::default()
+                    }),
+                    Err(e) => Ok(ToolResult {
+                        output: format!("Remove model failed: {e}"),
+                        success: false,
+                        ..Default::default()
+                    }),
+                }
+            }
+            other => Ok(ToolResult {
+                output: format!("Unknown action: {other}. Use: status, health, start, stop, restart, logs, models, download_model, remove_model, install, remove."),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}

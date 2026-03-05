@@ -99,6 +99,11 @@ pub struct Config {
     #[serde(default)]
     pub email: Option<EmailConfig>,
 
+    /// Voice (ASR/TTS) configuration. When set, enables auto-transcription of
+    /// voice messages and auto-TTS replies for voice conversations.
+    #[serde(default)]
+    pub voice: Option<VoiceConfig>,
+
     /// Dashboard user authentication configuration (email OTP).
     /// When set, enables multi-user login via email verification codes.
     #[cfg(feature = "api")]
@@ -216,6 +221,47 @@ pub struct EmailConfig {
     /// "cn" (default) or "global".
     #[serde(default)]
     pub feishu_region: Option<String>,
+}
+
+/// Voice (ASR/TTS) configuration for auto-transcription and auto-synthesis.
+/// The OminiX API URL is a platform-wide setting via OMINIX_API_URL env var
+/// (default http://localhost:8080), NOT per-profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Legacy field — ignored. OminiX URL is now platform-wide via OMINIX_API_URL env var.
+    #[serde(default, skip_serializing)]
+    pub api_url: Option<String>,
+    /// Auto-transcribe voice messages at gateway level. Default: true.
+    #[serde(default = "voice_default_true")]
+    pub auto_asr: bool,
+    /// Auto-synthesize voice replies for voice conversations. Default: true.
+    #[serde(default = "voice_default_true")]
+    pub auto_tts: bool,
+    /// Default TTS voice preset. Default: "vivian".
+    #[serde(default = "default_voice_preset")]
+    pub default_voice: String,
+    /// Default ASR language hint. Default: None (auto-detect).
+    #[serde(default)]
+    pub asr_language: Option<String>,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            api_url: None,
+            auto_asr: true,
+            auto_tts: true,
+            default_voice: default_voice_preset(),
+            asr_language: None,
+        }
+    }
+}
+
+fn voice_default_true() -> bool {
+    true
+}
+fn default_voice_preset() -> String {
+    "vivian".to_string()
 }
 
 /// Adaptive routing configuration for dynamic LLM provider selection.

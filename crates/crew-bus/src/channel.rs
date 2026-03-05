@@ -45,6 +45,12 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Send a "listening" / recording-voice indicator (for voice transcription).
+    /// Falls back to typing indicator by default.
+    async fn send_listening(&self, chat_id: &str) -> Result<()> {
+        self.send_typing(chat_id).await
+    }
+
     /// Send a message and return its platform message ID (for later editing/deletion).
     /// Default: delegates to `send()` and returns None.
     async fn send_with_id(&self, msg: &OutboundMessage) -> Result<Option<String>> {

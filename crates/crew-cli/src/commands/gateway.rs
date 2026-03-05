@@ -18,8 +18,8 @@ use crew_bus::{
 };
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
 use crew_llm::{
-    AdaptiveConfig, AdaptiveRouter, GroqTranscriber, LlmProvider, ProviderChain, ProviderRouter,
-    RetryProvider,
+    AdaptiveConfig, AdaptiveRouter, GroqTranscriber, LlmProvider, OminixClient, ProviderChain,
+    ProviderRouter, RetryProvider, Transcriber,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
@@ -238,6 +238,11 @@ impl GatewayCommand {
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
         let data_dir = super::resolve_data_dir(self.data_dir)?;
 
+        // Expose data_dir to skill binaries (e.g. mofa-fm voice storage)
+        // SAFETY: called before spawning any threads; single-threaded at this point
+        #[allow(unsafe_code)]
+        unsafe { std::env::set_var("CREW_DATA_DIR", &data_dir); }
+
         // Open ProfileStore for /account commands (if crew-home is available)
         let profile_store: Option<Arc<crate::profiles::ProfileStore>> =
             if let Some(ref crew_home) = self.crew_home {
@@ -281,11 +286,35 @@ impl GatewayCommand {
         let media_dir = data_dir.join("media");
         let _ = &media_dir; // used by channel feature gates below
 
-        // Create voice transcriber if GROQ_API_KEY is set
-        let transcriber = std::env::var("GROQ_API_KEY").ok().map(|key| {
-            println!("{}: Groq Whisper", "Transcriber".green());
-            GroqTranscriber::new(key)
-        });
+        // Create voice transcriber: prefer OminiX (local), fall back to Groq (cloud)
+        // OminiX API URL is platform-wide via OMINIX_API_URL env var (set by crew serve)
+        let voice_config = config.voice.clone();
+        let ominix_client: Option<Arc<OminixClient>> = {
+            let api_url = std::env::var("OMINIX_API_URL").ok();
+            if let Some(ref url) = api_url {
+                let client = OminixClient::new(url).with_language(
+                    voice_config.as_ref().and_then(|vc| vc.asr_language.clone()),
+                );
+                if client.health().await {
+                    println!("{}: OminiX ({})", "Transcriber".green(), url);
+                    Some(Arc::new(client))
+                } else {
+                    warn!("OminiX API not reachable at {url}");
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let transcriber: Option<Arc<dyn Transcriber>> = if let Some(ref oc) = ominix_client {
+            Some(oc.clone() as Arc<dyn Transcriber>)
+        } else {
+            std::env::var("GROQ_API_KEY").ok().map(|key| {
+                println!("{}: Groq Whisper", "Transcriber".green());
+                Arc::new(GroqTranscriber::new(key)) as Arc<dyn Transcriber>
+            })
+        };
 
         eprintln!("[gateway] opening episode store at {}", data_dir.display());
         let memory = Arc::new(
@@ -315,7 +344,41 @@ impl GatewayCommand {
             info!(count = n, "bootstrapped bundled app-skills");
         }
 
-        let skills_loader = SkillsLoader::new(&project_dir);
+        // Log voice API status
+        if ominix_client.is_some() {
+            let url = std::env::var("OMINIX_API_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".to_string());
+            println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
+        }
+
+        // Collect extra skills dirs: parent profile (for sub-accounts) + global
+        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
+        if data_dir != project_dir {
+            // Sub-account: also add parent profile's skills dir
+            if let Some(ref parent_path) = self.parent_profile {
+                if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
+                    if let Ok(parent) =
+                        serde_json::from_str::<crate::profiles::UserProfile>(&parent_content)
+                    {
+                        if let Some(ref store) = profile_store {
+                            extra_skills_dirs.push(store.resolve_data_dir(&parent));
+                        }
+                    }
+                }
+            }
+            extra_skills_dirs.push(project_dir.clone());
+        }
+
+        // Skills priority: sub-account data_dir > parent profile data_dir > global .crew/
+        let skills_loader = if data_dir != project_dir {
+            let mut loader = SkillsLoader::new(&data_dir);
+            for dir in &extra_skills_dirs {
+                loader.add_skills_dir(dir);
+            }
+            loader
+        } else {
+            SkillsLoader::new(&project_dir)
+        };
 
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
@@ -385,13 +448,11 @@ impl GatewayCommand {
             tools.register_arc(message_tool.clone() as Arc<dyn crew_agent::Tool>);
             tools.register_arc(send_file_tool.clone() as Arc<dyn crew_agent::Tool>);
 
-            // App-skill tools (send_email, news, etc.) via plugin loader
-            let plugin_dirs = crate::config::Config::plugin_dirs(&cwd);
-            if !plugin_dirs.is_empty() {
-                if let Err(e) = crew_agent::PluginLoader::load_into(&mut tools, &plugin_dirs) {
-                    warn!("plugin loading failed: {e}");
-                }
-            }
+            // Shell tool for direct server access (diagnostics, troubleshooting)
+            tools.register(crew_agent::ShellTool::new(&cwd));
+
+            // Note: admin mode does NOT load app-skill plugins (news, deep_search,
+            // etc.) — those are user-facing tools. Admin bot only has admin API tools.
 
             // Memory bank tools
             tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
@@ -930,6 +991,7 @@ impl GatewayCommand {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
+            let extra_dirs_p = extra_skills_dirs.clone();
             let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
@@ -939,11 +1001,15 @@ impl GatewayCommand {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
+                    let eds = extra_dirs_p.clone();
                     let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let agent = agent_for_persona.clone();
                     tokio::spawn(async move {
-                        let sl = SkillsLoader::new(&pd);
+                        let mut sl = SkillsLoader::new(&dd);
+                        for dir in &eds {
+                            sl.add_skills_dir(dir);
+                        }
                         let new_prompt =
                             build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
                         agent.set_system_prompt(new_prompt);
@@ -1006,11 +1072,21 @@ impl GatewayCommand {
 
             // Transcribe audio media and separate images (stays on main task)
             let mut image_media = Vec::new();
+            let mut is_voice_message = false;
             if let Some(ref transcriber) = transcriber {
                 for path in &inbound.media {
                     if crew_bus::media::is_audio(path) {
+                        is_voice_message = true;
+                        // Show "listening" indicator while transcribing voice
+                        if let Some(ch) = channel_mgr.get_channel(&inbound.channel) {
+                            let _ = ch.send_listening(&inbound.chat_id).await;
+                        }
                         match transcriber.transcribe(std::path::Path::new(path)).await {
                             Ok(text) => {
+                                // Store transcript in metadata for status indicator display
+                                if let Some(obj) = inbound.metadata.as_object_mut() {
+                                    obj.insert("voice_transcript".into(), serde_json::Value::String(text.clone()));
+                                }
                                 let prefix = format!("[Voice transcription: {text}]\n\n");
                                 inbound.content = format!("{prefix}{}", inbound.content);
                             }
@@ -1021,12 +1097,21 @@ impl GatewayCommand {
                     }
                 }
             } else {
-                image_media = inbound
-                    .media
-                    .iter()
-                    .filter(|p| crew_bus::media::is_image(p))
-                    .cloned()
-                    .collect();
+                // Check for audio even without transcriber (for voice_message flag)
+                for path in &inbound.media {
+                    if crew_bus::media::is_audio(path) {
+                        is_voice_message = true;
+                    } else if crew_bus::media::is_image(path) {
+                        image_media.push(path.clone());
+                    }
+                }
+            }
+
+            // Tag voice messages in metadata for auto-TTS downstream
+            if is_voice_message {
+                if let Some(obj) = inbound.metadata.as_object_mut() {
+                    obj.insert("voice_message".into(), serde_json::Value::Bool(true));
+                }
             }
 
             // Route cron-triggered messages to their target channel
@@ -1414,6 +1499,35 @@ impl GatewayCommand {
                 continue;
             }
 
+            // Handle /skills command inline — skill management
+            if inbound.content.trim() == "/skills"
+                || inbound.content.trim().starts_with("/skills ")
+            {
+                let args = inbound
+                    .content
+                    .trim()
+                    .strip_prefix("/skills")
+                    .unwrap_or("")
+                    .trim();
+                let response = handle_skills_command(
+                    args,
+                    profile_id.as_deref(),
+                    &data_dir,
+                    &profile_store,
+                )
+                .await;
+                let msg = OutboundMessage {
+                    channel: reply_channel.clone(),
+                    chat_id: reply_chat_id.clone(),
+                    content: response,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({}),
+                };
+                let _ = agent_handle.send_outbound(msg).await;
+                continue;
+            }
+
             info!(
                 channel = %inbound.channel,
                 sender = %inbound.sender_id,
@@ -1617,10 +1731,16 @@ async fn process_session_message(
             pt.set_status_bridge(bridge);
         }
 
+        let voice_transcript = inbound.metadata
+            .get("voice_transcript")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         si.start(
             reply_chat_id.to_string(),
             &inbound.content,
             Arc::clone(&token_tracker),
+            voice_transcript,
         )
     });
 
@@ -1709,6 +1829,7 @@ async fn process_session_message(
                     .or_else(|| content.trim_start().strip_prefix("[NO_CHANGE]"))
                     .unwrap_or(&content)
                     .to_string();
+
                 let outbound = OutboundMessage {
                     channel: reply_channel.to_string(),
                     chat_id: reply_chat_id.to_string(),
@@ -2295,6 +2416,109 @@ async fn handle_account_command(
 
         other => format!(
             "Unknown sub-command: {other}\nUsage: /account [list|create|update|delete|start|stop|restart]\n  /account list — list sub-accounts\n  /account create <name> — create sub-account\n  /account update <sub-id> key=value ... — update config\n  /account start <sub-id> — enable & start gateway\n  /account stop <sub-id> — disable & stop gateway\n  /account restart <sub-id> — restart gateway\n  /account delete <sub-id> — delete sub-account"
+        ),
+    }
+}
+
+// ── /skills command handler ──────────────────────────────────────────
+
+async fn handle_skills_command(
+    args: &str,
+    profile_id: Option<&str>,
+    data_dir: &std::path::Path,
+    profile_store: &Option<Arc<crate::profiles::ProfileStore>>,
+) -> String {
+    // Resolve skills directory: profile-based or data_dir fallback
+    let skills_dir = if let (Some(pid), Some(store)) = (profile_id, profile_store) {
+        match crate::commands::skills::resolve_profile_skills_dir(store, pid) {
+            Ok(d) => d,
+            Err(e) => return format!("Error resolving skills dir: {e}"),
+        }
+    } else {
+        data_dir.join("skills")
+    };
+
+    let parts: Vec<&str> = args.splitn(3, ' ').collect();
+    match parts.first().copied().unwrap_or("list") {
+        "" | "list" => match crate::commands::skills::list_skills(&skills_dir) {
+            Ok(entries) if entries.is_empty() => {
+                "No skills installed.\nInstall with: /skills install <user/repo>".to_string()
+            }
+            Ok(entries) => {
+                let mut lines = vec![format!("{} skill(s) installed:", entries.len())];
+                for e in &entries {
+                    let ver = e
+                        .version
+                        .as_deref()
+                        .map(|v| format!(" v{v}"))
+                        .unwrap_or_default();
+                    let src = e
+                        .source_repo
+                        .as_deref()
+                        .map(|s| format!(" (from {s})"))
+                        .unwrap_or_default();
+                    let tools = if e.tool_count > 0 {
+                        format!(" [{} tool(s)]", e.tool_count)
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!("  {}{}{}{}", e.name, ver, tools, src));
+                }
+                lines.join("\n")
+            }
+            Err(e) => format!("Error: {e}"),
+        },
+
+        "install" => {
+            let repo = parts.get(1).copied().unwrap_or("").trim();
+            if repo.is_empty() {
+                return "Usage: /skills install <user/repo>".to_string();
+            }
+            let skills_dir_c = skills_dir.clone();
+            let repo_c = repo.to_string();
+            match tokio::task::spawn_blocking(move || {
+                crate::commands::skills::install_skill(&skills_dir_c, &repo_c, false, "main")
+            })
+            .await
+            {
+                Ok(Ok(result)) => {
+                    let mut parts = Vec::new();
+                    if !result.installed.is_empty() {
+                        parts.push(format!("Installed: {}", result.installed.join(", ")));
+                    }
+                    if !result.deps_installed.is_empty() {
+                        parts.push(format!("Dependencies: {}", result.deps_installed.join(", ")));
+                    }
+                    if !result.skipped.is_empty() {
+                        parts.push(format!(
+                            "Skipped (already exists): {}",
+                            result.skipped.join(", ")
+                        ));
+                    }
+                    if parts.is_empty() {
+                        "No skills found in repository.".to_string()
+                    } else {
+                        parts.join("\n")
+                    }
+                }
+                Ok(Err(e)) => format!("Install failed: {e}"),
+                Err(e) => format!("Install task failed: {e}"),
+            }
+        }
+
+        "remove" => {
+            let name = parts.get(1).copied().unwrap_or("").trim();
+            if name.is_empty() {
+                return "Usage: /skills remove <name>".to_string();
+            }
+            match crate::commands::skills::remove_skill(&skills_dir, name) {
+                Ok(()) => format!("Removed skill: {name}"),
+                Err(e) => format!("Error: {e}"),
+            }
+        }
+
+        other => format!(
+            "Unknown /skills subcommand: {other}\nUsage:\n  /skills — list installed skills\n  /skills install <user/repo> — install from GitHub\n  /skills remove <name> — remove a skill"
         ),
     }
 }

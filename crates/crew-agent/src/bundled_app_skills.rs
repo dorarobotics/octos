@@ -36,4 +36,28 @@ pub const BUNDLED_APP_SKILLS: &[(&str, &str, &str, &str)] = &[
         include_str!("../../app-skills/account-manager/SKILL.md"),
         include_str!("../../app-skills/account-manager/manifest.json"),
     ),
+    (
+        "clock",
+        "clock",
+        include_str!("../../app-skills/time/SKILL.md"),
+        include_str!("../../app-skills/time/manifest.json"),
+    ),
+    (
+        "weather",
+        "weather",
+        include_str!("../../app-skills/weather/SKILL.md"),
+        include_str!("../../app-skills/weather/manifest.json"),
+    ),
+];
+
+/// Platform skills: bootstrapped once by `crew serve` (admin bot) at startup,
+/// shared across all gateway profiles. Only installed when their backend is reachable.
+/// Same tuple format as BUNDLED_APP_SKILLS: (dir_name, binary_name, skill_md, manifest_json).
+pub const PLATFORM_SKILLS: &[(&str, &str, &str, &str)] = &[
+    (
+        "asr",
+        "asr",
+        include_str!("../../platform-skills/asr/SKILL.md"),
+        include_str!("../../platform-skills/asr/manifest.json"),
+    ),
 ];

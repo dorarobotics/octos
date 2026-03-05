@@ -13,7 +13,7 @@ mod init;
 mod office;
 #[cfg(feature = "api")]
 mod serve;
-mod skills;
+pub(crate) mod skills;
 mod status;
 
 use std::path::PathBuf;

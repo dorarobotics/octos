@@ -55,6 +55,7 @@ impl StatusIndicator {
         chat_id: String,
         message_text: &str,
         tracker: Arc<TokenTracker>,
+        voice_transcript: Option<String>,
     ) -> StatusHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let status_msg_id = Arc::new(Mutex::new(None::<String>));
@@ -109,6 +110,7 @@ impl StatusIndicator {
                 cancelled_clone,
                 msg_id_clone,
                 tracker_clone,
+                voice_transcript,
             )
             .await;
         });
@@ -158,6 +160,7 @@ async fn run_status_loop(
     cancelled: Arc<AtomicBool>,
     status_msg_id: Arc<Mutex<Option<String>>>,
     tracker: Arc<TokenTracker>,
+    voice_transcript: Option<String>,
 ) {
     let start = Instant::now();
     let word_count = words.len().max(1);
@@ -178,7 +181,7 @@ async fn run_status_loop(
     let word = &words[word_idx % word_count];
     let ti = tracker.input_tokens.load(Ordering::Relaxed);
     let to = tracker.output_tokens.load(Ordering::Relaxed);
-    let status_text = format_status(word, start.elapsed().as_secs(), ti, to);
+    let status_text = format_status(word, start.elapsed().as_secs(), ti, to, voice_transcript.as_deref());
 
     let msg = OutboundMessage {
         channel: channel.name().to_string(),
@@ -222,7 +225,7 @@ async fn run_status_loop(
             let elapsed = start.elapsed().as_secs();
             let ti = tracker.input_tokens.load(Ordering::Relaxed);
             let to = tracker.output_tokens.load(Ordering::Relaxed);
-            let new_text = format_status(word, elapsed, ti, to);
+            let new_text = format_status(word, elapsed, ti, to, voice_transcript.as_deref());
 
             let mid = status_msg_id.lock().await.clone();
             if let Some(ref mid) = mid {
@@ -248,7 +251,8 @@ fn fmt_tokens(n: u32) -> String {
 }
 
 /// Format a status message like "✦ Considering... (12s · 1.2k↑ 350↓)"
-fn format_status(word: &str, elapsed_secs: u64, input_tokens: u32, output_tokens: u32) -> String {
+/// With voice transcript: "✦ Considering... 🎙 what about today's weather (12s)"
+fn format_status(word: &str, elapsed_secs: u64, input_tokens: u32, output_tokens: u32, voice_transcript: Option<&str>) -> String {
     let has_tokens = input_tokens > 0 || output_tokens > 0;
 
     let time_part = if elapsed_secs < 3 {
@@ -277,10 +281,21 @@ fn format_status(word: &str, elapsed_secs: u64, input_tokens: u32, output_tokens
         .filter(|s| !s.is_empty())
         .collect();
 
-    if details.is_empty() {
+    // Voice transcript suffix (truncate long transcripts)
+    let voice_part = voice_transcript.map(|t| {
+        let truncated = if t.len() > 80 { &t[..80] } else { t };
+        format!("\n🎙 {truncated}")
+    });
+
+    let base = if details.is_empty() {
         format!("✦ {word}...")
     } else {
         format!("✦ {word}... ({})", details.join(" · "))
+    };
+
+    match voice_part {
+        Some(vp) => format!("{base}{vp}"),
+        None => base,
     }
 }
 
@@ -290,19 +305,19 @@ mod tests {
 
     #[test]
     fn test_format_status_short() {
-        assert_eq!(format_status("Thinking", 1, 0, 0), "✦ Thinking...");
-        assert_eq!(format_status("Thinking", 2, 0, 0), "✦ Thinking...");
+        assert_eq!(format_status("Thinking", 1, 0, 0, None), "✦ Thinking...");
+        assert_eq!(format_status("Thinking", 2, 0, 0, None), "✦ Thinking...");
     }
 
     #[test]
     fn test_format_status_seconds() {
-        assert_eq!(format_status("Pondering", 15, 0, 0), "✦ Pondering... (15s)");
+        assert_eq!(format_status("Pondering", 15, 0, 0, None), "✦ Pondering... (15s)");
     }
 
     #[test]
     fn test_format_status_with_tokens() {
         assert_eq!(
-            format_status("Pondering", 15, 1200, 350),
+            format_status("Pondering", 15, 1200, 350, None),
             "✦ Pondering... (15s · 1.2k↑ 350↓)"
         );
     }
@@ -310,7 +325,7 @@ mod tests {
     #[test]
     fn test_format_status_tokens_only() {
         assert_eq!(
-            format_status("Thinking", 1, 500, 100),
+            format_status("Thinking", 1, 500, 100, None),
             "✦ Thinking... (500↑ 100↓)"
         );
     }
@@ -318,7 +333,7 @@ mod tests {
     #[test]
     fn test_format_status_minutes_with_tokens() {
         assert_eq!(
-            format_status("Synthesizing", 65, 5000, 1200),
+            format_status("Synthesizing", 65, 5000, 1200, None),
             "✦ Synthesizing... (1m 5s · 5.0k↑ 1.2k↓)"
         );
     }

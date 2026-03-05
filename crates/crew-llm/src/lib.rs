@@ -22,6 +22,7 @@ pub mod vision;
 
 pub mod anthropic;
 pub mod gemini;
+pub mod ominix;
 pub mod openai;
 pub mod openrouter;
 pub mod registry;
@@ -41,7 +42,28 @@ pub use provider::{
 };
 pub use retry::{RetryConfig, RetryProvider};
 pub use router::{ProviderRouter, SubProviderMeta};
+pub use ominix::OminixClient;
 pub use transcription::GroqTranscriber;
 pub use types::{
     ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec, strip_think_tags,
 };
+
+/// Unified trait for audio transcription backends.
+#[async_trait::async_trait]
+pub trait Transcriber: Send + Sync {
+    async fn transcribe(&self, audio_path: &std::path::Path) -> eyre::Result<String>;
+}
+
+#[async_trait::async_trait]
+impl Transcriber for GroqTranscriber {
+    async fn transcribe(&self, audio_path: &std::path::Path) -> eyre::Result<String> {
+        self.transcribe(audio_path).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Transcriber for OminixClient {
+    async fn transcribe(&self, audio_path: &std::path::Path) -> eyre::Result<String> {
+        self.transcribe(audio_path).await
+    }
+}

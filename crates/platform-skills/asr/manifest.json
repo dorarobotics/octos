@@ -1,0 +1,120 @@
+{
+  "name": "asr",
+  "version": "1.0.0",
+  "author": "hagency",
+  "description": "OminiX ASR, TTS, and podcast generation via local Qwen3 models on Apple Silicon",
+  "timeout_secs": 300,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "voice_transcribe",
+      "description": "Transcribe an audio file to text using OminiX ASR (Qwen3). Supports WAV, OGG, MP3, FLAC, M4A. Use this when you receive a voice message or need to extract text from audio. Returns the transcribed text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "audio_path": {
+            "type": "string",
+            "description": "Absolute path to the audio file to transcribe"
+          },
+          "language": {
+            "type": "string",
+            "description": "Transcription language: 'Chinese' (default), 'English', 'Japanese', 'Korean', 'Cantonese', etc."
+          }
+        },
+        "required": ["audio_path"]
+      }
+    },
+    {
+      "name": "voice_synthesize",
+      "description": "Synthesize speech from text using OminiX TTS (Qwen3). Produces a WAV audio file. Use this when the user asks for a voice reply or text-to-speech. After generating, use send_file to deliver the audio to the user.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to synthesize into speech"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the WAV file. Default: /tmp/crew_tts_<timestamp>.wav"
+          },
+          "language": {
+            "type": "string",
+            "description": "Speech language: 'chinese' (default), 'english', 'japanese', 'korean'"
+          },
+          "speaker": {
+            "type": "string",
+            "description": "Voice preset: 'vivian' (default), 'serena', 'ryan', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee'"
+          }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "generate_podcast",
+      "description": "Generate a multi-speaker podcast audio file from a dialogue script. Each line specifies a speaker voice and text. The tool synthesizes each line and concatenates them into a single WAV file. Optionally converts to MP3 if ffmpeg is available.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "script": {
+            "type": "array",
+            "description": "Dialogue script as an array of lines",
+            "items": {
+              "type": "object",
+              "properties": {
+                "speaker": {
+                  "type": "string",
+                  "description": "Speaker name (for labeling, e.g. 'Host', 'Guest')"
+                },
+                "voice": {
+                  "type": "string",
+                  "description": "Voice preset: 'vivian', 'ryan', 'serena', 'aiden', 'eric', 'dylan', 'uncle_fu', 'ono_anna', 'sohee'"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "The text this speaker says"
+                }
+              },
+              "required": ["speaker", "voice", "text"]
+            }
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the final audio. Default: /tmp/crew_podcast_<timestamp>.wav"
+          },
+          "language": {
+            "type": "string",
+            "description": "Speech language for all lines: 'chinese' (default), 'english', 'japanese', 'korean'"
+          }
+        },
+        "required": ["script"]
+      }
+    },
+    {
+      "name": "voice_clone_synthesize",
+      "description": "Synthesize speech using voice cloning. Provide a reference audio file (3-10s of the target speaker) and the text to speak. The output will sound like the reference speaker. Use this when the user wants TTS in their own voice or a specific person's voice. After generating, use send_file to deliver the audio.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to synthesize into speech"
+          },
+          "reference_audio": {
+            "type": "string",
+            "description": "Absolute path to reference audio file (3-10s WAV/OGG/MP3 of target speaker)"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the WAV file. Default: /tmp/crew_voice_clone_<timestamp>.wav"
+          },
+          "language": {
+            "type": "string",
+            "description": "Speech language: 'chinese' (default), 'english', 'japanese', 'korean'"
+          }
+        },
+        "required": ["text", "reference_audio"]
+      }
+    }
+  ]
+}

@@ -25,19 +25,34 @@ pub struct SkillInfo {
 }
 
 /// Loads workspace skills from `.crew/skills/`.
+///
+/// Supports multiple skills directories (e.g. per-profile + global).
+/// Earlier directories take priority over later ones for skills with the same name.
 pub struct SkillsLoader {
-    skills_dir: PathBuf,
+    skills_dirs: Vec<PathBuf>,
 }
 
 impl SkillsLoader {
     /// Create a new loader for the given data directory.
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
         Self {
-            skills_dir: data_dir.as_ref().join("skills"),
+            skills_dirs: vec![data_dir.as_ref().join("skills")],
+        }
+    }
+
+    /// Add an additional skills directory. Skills from earlier-added directories
+    /// take priority over later ones.
+    pub fn add_skills_dir(&mut self, dir: impl AsRef<Path>) {
+        let path = dir.as_ref().join("skills");
+        // Avoid duplicates
+        if !self.skills_dirs.contains(&path) {
+            self.skills_dirs.push(path);
         }
     }
 
     /// List all skills (built-in system skills + installed workspace skills).
+    ///
+    /// Priority (highest first): first skills_dir, second skills_dir, ..., builtins.
     pub async fn list_skills(&self) -> Result<Vec<SkillInfo>> {
         let mut skills = Vec::new();
 
@@ -49,26 +64,33 @@ impl SkillsLoader {
             }
         }
 
-        // Load workspace skills from .crew/skills/
-        let entries = match tokio::fs::read_dir(&self.skills_dir).await {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).wrap_err("failed to read skills directory"),
-        };
-
-        if let Some(mut entries) = entries {
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
+        // Load workspace skills from all directories (later dirs first so earlier
+        // dirs can override them, since we use retain to remove duplicates).
+        for skills_dir in self.skills_dirs.iter().rev() {
+            let entries = match tokio::fs::read_dir(skills_dir).await {
+                Ok(entries) => Some(entries),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(e).wrap_err_with(|| {
+                        format!("failed to read skills directory: {}", skills_dir.display())
+                    })
                 }
+            };
 
-                let skill_file = path.join("SKILL.md");
-                if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
-                    if let Some(info) = parse_skill(&skill_file, &content, false) {
-                        // Workspace skill overrides builtin with same name
-                        skills.retain(|s| !(s.builtin && s.name == info.name));
-                        skills.push(info);
+            if let Some(mut entries) = entries {
+                while let Some(entry) = entries.next_entry().await? {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+
+                    let skill_file = path.join("SKILL.md");
+                    if let Ok(content) = tokio::fs::read_to_string(&skill_file).await {
+                        if let Some(info) = parse_skill(&skill_file, &content, false) {
+                            // Override any existing skill with the same name
+                            skills.retain(|s: &SkillInfo| s.name != info.name);
+                            skills.push(info);
+                        }
                     }
                 }
             }
@@ -79,13 +101,20 @@ impl SkillsLoader {
     }
 
     /// Load a specific skill's full content (without frontmatter).
+    ///
+    /// Checks skills directories in priority order (first added = highest priority),
+    /// then falls back to built-in system skills.
     pub async fn load_skill(&self, name: &str) -> Result<Option<String>> {
-        // Check workspace first
-        let skill_file = self.skills_dir.join(name).join("SKILL.md");
-        match tokio::fs::read_to_string(&skill_file).await {
-            Ok(content) => return Ok(Some(strip_frontmatter(&content))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
+        // Check workspace directories in priority order
+        for skills_dir in &self.skills_dirs {
+            let skill_file = skills_dir.join(name).join("SKILL.md");
+            match tokio::fs::read_to_string(&skill_file).await {
+                Ok(content) => return Ok(Some(strip_frontmatter(&content))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).wrap_err_with(|| format!("failed to read skill: {name}"))
+                }
+            }
         }
 
         // Fall back to built-in system skills
@@ -406,5 +435,75 @@ mod tests {
         assert!(!plain.has_tools);
         let with_tools = skills.iter().find(|s| s.name == "with-tools").unwrap();
         assert!(with_tools.has_tools);
+    }
+
+    #[tokio::test]
+    async fn test_multi_dir_priority() {
+        // Set up two directories: "global" and "profile"
+        let global_dir = tempfile::tempdir().unwrap();
+        let profile_dir = tempfile::tempdir().unwrap();
+        let global_skills = setup_skills_dir(&global_dir).await;
+        let profile_skills = setup_skills_dir(&profile_dir).await;
+
+        // Global has skill "shared" with description "global version"
+        let sd = global_skills.join("shared");
+        tokio::fs::create_dir_all(&sd).await.unwrap();
+        tokio::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: shared\ndescription: global version\n---\nGlobal body\n",
+        )
+        .await
+        .unwrap();
+
+        // Global has skill "global-only"
+        let sd = global_skills.join("global-only");
+        tokio::fs::create_dir_all(&sd).await.unwrap();
+        tokio::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: global-only\ndescription: only in global\n---\nBody\n",
+        )
+        .await
+        .unwrap();
+
+        // Profile has skill "shared" with description "profile version" (overrides global)
+        let sd = profile_skills.join("shared");
+        tokio::fs::create_dir_all(&sd).await.unwrap();
+        tokio::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: shared\ndescription: profile version\n---\nProfile body\n",
+        )
+        .await
+        .unwrap();
+
+        // Profile has skill "profile-only"
+        let sd = profile_skills.join("profile-only");
+        tokio::fs::create_dir_all(&sd).await.unwrap();
+        tokio::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: profile-only\ndescription: only in profile\n---\nBody\n",
+        )
+        .await
+        .unwrap();
+
+        // Profile dir first (higher priority), then global
+        let mut loader = SkillsLoader::new(profile_dir.path());
+        loader.add_skills_dir(global_dir.path());
+        let skills = loader.list_skills().await.unwrap();
+
+        // "shared" should use profile version
+        let shared = skills.iter().find(|s| s.name == "shared").unwrap();
+        assert_eq!(shared.description, "profile version");
+
+        // Both unique skills should be present
+        assert!(skills.iter().any(|s| s.name == "global-only"));
+        assert!(skills.iter().any(|s| s.name == "profile-only"));
+
+        // load_skill should return profile version
+        let content = loader.load_skill("shared").await.unwrap().unwrap();
+        assert_eq!(content, "Profile body\n");
+
+        // load_skill should find global-only skill
+        let content = loader.load_skill("global-only").await.unwrap().unwrap();
+        assert_eq!(content, "Body\n");
     }
 }

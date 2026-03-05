@@ -73,9 +73,22 @@ fn serve_file(path: &str, data: &[u8]) -> Response {
         _ => "application/octet-stream",
     };
 
+    // HTML files: no-cache so the browser always fetches the latest index.html
+    // Asset files (with content hash in name): cache for 1 year
+    let cache_control = if path.ends_with(".html") {
+        "no-cache, no-store, must-revalidate"
+    } else if path.contains("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, mime)],
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, cache_control),
+        ],
         data.to_vec(),
     )
         .into_response()
