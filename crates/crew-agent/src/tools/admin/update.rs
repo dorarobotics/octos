@@ -1,0 +1,162 @@
+//! Admin tool for checking and applying crew updates via the serve API.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use eyre::Result;
+use serde::Deserialize;
+
+use super::{AdminApiContext, Tool, ToolResult};
+
+pub struct UpdateCrewTool {
+    ctx: Arc<AdminApiContext>,
+}
+
+impl UpdateCrewTool {
+    pub fn new(ctx: Arc<AdminApiContext>) -> Self {
+        Self { ctx }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateInput {
+    action: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[async_trait]
+impl Tool for UpdateCrewTool {
+    fn name(&self) -> &str {
+        "admin_update_crew"
+    }
+    fn description(&self) -> &str {
+        "Check for crew updates or apply an update. Actions: 'check' to see current/latest version, 'update' to download and install the latest (or a specific) version. The service restarts automatically after update."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["check", "update"],
+                    "description": "Action: 'check' to see versions, 'update' to apply update"
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Version to update to (e.g. 'v0.2.0'). Defaults to latest."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+    async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let input: UpdateInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+
+        match input.action.as_str() {
+            "check" => self.check_version().await,
+            "update" => self.do_update(input.version).await,
+            other => Ok(ToolResult {
+                output: format!("Unknown action '{other}'. Use 'check' or 'update'."),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+impl UpdateCrewTool {
+    async fn check_version(&self) -> Result<ToolResult> {
+        match self.ctx.get("/api/admin/system/version").await {
+            Ok(info) => {
+                let current = info
+                    .get("current")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let update_available = info
+                    .get("update_available")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                let mut out = format!("Current version: {current}\n");
+
+                if let Some(latest) = info.get("latest") {
+                    if latest.is_null() {
+                        out.push_str("Could not check latest version (GitHub API error).\n");
+                    } else {
+                        let tag = latest.get("tag").and_then(|v| v.as_str()).unwrap_or("?");
+                        let published = latest
+                            .get("published_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        out.push_str(&format!("Latest release: {tag} (published {published})\n"));
+
+                        if update_available {
+                            out.push_str("Update available! Use action 'update' to install it.\n");
+                        } else {
+                            out.push_str("You are up to date.\n");
+                        }
+                    }
+                }
+
+                Ok(ToolResult {
+                    output: out,
+                    success: true,
+                    ..Default::default()
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                output: format!("Failed to check version: {e}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn do_update(&self, version: Option<String>) -> Result<ToolResult> {
+        let ver = version.unwrap_or_else(|| "latest".to_string());
+        let body = serde_json::json!({ "version": ver });
+
+        match self.ctx.post("/api/admin/system/update", Some(&body)).await {
+            Ok(resp) => {
+                let success = resp
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let old = resp
+                    .get("old_version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let new = resp
+                    .get("new_version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let message = resp.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let binaries = resp
+                    .get("binaries_updated")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+
+                let out = format!("Updated: {old} → {new}\nBinaries: {binaries}\n{message}");
+
+                Ok(ToolResult {
+                    output: out,
+                    success,
+                    ..Default::default()
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                output: format!("Update failed: {e}"),
+                success: false,
+                ..Default::default()
+            }),
+        }
+    }
+}

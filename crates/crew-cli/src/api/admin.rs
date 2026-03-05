@@ -202,12 +202,10 @@ pub async fn create_profile(
         updated_at: now,
     };
 
-    store
-        .save(&profile)
-        .map_err(|e| {
-            tracing::error!(profile = %profile.id, error = %e, "failed to create profile");
-            (StatusCode::BAD_REQUEST, e.to_string())
-        })?;
+    store.save(&profile).map_err(|e| {
+        tracing::error!(profile = %profile.id, error = %e, "failed to create profile");
+        (StatusCode::BAD_REQUEST, e.to_string())
+    })?;
 
     tracing::info!(profile = %profile.id, name = %profile.name, "profile created");
     let status = pm.status(&profile.id).await;
@@ -258,8 +256,7 @@ pub async fn update_profile(
     // This lets the admin tool send `{"config":{"model":"x"}}` without wiping
     // channels/env_vars, while the dashboard can still send a full config object.
     {
-        let raw: serde_json::Value =
-            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let raw: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
         if let Some(config_patch) = raw.get("config") {
             if config_patch.is_object() {
                 let mut existing =
@@ -273,12 +270,10 @@ pub async fn update_profile(
     }
     profile.updated_at = Utc::now();
 
-    store
-        .save_with_merge(&mut profile)
-        .map_err(|e| {
-            tracing::error!(profile = %id, error = %e, "failed to update profile");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    store.save_with_merge(&mut profile).map_err(|e| {
+        tracing::error!(profile = %id, error = %e, "failed to update profile");
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     tracing::info!(profile = %id, "profile updated");
     let status = pm.status(&id).await;
@@ -1251,21 +1246,21 @@ pub async fn remove_profile_skill(
 // ── Platform Skills ──────────────────────────────────────────────────
 
 fn ominix_api_url() -> String {
-    std::env::var("OMINIX_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+    std::env::var("OMINIX_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string())
 }
 
 fn models_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(
-        std::env::var("OMINIX_MODELS_DIR")
-            .unwrap_or_else(|_| {
-                // Try both common locations
-                let p1 = format!("{home}/.ominix/models");
-                let p2 = format!("{home}/.OminiX/models");
-                if std::path::Path::new(&p1).exists() { p1 } else { p2 }
-            }),
-    )
+    std::path::PathBuf::from(std::env::var("OMINIX_MODELS_DIR").unwrap_or_else(|_| {
+        // Try both common locations
+        let p1 = format!("{home}/.ominix/models");
+        let p2 = format!("{home}/.OminiX/models");
+        if std::path::Path::new(&p1).exists() {
+            p1
+        } else {
+            p2
+        }
+    }))
 }
 
 /// GET /api/admin/platform-skills — list platform skills and their status.
@@ -1279,13 +1274,13 @@ pub async fn list_platform_skills(
     let skills_dir = store.crew_home_dir().join("skills");
 
     // List installed platform skills
-    let installed = crate::commands::skills::list_skills(&skills_dir)
-        .unwrap_or_default();
+    let installed = crate::commands::skills::list_skills(&skills_dir).unwrap_or_default();
 
     // Check ominix-api health
     let ominix_url = ominix_api_url();
     let health_url = format!("{}/health", ominix_url.trim_end_matches('/'));
-    let ominix_healthy = state.http_client
+    let ominix_healthy = state
+        .http_client
         .get(&health_url)
         .timeout(std::time::Duration::from_secs(3))
         .send()
@@ -1409,7 +1404,8 @@ pub async fn platform_skill_health(
         "asr" | "ominix-api" => {
             let url = ominix_api_url();
             let health_url = format!("{}/health", url.trim_end_matches('/'));
-            let result = state.http_client
+            let result = state
+                .http_client
                 .get(&health_url)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
@@ -1420,7 +1416,10 @@ pub async fn platform_skill_health(
                     let body: serde_json::Value = resp.json().await.unwrap_or_default();
                     ("healthy", body)
                 }
-                Ok(resp) => ("error", serde_json::json!({"http_status": resp.status().as_u16()})),
+                Ok(resp) => (
+                    "error",
+                    serde_json::json!({"http_status": resp.status().as_u16()}),
+                ),
                 Err(e) => ("unreachable", serde_json::json!({"error": e.to_string()})),
             };
 
@@ -1431,7 +1430,10 @@ pub async fn platform_skill_health(
                 "detail": detail,
             })))
         }
-        _ => Err((StatusCode::NOT_FOUND, format!("Unknown platform skill: {name}"))),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            format!("Unknown platform skill: {name}"),
+        )),
     }
 }
 
@@ -1450,10 +1452,16 @@ pub async fn platform_service_start() -> Result<Json<ActionResponse>, (StatusCod
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if output.status.success() {
-        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service started".into()) }))
+        Ok(Json(ActionResponse {
+            ok: true,
+            message: Some("ominix-api service started".into()),
+        }))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse { ok: false, message: Some(format!("launchctl load failed: {stderr}")) }))
+        Ok(Json(ActionResponse {
+            ok: false,
+            message: Some(format!("launchctl load failed: {stderr}")),
+        }))
     }
 }
 
@@ -1470,10 +1478,16 @@ pub async fn platform_service_stop() -> Result<Json<ActionResponse>, (StatusCode
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if output.status.success() {
-        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service stopped".into()) }))
+        Ok(Json(ActionResponse {
+            ok: true,
+            message: Some("ominix-api service stopped".into()),
+        }))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse { ok: false, message: Some(format!("launchctl unload failed: {stderr}")) }))
+        Ok(Json(ActionResponse {
+            ok: false,
+            message: Some(format!("launchctl unload failed: {stderr}")),
+        }))
     }
 }
 
@@ -1499,10 +1513,16 @@ pub async fn platform_service_restart() -> Result<Json<ActionResponse>, (StatusC
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if output.status.success() {
-        Ok(Json(ActionResponse { ok: true, message: Some("ominix-api service restarted".into()) }))
+        Ok(Json(ActionResponse {
+            ok: true,
+            message: Some("ominix-api service restarted".into()),
+        }))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Ok(Json(ActionResponse { ok: false, message: Some(format!("Restart failed: {stderr}")) }))
+        Ok(Json(ActionResponse {
+            ok: false,
+            message: Some(format!("Restart failed: {stderr}")),
+        }))
     }
 }
 
@@ -1510,7 +1530,8 @@ pub async fn platform_service_restart() -> Result<Json<ActionResponse>, (StatusC
 pub async fn platform_service_logs(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let lines: usize = params.get("lines")
+    let lines: usize = params
+        .get("lines")
         .and_then(|v| v.parse().ok())
         .unwrap_or(50)
         .min(200);
@@ -1520,7 +1541,11 @@ pub async fn platform_service_logs(
     let log_path = {
         let p1 = format!("{home}/.ominix/api.log");
         let p2 = format!("{home}/.ominix/ominix-api.log");
-        if std::path::Path::new(&p1).exists() { p1 } else { p2 }
+        if std::path::Path::new(&p1).exists() {
+            p1
+        } else {
+            p2
+        }
     };
 
     let content = match tokio::fs::read_to_string(&log_path).await {
@@ -1552,20 +1577,32 @@ pub async fn platform_service_logs(
 pub async fn platform_models_catalog(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let url = format!("{}/v1/models/catalog", ominix_api_url().trim_end_matches('/'));
-    let resp = state.http_client
+    let url = format!(
+        "{}/v1/models/catalog",
+        ominix_api_url().trim_end_matches('/')
+    );
+    let resp = state
+        .http_client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("ominix-api unreachable: {e}"),
+            )
+        })?;
 
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
 
     // Filter to only ASR + TTS models (crew platform skills don't use Image/LLM/VLM)
     if let Some(models) = body.get("models").and_then(|v| v.as_array()) {
-        let filtered: Vec<&serde_json::Value> = models.iter()
+        let filtered: Vec<&serde_json::Value> = models
+            .iter()
             .filter(|m| {
                 let cat = m.get("category").and_then(|v| v.as_str()).unwrap_or("");
                 cat.eq_ignore_ascii_case("asr") || cat.eq_ignore_ascii_case("tts")
@@ -1582,24 +1619,37 @@ pub async fn platform_models_download(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let url = format!("{}/v1/models/download", ominix_api_url().trim_end_matches('/'));
-    let resp = state.http_client
+    let url = format!(
+        "{}/v1/models/download",
+        ominix_api_url().trim_end_matches('/')
+    );
+    let resp = state
+        .http_client
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("ominix-api unreachable: {e}"),
+            )
+        })?;
 
     let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await
+    let resp_body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
 
     if status.is_success() {
         Ok(Json(resp_body))
     } else {
-        Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-             serde_json::to_string(&resp_body).unwrap_or_default()))
+        Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            serde_json::to_string(&resp_body).unwrap_or_default(),
+        ))
     }
 }
 
@@ -1608,23 +1658,149 @@ pub async fn platform_models_remove(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let url = format!("{}/v1/models/remove", ominix_api_url().trim_end_matches('/'));
-    let resp = state.http_client
+    let url = format!(
+        "{}/v1/models/remove",
+        ominix_api_url().trim_end_matches('/')
+    );
+    let resp = state
+        .http_client
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("ominix-api unreachable: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("ominix-api unreachable: {e}"),
+            )
+        })?;
 
     let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await
+    let resp_body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Invalid response: {e}")))?;
 
     if status.is_success() {
         Ok(Json(resp_body))
     } else {
-        Err((StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-             serde_json::to_string(&resp_body).unwrap_or_default()))
+        Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            serde_json::to_string(&resp_body).unwrap_or_default(),
+        ))
     }
+}
+
+// ── System Update ────────────────────────────────────────────────────
+
+/// GET /api/admin/system/version — check current and latest version
+pub async fn system_version(
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let current = crate::updater::Updater::current_version();
+
+    let updater = crate::updater::Updater::new()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let latest = match updater.check_latest().await {
+        Ok(info) => serde_json::json!({
+            "tag": info.tag,
+            "version": info.version,
+            "published_at": info.published_at,
+        }),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to check latest version");
+            serde_json::json!(null)
+        }
+    };
+
+    let current_semver = env!("CARGO_PKG_VERSION");
+    let update_available = latest
+        .get("version")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| v != current_semver);
+
+    Ok(Json(serde_json::json!({
+        "current": current,
+        "latest": latest,
+        "update_available": update_available,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRequest {
+    #[serde(default = "default_version")]
+    pub version: String,
+}
+fn default_version() -> String {
+    "latest".to_string()
+}
+
+/// POST /api/admin/system/update — download and apply an update
+pub async fn system_update(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<UpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let updater = crate::updater::Updater::new()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Resolve the release
+    let release = if body.version == "latest" {
+        updater.check_latest().await
+    } else {
+        let tag = if body.version.starts_with('v') {
+            body.version.clone()
+        } else {
+            format!("v{}", body.version)
+        };
+        updater.check_version(&tag).await
+    }
+    .map_err(|e| (StatusCode::BAD_REQUEST, format!("Release not found: {e}")))?;
+
+    // Perform the update
+    let result = updater.update(&release).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Update failed: {e}"),
+        )
+    })?;
+
+    // Schedule a restart after sending the response
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tracing::info!("restarting service after update");
+        // Get UID via `id -u` (safe, no unsafe block needed)
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "501".to_string());
+        let label = format!("gui/{uid}/io.ominix.crew-serve");
+        let status = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &label])
+            .status();
+        match status {
+            Ok(s) if s.success() => tracing::info!("launchctl restart succeeded"),
+            Ok(s) => {
+                tracing::warn!(code = ?s.code(), "launchctl restart exited with error, trying exit");
+                // Fallback: just exit and let launchd KeepAlive restart us
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "launchctl not available, exiting for restart");
+                std::process::exit(0);
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "old_version": result.old_version,
+        "new_version": result.new_version,
+        "binaries_updated": result.binaries_updated,
+        "message": "Update complete. Restarting service...",
+    })))
 }

@@ -24,7 +24,9 @@ pub fn bootstrap_bundled_skills(skills_dir: &Path) -> usize {
 
     let mut count = 0;
 
-    for &(dir_name, binary_name, skill_md, manifest_json) in BUNDLED_APP_SKILLS.iter().chain(PLATFORM_SKILLS.iter()) {
+    for &(dir_name, binary_name, skill_md, manifest_json) in
+        BUNDLED_APP_SKILLS.iter().chain(PLATFORM_SKILLS.iter())
+    {
         let skill_dir = skills_dir.join(dir_name);
         let main_path = skill_dir.join("main");
 

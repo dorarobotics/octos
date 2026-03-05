@@ -3,11 +3,12 @@
 //! Each sub-module implements one or more related admin tools.
 //! All tools call the `crew serve` REST API via [`AdminApiContext`].
 
-mod profiles;
-mod system;
-mod sub_accounts;
-mod skills;
 mod platform_skills;
+mod profiles;
+mod skills;
+mod sub_accounts;
+mod system;
+mod update;
 
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use serde::Deserialize;
 
-use super::{Tool, ToolResult, ToolRegistry};
+use super::{Tool, ToolRegistry, ToolResult};
 
 /// Shared context for all admin API tools.
 pub struct AdminApiContext {
@@ -43,7 +44,11 @@ impl AdminApiContext {
     }
 
     /// Make an authenticated POST request.
-    pub(crate) async fn post(&self, path: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value> {
+    pub(crate) async fn post(
+        &self,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         let url = format!("{}{}", self.serve_url, path);
         let mut req = self.http.post(&url).bearer_auth(&self.admin_token);
         if let Some(b) = body {
@@ -78,7 +83,11 @@ impl AdminApiContext {
     }
 
     /// Make an authenticated PUT request.
-    pub(crate) async fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    pub(crate) async fn put(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let url = format!("{}{}", self.serve_url, path);
         let resp = self
             .http
@@ -145,5 +154,8 @@ pub fn register_admin_api_tools(registry: &mut ToolRegistry, ctx: Arc<AdminApiCo
     registry.register(skills::ManageSkillsTool::new(ctx.clone()));
 
     // Platform skills (ASR/TTS engine management)
-    registry.register(platform_skills::PlatformSkillsTool::new(ctx));
+    registry.register(platform_skills::PlatformSkillsTool::new(ctx.clone()));
+
+    // System update
+    registry.register(update::UpdateCrewTool::new(ctx));
 }

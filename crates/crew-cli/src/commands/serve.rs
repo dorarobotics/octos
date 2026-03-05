@@ -163,7 +163,9 @@ impl ServeCommand {
         let auth_manager = {
             let auth_config = config.dashboard_auth.clone();
             if auth_config.is_none() {
-                tracing::warn!("no dashboard_auth.smtp configured — OTP codes will be logged to console only");
+                tracing::warn!(
+                    "no dashboard_auth.smtp configured — OTP codes will be logged to console only"
+                );
             }
             Some(Arc::new(crate::otp::AuthManager::new(
                 auth_config,
@@ -216,7 +218,11 @@ impl ServeCommand {
         // Auto-start enabled profiles
         let profiles = profile_store.list().unwrap_or_default();
         let enabled_count = profiles.iter().filter(|p| p.enabled).count();
-        tracing::info!(total = profiles.len(), enabled = enabled_count, "loaded profiles");
+        tracing::info!(
+            total = profiles.len(),
+            enabled = enabled_count,
+            "loaded profiles"
+        );
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {

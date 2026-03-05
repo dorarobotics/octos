@@ -260,10 +260,7 @@ impl Tool for ProviderMetricsTool {
 
         match self
             .ctx
-            .get(&format!(
-                "/api/admin/profiles/{}/metrics",
-                input.profile_id
-            ))
+            .get(&format!("/api/admin/profiles/{}/metrics", input.profile_id))
             .await
         {
             Ok(metrics) => Ok(ToolResult {
@@ -401,9 +398,15 @@ impl Tool for SystemMetricsTool {
                 let mut out = String::new();
 
                 if let Some(cpu) = data.get("cpu") {
-                    let usage = cpu.get("usage_percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let usage = cpu
+                        .get("usage_percent")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
                     let cores = cpu.get("core_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let brand = cpu.get("brand").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let brand = cpu
+                        .get("brand")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     out.push_str(&format!("CPU: {brand}\n"));
                     out.push_str(&format!("  Usage: {usage:.1}% ({cores} cores)\n"));
                 }
@@ -411,8 +414,15 @@ impl Tool for SystemMetricsTool {
                 if let Some(mem) = data.get("memory") {
                     let total = mem.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                     let used = mem.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let avail = mem.get("available_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                    let avail = mem
+                        .get("available_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let pct = if total > 0 {
+                        (used as f64 / total as f64) * 100.0
+                    } else {
+                        0.0
+                    };
                     out.push_str(&format!(
                         "\nMemory: {:.1} GB used / {:.1} GB total ({pct:.0}%)\n",
                         used as f64 / 1_073_741_824.0,
@@ -425,7 +435,10 @@ impl Tool for SystemMetricsTool {
                 }
 
                 if let Some(swap) = data.get("swap") {
-                    let total = swap.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let total = swap
+                        .get("total_bytes")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let used = swap.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                     if total > 0 {
                         out.push_str(&format!(
@@ -442,8 +455,15 @@ impl Tool for SystemMetricsTool {
                         let mount = d.get("mount_point").and_then(|v| v.as_str()).unwrap_or("?");
                         let total = d.get("total_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
                         let used = d.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let avail = d.get("available_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                        let avail = d
+                            .get("available_bytes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let pct = if total > 0 {
+                            (used as f64 / total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
                         out.push_str(&format!(
                             "  {mount}: {:.1} GB used / {:.1} GB total ({pct:.0}%), {:.1} GB free\n",
                             used as f64 / 1_073_741_824.0,
@@ -456,8 +476,14 @@ impl Tool for SystemMetricsTool {
                 if let Some(plat) = data.get("platform") {
                     let host = plat.get("hostname").and_then(|v| v.as_str()).unwrap_or("?");
                     let os = plat.get("os").and_then(|v| v.as_str()).unwrap_or("?");
-                    let ver = plat.get("os_version").and_then(|v| v.as_str()).unwrap_or("?");
-                    let uptime = plat.get("uptime_secs").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let ver = plat
+                        .get("os_version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let uptime = plat
+                        .get("uptime_secs")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
                     out.push_str(&format!("\nPlatform: {os} {ver} ({host})\n"));
                     out.push_str(&format!("  Uptime: {}\n", format_duration(uptime)));
                 }

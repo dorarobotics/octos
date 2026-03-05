@@ -73,7 +73,7 @@ impl SkillsLoader {
                 Err(e) => {
                     return Err(e).wrap_err_with(|| {
                         format!("failed to read skills directory: {}", skills_dir.display())
-                    })
+                    });
                 }
             };
 
@@ -111,9 +111,7 @@ impl SkillsLoader {
             match tokio::fs::read_to_string(&skill_file).await {
                 Ok(content) => return Ok(Some(strip_frontmatter(&content))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(e).wrap_err_with(|| format!("failed to read skill: {name}"))
-                }
+                Err(e) => return Err(e).wrap_err_with(|| format!("failed to read skill: {name}")),
             }
         }
 

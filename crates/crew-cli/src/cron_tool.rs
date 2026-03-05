@@ -229,7 +229,9 @@ impl CronTool {
         };
 
         let name = input.name.unwrap_or_else(|| "unnamed".into());
-        let job = self.service.add_job_with_tz(name, schedule, payload, input.timezone)?;
+        let job = self
+            .service
+            .add_job_with_tz(name, schedule, payload, input.timezone)?;
 
         Ok(ToolResult {
             output: format!("Created job '{}' (id: {}), {desc}.", job.name, job.id),

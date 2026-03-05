@@ -576,8 +576,7 @@ pub(crate) fn create_provider_with_api_type(
         let mut provider =
             crew_llm::anthropic::AnthropicProvider::new(&key, &m).with_base_url(&url);
         if let Some(t) = llm_timeout_secs {
-            let c = llm_connect_timeout_secs
-                .unwrap_or(crew_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+            let c = llm_connect_timeout_secs.unwrap_or(crew_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
             provider = provider.with_http_timeout(t, c);
         }
         println!(

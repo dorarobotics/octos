@@ -149,6 +149,10 @@ metrics-exporter-prometheus = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Archive extraction
+flate2 = "1"
+tar = "0.4"
+
 # Testing
 tokio-test = "0.4"
 tempfile = "3"

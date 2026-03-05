@@ -233,8 +233,8 @@ impl ProcessManager {
         }
 
         // Inject OminiX API URL for all gateways (platform-wide, not per-profile)
-        let ominix_url = std::env::var("OMINIX_API_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        let ominix_url =
+            std::env::var("OMINIX_API_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
         cmd.env("OMINIX_API_URL", &ominix_url);
 
         // Admin mode: inject CREW_SERVE_URL and CREW_ADMIN_TOKEN

@@ -80,26 +80,26 @@ impl Tool for PlatformSkillsTool {
         })
     }
     async fn execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let input: PlatformSkillsInput = serde_json::from_value(args.clone())
-            .map_err(|e| eyre::eyre!("invalid input: {e}"))?;
+        let input: PlatformSkillsInput =
+            serde_json::from_value(args.clone()).map_err(|e| eyre::eyre!("invalid input: {e}"))?;
 
         match input.action.as_str() {
-            "status" => {
-                match self.ctx.get("/api/admin/platform-skills").await {
-                    Ok(resp) => Ok(ToolResult {
-                        output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
-                        success: true,
-                        ..Default::default()
-                    }),
-                    Err(e) => Ok(ToolResult {
-                        output: format!("Failed to get platform skills status: {e}"),
-                        success: false,
-                        ..Default::default()
-                    }),
-                }
-            }
+            "status" => match self.ctx.get("/api/admin/platform-skills").await {
+                Ok(resp) => Ok(ToolResult {
+                    output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
+                    success: true,
+                    ..Default::default()
+                }),
+                Err(e) => Ok(ToolResult {
+                    output: format!("Failed to get platform skills status: {e}"),
+                    success: false,
+                    ..Default::default()
+                }),
+            },
             "health" => {
-                let name = input.name.as_deref()
+                let name = input
+                    .name
+                    .as_deref()
                     .ok_or_else(|| eyre::eyre!("'name' is required for health"))?;
                 let path = format!("/api/admin/platform-skills/{name}/health");
                 match self.ctx.get(&path).await {
@@ -119,7 +119,8 @@ impl Tool for PlatformSkillsTool {
                 let path = format!("/api/admin/platform-skills/ominix-api/{}", input.action);
                 match self.ctx.post(&path, None).await {
                     Ok(resp) => {
-                        let msg = resp.get("message")
+                        let msg = resp
+                            .get("message")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Done");
                         Ok(ToolResult {
@@ -152,7 +153,9 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             "install" => {
-                let name = input.name.as_deref()
+                let name = input
+                    .name
+                    .as_deref()
                     .ok_or_else(|| eyre::eyre!("'name' is required for install"))?;
                 let path = format!("/api/admin/platform-skills/{name}/install");
                 match self.ctx.post(&path, None).await {
@@ -169,7 +172,9 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             "remove" => {
-                let name = input.name.as_deref()
+                let name = input
+                    .name
+                    .as_deref()
                     .ok_or_else(|| eyre::eyre!("'name' is required for remove"))?;
                 let path = format!("/api/admin/platform-skills/{name}");
                 match self.ctx.delete(&path).await {
@@ -186,7 +191,11 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             "models" => {
-                match self.ctx.get("/api/admin/platform-skills/ominix-api/models").await {
+                match self
+                    .ctx
+                    .get("/api/admin/platform-skills/ominix-api/models")
+                    .await
+                {
                     Ok(resp) => Ok(ToolResult {
                         output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
                         success: true,
@@ -200,10 +209,19 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             "download_model" => {
-                let model_id = input.model_id.as_deref()
+                let model_id = input
+                    .model_id
+                    .as_deref()
                     .ok_or_else(|| eyre::eyre!("'model_id' is required for download_model"))?;
                 let body = serde_json::json!({ "model_id": model_id });
-                match self.ctx.post("/api/admin/platform-skills/ominix-api/models/download", Some(&body)).await {
+                match self
+                    .ctx
+                    .post(
+                        "/api/admin/platform-skills/ominix-api/models/download",
+                        Some(&body),
+                    )
+                    .await
+                {
                     Ok(resp) => Ok(ToolResult {
                         output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
                         success: true,
@@ -217,10 +235,19 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             "remove_model" => {
-                let model_id = input.model_id.as_deref()
+                let model_id = input
+                    .model_id
+                    .as_deref()
                     .ok_or_else(|| eyre::eyre!("'model_id' is required for remove_model"))?;
                 let body = serde_json::json!({ "model_id": model_id });
-                match self.ctx.post("/api/admin/platform-skills/ominix-api/models/remove", Some(&body)).await {
+                match self
+                    .ctx
+                    .post(
+                        "/api/admin/platform-skills/ominix-api/models/remove",
+                        Some(&body),
+                    )
+                    .await
+                {
                     Ok(resp) => Ok(ToolResult {
                         output: serde_json::to_string_pretty(&resp).unwrap_or_default(),
                         success: true,
@@ -234,7 +261,9 @@ impl Tool for PlatformSkillsTool {
                 }
             }
             other => Ok(ToolResult {
-                output: format!("Unknown action: {other}. Use: status, health, start, stop, restart, logs, models, download_model, remove_model, install, remove."),
+                output: format!(
+                    "Unknown action: {other}. Use: status, health, start, stop, restart, logs, models, download_model, remove_model, install, remove."
+                ),
                 success: false,
                 ..Default::default()
             }),

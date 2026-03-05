@@ -181,7 +181,13 @@ async fn run_status_loop(
     let word = &words[word_idx % word_count];
     let ti = tracker.input_tokens.load(Ordering::Relaxed);
     let to = tracker.output_tokens.load(Ordering::Relaxed);
-    let status_text = format_status(word, start.elapsed().as_secs(), ti, to, voice_transcript.as_deref());
+    let status_text = format_status(
+        word,
+        start.elapsed().as_secs(),
+        ti,
+        to,
+        voice_transcript.as_deref(),
+    );
 
     let msg = OutboundMessage {
         channel: channel.name().to_string(),
@@ -252,7 +258,13 @@ fn fmt_tokens(n: u32) -> String {
 
 /// Format a status message like "✦ Considering... (12s · 1.2k↑ 350↓)"
 /// With voice transcript: "✦ Considering... 🎙 what about today's weather (12s)"
-fn format_status(word: &str, elapsed_secs: u64, input_tokens: u32, output_tokens: u32, voice_transcript: Option<&str>) -> String {
+fn format_status(
+    word: &str,
+    elapsed_secs: u64,
+    input_tokens: u32,
+    output_tokens: u32,
+    voice_transcript: Option<&str>,
+) -> String {
     let has_tokens = input_tokens > 0 || output_tokens > 0;
 
     let time_part = if elapsed_secs < 3 {
@@ -311,7 +323,10 @@ mod tests {
 
     #[test]
     fn test_format_status_seconds() {
-        assert_eq!(format_status("Pondering", 15, 0, 0, None), "✦ Pondering... (15s)");
+        assert_eq!(
+            format_status("Pondering", 15, 0, 0, None),
+            "✦ Pondering... (15s)"
+        );
     }
 
     #[test]
