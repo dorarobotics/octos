@@ -19,7 +19,7 @@ use crew_bus::{
 use crew_core::{AgentId, Message, MessageRole, OutboundMessage, SessionKey};
 use crew_llm::{
     AdaptiveConfig, AdaptiveRouter, GroqTranscriber, LlmProvider, OminixClient, ProviderChain,
-    ProviderRouter, RetryProvider, Transcriber,
+    ProviderRouter, RetryProvider, SwappableProvider, Transcriber,
 };
 use crew_memory::{EpisodeStore, MemoryStore};
 use eyre::{Result, WrapErr};
@@ -240,6 +240,10 @@ impl GatewayCommand {
                 Arc::new(ProviderChain::new(providers))
             }
         };
+
+        // Wrap LLM in SwappableProvider for runtime model switching
+        let swappable = Arc::new(SwappableProvider::new(llm));
+        let llm: Arc<dyn LlmProvider> = swappable.clone();
 
         // Resolve data directory (--data-dir > $CREW_HOME > ~/.crew)
         let data_dir = super::resolve_data_dir(self.data_dir)?;
@@ -606,6 +610,13 @@ impl GatewayCommand {
             // Memory bank tools
             tools.register(crew_agent::RecallMemoryTool::new(memory_store.clone()));
             tools.register(crew_agent::SaveMemoryTool::new(memory_store.clone()));
+
+            // Runtime model switching tool
+            tools.register(crate::tools::SwitchModelTool::new(
+                swappable.clone(),
+                config.clone(),
+                self.profile.clone(),
+            ));
         }
 
         // Note: send_email tool is now provided by the system-skills package
