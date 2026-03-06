@@ -54,4 +54,6 @@ pub struct AppState {
     pub watchdog_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Monitor alerts flag (shared with Monitor task).
     pub alerts_enabled: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Persistent sysinfo instance for accurate CPU metrics across polls.
+    pub sysinfo: tokio::sync::Mutex<sysinfo::System>,
 }

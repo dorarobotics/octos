@@ -11,6 +11,7 @@ import type {
   User,
   SharedMetrics,
   MonitorStatus,
+  SystemMetrics,
 } from './types'
 
 const BASE = '/api/admin'
@@ -157,6 +158,9 @@ export const api = {
 
   gatewayStatus: (id: string) =>
     request<{ running: boolean; pid: number | null }>(`/profiles/${id}/status`),
+
+  systemMetrics: (opts?: { procs?: boolean }) =>
+    request<SystemMetrics>(`/system/metrics${opts?.procs ? '?procs=1' : ''}`),
 }
 
 // ── Auth API (public) ───────────────────────────────────────────────

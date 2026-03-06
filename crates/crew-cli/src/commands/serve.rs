@@ -213,6 +213,7 @@ impl ServeCommand {
             config_path: resolved_config_path,
             watchdog_enabled: watchdog_flag.clone(),
             alerts_enabled: alerts_flag.clone(),
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
         });
 
         // Auto-start enabled profiles

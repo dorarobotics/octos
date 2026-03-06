@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use chrono::Utc;
@@ -1034,11 +1034,14 @@ pub async fn create_sub_account(
 
 /// GET /api/admin/system/metrics — return system resource metrics (CPU, memory, disk).
 pub async fn system_metrics(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use sysinfo::{Disks, System};
 
-    let mut sys = System::new_all();
+    let include_procs = params.get("procs").map(|v| v == "1").unwrap_or(false);
+
+    let mut sys = state.sysinfo.lock().await;
     sys.refresh_all();
 
     // CPU info
@@ -1077,6 +1080,37 @@ pub async fn system_metrics(
         })
         .collect();
 
+    // Top processes (only when requested via ?procs=1)
+    let top_processes: Vec<serde_json::Value> = if include_procs {
+        let mut procs: Vec<_> = sys
+            .processes()
+            .values()
+            .map(|p| {
+                (
+                    p.pid().as_u32(),
+                    p.name().to_string_lossy().to_string(),
+                    (p.cpu_usage() * 10.0).round() / 10.0,
+                    p.memory(),
+                )
+            })
+            .collect();
+        procs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        procs.truncate(10);
+        procs
+            .into_iter()
+            .map(|(pid, name, cpu, mem)| {
+                serde_json::json!({
+                    "pid": pid,
+                    "name": name,
+                    "cpu_percent": cpu,
+                    "memory_bytes": mem,
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Platform
     let hostname = System::host_name().unwrap_or_default();
     let os_name = System::name().unwrap_or_default();
@@ -1099,6 +1133,7 @@ pub async fn system_metrics(
             "used_bytes": used_swap,
         },
         "disks": disk_info,
+        "top_processes": top_processes,
         "platform": {
             "hostname": hostname,
             "os": os_name,

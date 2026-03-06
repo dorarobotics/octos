@@ -229,3 +229,42 @@ export interface MonitorStatus {
   watchdog_enabled: boolean
   alerts_enabled: boolean
 }
+
+// ── System Metrics ─────────────────────────────────────────────────
+
+export interface SystemMetrics {
+  cpu: {
+    usage_percent: number
+    core_count: number
+    brand: string
+  }
+  memory: {
+    total_bytes: number
+    used_bytes: number
+    available_bytes: number
+  }
+  swap: {
+    total_bytes: number
+    used_bytes: number
+  }
+  disks: {
+    name: string
+    mount_point: string
+    total_bytes: number
+    available_bytes: number
+    used_bytes: number
+    file_system: string
+  }[]
+  top_processes: {
+    pid: number
+    name: string
+    cpu_percent: number
+    memory_bytes: number
+  }[]
+  platform: {
+    hostname: string
+    os: string
+    os_version: string
+    uptime_secs: number
+  }
+}
