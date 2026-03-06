@@ -9,8 +9,12 @@
 //! primary  = "(" expr ")"
 //!          | "outcome.status" ("==" | "!=") STRING
 //!          | "outcome.contains(" STRING ")"
-//!          | STRING   // bare literal, compared to outcome.content
+//!          | "context." IDENT ("==" | "!=") STRING
 //! ```
+//!
+//! Context variable semantics:
+//! - `context.key == "val"` → `false` if key is missing (conservative)
+//! - `context.key != "val"` → `true` if key is missing (open-world assumption)
 
 use eyre::Result;
 
@@ -151,14 +155,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             b'"' => {
                 i += 1;
-                let start = i;
+                let mut s = String::new();
                 while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip escaped char
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1; // skip backslash
+                        match bytes[i] {
+                            b'n' => s.push('\n'),
+                            b't' => s.push('\t'),
+                            b'\\' => s.push('\\'),
+                            b'"' => s.push('"'),
+                            c => {
+                                s.push('\\');
+                                s.push(c as char);
+                            }
+                        }
+                    } else {
+                        s.push(bytes[i] as char);
                     }
                     i += 1;
                 }
-                let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
                 tokens.push(Token::StringLit(s));
                 if i < bytes.len() {
                     i += 1; // skip closing quote
@@ -422,5 +437,24 @@ mod tests {
 
         let o_fail = outcome(OutcomeStatus::Fail, "");
         assert!(!evaluate_with_context(&expr, &o_fail, &ctx));
+    }
+
+    #[test]
+    fn test_string_escape_handling() {
+        // Escaped quotes inside strings should be handled correctly
+        let expr = parse_condition(r#"outcome.contains("say \"hello\"")"#).unwrap();
+        assert!(evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, r#"please say "hello" now"#)
+        ));
+    }
+
+    #[test]
+    fn test_backslash_escape_sequences() {
+        let expr = parse_condition(r#"outcome.contains("line1\nline2")"#).unwrap();
+        assert!(evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, "line1\nline2")
+        ));
     }
 }

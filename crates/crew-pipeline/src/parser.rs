@@ -370,14 +370,15 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
 
 /// Parse a duration string like "900s", "15m", "2h" into seconds.
 /// Falls back to plain integer parsing (interpreted as seconds).
+/// Returns `None` on overflow or unrecognized format.
 fn parse_duration_secs(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix('s') {
         n.trim().parse::<u64>().ok()
     } else if let Some(n) = s.strip_suffix('m') {
-        n.trim().parse::<u64>().ok().map(|v| v * 60)
+        n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(60))
     } else if let Some(n) = s.strip_suffix('h') {
-        n.trim().parse::<u64>().ok().map(|v| v * 3600)
+        n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(3600))
     } else {
         s.parse::<u64>().ok()
     }
@@ -634,6 +635,13 @@ mod tests {
         assert_eq!(parse_duration_secs("15m"), Some(900));
         assert_eq!(parse_duration_secs("2h"), Some(7200));
         assert_eq!(parse_duration_secs("bad"), None);
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        // Huge values should return None via checked_mul, not wrap
+        assert_eq!(parse_duration_secs("9999999999999999999h"), None);
+        assert_eq!(parse_duration_secs("9999999999999999999m"), None);
     }
 
     #[test]

@@ -40,8 +40,11 @@ pub fn truncate_head_tail(s: &str, max_len: usize, head_ratio: f32) -> String {
     }
 
     let head_ratio = head_ratio.clamp(0.1, 0.9);
-    let separator = "\n\n... [output truncated] ...\n\n";
-    let available = max_len.saturating_sub(separator.len());
+
+    // Estimate separator overhead conservatively (handles large omitted counts)
+    // "\n\n... [99999 bytes omitted] ...\n\n" is ~40 bytes max
+    let sep_overhead = 50;
+    let available = max_len.saturating_sub(sep_overhead);
     let head_budget = (available as f32 * head_ratio) as usize;
     let tail_budget = available.saturating_sub(head_budget);
 

@@ -30,6 +30,12 @@ impl LoopDetector {
         let sig = Self::signature(tool_name, args);
         self.signatures.push(sig);
 
+        // Trim to bounded size (actual ring buffer behavior)
+        if self.signatures.len() > self.window * 2 {
+            let drain_to = self.signatures.len() - self.window;
+            self.signatures.drain(..drain_to);
+        }
+
         // Only check once we have enough history
         if self.signatures.len() < 4 {
             return None;
