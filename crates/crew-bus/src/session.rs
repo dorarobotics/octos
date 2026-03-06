@@ -13,6 +13,19 @@ use tracing::{debug, warn};
 /// Current schema version for session JSONL files.
 const CURRENT_SESSION_SCHEMA: u32 = 1;
 
+/// FNV-1a 64-bit hash — deterministic across Rust versions (unlike DefaultHasher).
+/// Used for session filename suffixes on truncated keys.
+fn fnv1a_64(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn default_session_schema() -> u32 {
     CURRENT_SESSION_SCHEMA
 }
@@ -201,11 +214,10 @@ impl SessionManager {
             }
         }
         if truncated {
-            // Append 8-char hex hash of full key to prevent collisions
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.0.hash(&mut hasher);
-            let hash = hasher.finish();
+            // Append 16-char hex hash of full key to prevent collisions.
+            // Uses FNV-1a (stable across Rust versions) instead of DefaultHasher
+            // (which wraps SipHash and is NOT guaranteed stable across toolchain upgrades).
+            let hash = fnv1a_64(key.0.as_bytes());
             safe_name.push_str(&format!("_{hash:016X}"));
         }
         self.sessions_dir.join(format!("{safe_name}.jsonl"))

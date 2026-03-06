@@ -344,12 +344,14 @@ impl GatewayCommand {
         // Initialize skills loader (project-level, from cwd/.crew/)
         let project_dir = cwd.join(".crew");
 
-        // Bootstrap bundled app-skill binaries into .crew/skills/
-        let skills_dir = project_dir.join("skills");
-        std::fs::create_dir_all(&skills_dir).ok();
-        let n = crew_agent::bootstrap::bootstrap_bundled_skills(&skills_dir);
+        // Bootstrap bundled app-skills and platform skills into layered dirs
+        let n = crew_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
         if n > 0 {
             info!(count = n, "bootstrapped bundled app-skills");
+        }
+        let n = crew_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        if n > 0 {
+            info!(count = n, "bootstrapped platform skills");
         }
 
         // Log voice API status
@@ -377,7 +379,12 @@ impl GatewayCommand {
             extra_skills_dirs.push(project_dir.clone());
         }
 
-        // Skills priority: sub-account data_dir > parent profile data_dir > global .crew/
+        // Skills priority (highest first):
+        //   1. Profile skills (data_dir/skills or sub-account/skills)
+        //   2. Parent profile skills (if sub-account)
+        //   3. Global profile skills (project_dir/skills)
+        //   4. Bundled app-skills (project_dir/bundled-app-skills)
+        //   5. Platform skills (project_dir/platform-skills)
         let skills_loader = if data_dir != project_dir {
             let mut loader = SkillsLoader::new(&data_dir);
             for dir in &extra_skills_dirs {
@@ -387,6 +394,13 @@ impl GatewayCommand {
         } else {
             SkillsLoader::new(&project_dir)
         };
+        // Add shared layered dirs (lower priority than profile skills)
+        let mut skills_loader = skills_loader;
+        skills_loader.add_skills_path(
+            project_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR),
+        );
+        skills_loader
+            .add_skills_path(project_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR));
 
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
@@ -1090,8 +1104,12 @@ impl GatewayCommand {
         let concurrency_semaphore = Arc::new(Semaphore::new(gw_config.max_concurrent_sessions));
 
         // Create ActorRegistry for per-session dispatch
-        let mut actor_registry =
-            ActorRegistry::new(actor_factory, concurrency_semaphore, out_tx.clone(), pending_messages.clone());
+        let mut actor_registry = ActorRegistry::new(
+            actor_factory,
+            concurrency_semaphore,
+            out_tx.clone(),
+            pending_messages.clone(),
+        );
 
         // Drop the original out_tx — factory and registry hold their own clones.
         // This ensures the outbound channel closes properly when actors shut down.
@@ -1345,9 +1363,7 @@ impl GatewayCommand {
 
                     // Flush any buffered messages from this session
                     let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
-                    actor_registry
-                        .flush_pending(&target_key.to_string())
-                        .await;
+                    actor_registry.flush_pending(&target_key.to_string()).await;
                 } else if let Err(reason) = validate_topic_name(name) {
                     let msg = OutboundMessage {
                         channel: reply_channel.clone(),
@@ -1395,9 +1411,7 @@ impl GatewayCommand {
                     let _ = agent_handle.send_outbound(msg).await;
 
                     // Flush any buffered messages from this session
-                    actor_registry
-                        .flush_pending(&new_key.to_string())
-                        .await;
+                    actor_registry.flush_pending(&new_key.to_string()).await;
                 }
                 continue;
             }
@@ -1461,14 +1475,9 @@ impl GatewayCommand {
                         let _ = agent_handle.send_outbound(msg).await;
 
                         // Flush any buffered messages from the target session
-                        let target_key = SessionKey::with_topic(
-                            &inbound.channel,
-                            &inbound.chat_id,
-                            &topic,
-                        );
-                        actor_registry
-                            .flush_pending(&target_key.to_string())
-                            .await;
+                        let target_key =
+                            SessionKey::with_topic(&inbound.channel, &inbound.chat_id, &topic);
+                        actor_registry.flush_pending(&target_key.to_string()).await;
                     }
                     Ok(None) => {
                         let msg = OutboundMessage {

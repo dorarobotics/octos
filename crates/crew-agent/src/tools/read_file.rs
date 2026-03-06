@@ -83,6 +83,24 @@ impl Tool for ReadFileTool {
             }
         };
 
+        // Reject files larger than 10MB to prevent OOM (output is capped to 100KB
+        // anyway, and reading a multi-GB file just to slice a few lines is wasteful).
+        const MAX_FILE_BYTES: u64 = 10_000_000;
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) if meta.len() > MAX_FILE_BYTES => {
+                return Ok(ToolResult {
+                    output: format!(
+                        "File too large ({} bytes, max {}). Use start_line/end_line on smaller files.",
+                        meta.len(),
+                        MAX_FILE_BYTES
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+
         // Read file (O_NOFOLLOW atomically rejects symlinks, no TOCTOU race)
         let content = match super::read_no_follow(&path).await {
             Ok(c) => c,

@@ -146,9 +146,12 @@ impl Tool for VoiceSynthesizeTool {
         let m4a_path = media_dir.join(format!("tts_{timestamp}.m4a"));
         let output_path = match tokio::process::Command::new("afconvert")
             .args([
-                "-f", "m4af",
-                "-d", "aac",
-                "-s", "3",
+                "-f",
+                "m4af",
+                "-d",
+                "aac",
+                "-s",
+                "3",
                 wav_path.to_str().unwrap_or_default(),
                 m4a_path.to_str().unwrap_or_default(),
             ])
@@ -225,9 +228,7 @@ impl Tool for VoiceSynthesizeTool {
                 .map_err(|e| eyre::eyre!("failed to send TTS audio: {e}"))?;
 
             Ok(ToolResult {
-                output: format!(
-                    "Audio sent ({duration:.1}s, voice={voice}): {output_path_str}"
-                ),
+                output: format!("Audio sent ({duration:.1}s, voice={voice}): {output_path_str}"),
                 success: true,
                 ..Default::default()
             })

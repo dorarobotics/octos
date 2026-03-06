@@ -234,9 +234,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(webhook_proxy::twilio_webhook_proxy),
         );
 
-    // Unauthenticated routes (metrics + static files + auth endpoints + webhook proxy)
+    // Metrics route — protected when auth is configured, public otherwise
+    let metrics_route = Router::new().route("/metrics", get(metrics::metrics_handler));
+    let metrics_route = if has_auth {
+        metrics_route.layer(middleware::from_fn_with_state(
+            state.clone(),
+            user_auth_middleware,
+        ))
+    } else {
+        metrics_route
+    };
+
+    // Unauthenticated routes (static files + auth endpoints + webhook proxy)
     let public = Router::new()
-        .route("/metrics", get(metrics::metrics_handler))
+        .merge(metrics_route)
         .merge(auth_api)
         .merge(webhook_routes);
 

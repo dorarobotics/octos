@@ -1359,10 +1359,9 @@ pub async fn install_platform_skill(
         StatusCode::SERVICE_UNAVAILABLE,
         "admin not configured".into(),
     ))?;
-    let skills_dir = store.crew_home_dir().join("skills");
-    std::fs::create_dir_all(&skills_dir).ok();
+    let crew_home = store.crew_home_dir();
 
-    if crew_agent::bootstrap::bootstrap_single_skill(&skills_dir, &name) {
+    if crew_agent::bootstrap::bootstrap_single_skill(&crew_home, &name) {
         Ok(Json(ActionResponse {
             ok: true,
             message: Some(format!("Platform skill '{name}' installed")),

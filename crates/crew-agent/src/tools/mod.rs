@@ -260,9 +260,9 @@ pub(crate) mod site_crawl;
 pub mod spawn;
 pub mod synthesize_research;
 pub mod take_photo;
+pub mod voice_synthesize;
 pub mod web_fetch;
 pub mod web_search;
-pub mod voice_synthesize;
 pub mod write_file;
 
 pub mod admin;

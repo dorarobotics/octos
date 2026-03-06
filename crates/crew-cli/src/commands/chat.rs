@@ -216,11 +216,13 @@ impl ChatCommand {
         // Bootstrap bundled app-skill binaries (deep_search, deep_crawl, etc.)
         // Must happen BEFORE plugin loading so PluginLoader picks them up.
         let project_dir = cwd.join(".crew");
-        let skills_dir = project_dir.join("skills");
-        std::fs::create_dir_all(&skills_dir).ok();
-        let n = crew_agent::bootstrap::bootstrap_bundled_skills(&skills_dir);
+        let n = crew_agent::bootstrap::bootstrap_bundled_skills(&project_dir);
         if n > 0 {
             eprintln!("Bootstrapped {n} app-skills");
+        }
+        let n = crew_agent::bootstrap::bootstrap_platform_skills(&project_dir);
+        if n > 0 {
+            eprintln!("Bootstrapped {n} platform skills");
         }
 
         // Load plugins (includes app-skills from .crew/skills/)

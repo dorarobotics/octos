@@ -237,6 +237,11 @@ impl ActorRegistry {
     pub fn len(&self) -> usize {
         self.actors.len()
     }
+
+    /// Whether there are no active actors.
+    pub fn is_empty(&self) -> bool {
+        self.actors.is_empty()
+    }
 }
 
 // ── ActorFactory ────────────────────────────────────────────────────────────
@@ -495,9 +500,7 @@ async fn outbound_forwarder(
                     .send(OutboundMessage {
                         channel: channel.clone(),
                         chat_id: chat_id.clone(),
-                        content: format!(
-                            "📌 {topic_label} finished. /s {topic_label} to view."
-                        ),
+                        content: format!("📌 {topic_label} finished. /s {topic_label} to view."),
                         reply_to: None,
                         media: vec![],
                         metadata: serde_json::json!({}),

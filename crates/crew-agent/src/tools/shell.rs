@@ -112,9 +112,15 @@ impl Tool for ShellTool {
                 });
             }
             Decision::Ask => {
-                tracing::info!(command = %input.command, "command requires approval");
-                // In a real implementation, this would prompt the user
-                // For now, we log and allow (coordinator can intercept)
+                tracing::warn!(command = %input.command, "command requires approval — denied (no interactive approval available)");
+                return Ok(ToolResult {
+                    output: format!(
+                        "Command requires approval and was denied: {}\n\nThis command matches a potentially dangerous pattern (e.g. sudo, rm -rf, git push --force). It cannot be executed without interactive approval.",
+                        input.command
+                    ),
+                    success: false,
+                    ..Default::default()
+                });
             }
             Decision::Allow => {}
         }
@@ -263,5 +269,17 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.output.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_command_denied_without_approval() {
+        let tool = ShellTool::new("/tmp");
+        // sudo triggers Ask, which must be denied (no interactive approval)
+        let result = tool
+            .execute(&serde_json::json!({"command": "sudo ls"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("requires approval"));
     }
 }

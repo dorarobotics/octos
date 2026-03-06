@@ -60,6 +60,7 @@ fn version_string() -> &'static str {
     };
 
     // Leak a formatted string so we get a &'static str for clap
+    #[allow(clippy::const_is_empty)]
     if GIT_HASH.is_empty() {
         VERSION
     } else {

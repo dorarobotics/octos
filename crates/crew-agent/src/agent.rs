@@ -1219,8 +1219,9 @@ impl Agent {
         usage: TokenUsage,
         files_modified: Vec<std::path::PathBuf>,
     ) -> TaskResult {
+        let success = response.stop_reason != StopReason::MaxTokens;
         TaskResult {
-            success: true,
+            success,
             output: response.content.clone().unwrap_or_default(),
             files_modified,
             subtasks: Vec::new(),

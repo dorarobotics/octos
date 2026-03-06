@@ -452,7 +452,7 @@ fn parts_compatible(existing: &[GeminiPart], new: &[GeminiPart]) -> bool {
         .any(|p| matches!(p, GeminiPart::Text { .. } | GeminiPart::InlineData { .. }));
 
     // Don't merge if one side has functionResponse and the other has text
-    !(existing_has_func_response && new_has_text || existing_has_text && new_has_func_response)
+    !((existing_has_func_response && new_has_text) || (existing_has_text && new_has_func_response))
 }
 
 fn build_user_parts(msg: &Message) -> Vec<GeminiPart> {

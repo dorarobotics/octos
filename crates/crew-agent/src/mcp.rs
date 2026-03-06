@@ -418,6 +418,12 @@ impl McpClient {
             .as_deref()
             .ok_or_else(|| eyre::eyre!("MCP HTTP server requires 'url' field"))?;
 
+        // Validate URL against SSRF before connecting to prevent reaching
+        // internal endpoints through MCP config.
+        if let Some(msg) = crate::tools::ssrf::check_ssrf(url).await {
+            eyre::bail!("MCP HTTP server URL blocked by SSRF policy: {msg}");
+        }
+
         let conn = McpConnection::Http(HttpMcpConnection {
             client: reqwest::Client::new(),
             url: url.to_string(),
@@ -429,9 +435,42 @@ impl McpClient {
         initialize_and_list_tools(conn).await
     }
 
+    /// Built-in tool names that MCP tools must not shadow.
+    const PROTECTED_NAMES: &[&str] = &[
+        "shell",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "diff_edit",
+        "glob",
+        "grep",
+        "list_dir",
+        "web_search",
+        "web_fetch",
+        "browser",
+        "git",
+        "message",
+        "send_file",
+        "spawn",
+        "voice_synthesize",
+        "save_memory",
+        "recall_memory",
+        "configure_tool",
+    ];
+
     /// Register all discovered MCP tools into the given registry.
+    ///
+    /// Tools whose names collide with built-in tool names are rejected to prevent
+    /// a remote MCP server from silently replacing core functionality.
     pub fn register_tools(self, registry: &mut ToolRegistry) {
         for spec in self.tools {
+            if Self::PROTECTED_NAMES.contains(&spec.name.as_str()) {
+                warn!(
+                    tool = spec.name,
+                    "MCP tool name collides with built-in tool, skipping"
+                );
+                continue;
+            }
             registry.register(McpTool {
                 name: spec.name,
                 description: spec.description,
@@ -675,9 +714,6 @@ mod tests {
 
     #[test]
     fn test_validate_schema_at_max_depth() {
-        // Build a nested object exactly at depth 10.
-        // Each wrapping adds 1 level: the leaf {"type":"string"} adds 2
-        // (object level + scalar value level), so 9 wrappings -> depth 10.
         let mut schema = serde_json::json!({"type": "string"});
         for _ in 0..9 {
             schema = serde_json::json!({"nested": schema});
@@ -687,7 +723,6 @@ mod tests {
 
     #[test]
     fn test_validate_schema_exceeds_max_depth() {
-        // Build a nested object at depth 11 (exceeds MAX_SCHEMA_DEPTH=10)
         let mut schema = serde_json::json!({"type": "string"});
         for _ in 0..11 {
             schema = serde_json::json!({"nested": schema});
@@ -697,7 +732,6 @@ mod tests {
 
     #[test]
     fn test_validate_schema_array_depth() {
-        // Arrays also contribute to depth
         let mut schema = serde_json::json!({"type": "string"});
         for _ in 0..11 {
             schema = serde_json::json!([schema]);
@@ -707,7 +741,6 @@ mod tests {
 
     #[test]
     fn test_validate_schema_exceeds_max_size() {
-        // Build a schema larger than 64KB
         let mut props = serde_json::Map::new();
         for i in 0..2000 {
             props.insert(
@@ -769,7 +802,6 @@ mod tests {
     fn test_jsonrpc_response_null_result() {
         let json = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
         let resp: JsonRpcResponse = serde_json::from_str(json).unwrap();
-        // serde deserializes `null` as None for Option<Value>
         assert!(resp.result.is_none());
     }
 
@@ -824,7 +856,6 @@ mod tests {
 
     #[test]
     fn test_blocked_env_vars_filtering_logic() {
-        // Reproduce the filtering logic from start_stdio_server
         let env: HashMap<String, String> = [
             ("SAFE_VAR".into(), "ok".into()),
             ("LD_PRELOAD".into(), "evil.so".into()),
@@ -858,5 +889,18 @@ mod tests {
                 .any(|blocked| key.eq_ignore_ascii_case(blocked)),
             "filtering should be case-insensitive"
         );
+    }
+
+    // --- Protected names ---
+
+    #[test]
+    fn test_protected_names_coverage() {
+        let names = McpClient::PROTECTED_NAMES;
+        assert!(!names.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            assert!(!name.is_empty());
+            assert!(seen.insert(name), "duplicate protected name: {name}");
+        }
     }
 }

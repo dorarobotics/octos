@@ -40,11 +40,20 @@ impl SkillsLoader {
         }
     }
 
-    /// Add an additional skills directory. Skills from earlier-added directories
-    /// take priority over later ones.
+    /// Add an additional skills directory (appends `/skills` to the given dir).
+    /// Skills from earlier-added directories take priority over later ones.
     pub fn add_skills_dir(&mut self, dir: impl AsRef<Path>) {
         let path = dir.as_ref().join("skills");
         // Avoid duplicates
+        if !self.skills_dirs.contains(&path) {
+            self.skills_dirs.push(path);
+        }
+    }
+
+    /// Add a raw skills directory path (no `/skills` suffix appended).
+    /// Used for layered dirs like `platform-skills/` and `bundled-app-skills/`.
+    pub fn add_skills_path(&mut self, path: impl AsRef<Path>) {
+        let path = path.as_ref().to_path_buf();
         if !self.skills_dirs.contains(&path) {
             self.skills_dirs.push(path);
         }

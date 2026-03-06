@@ -109,35 +109,79 @@ impl Tool for WebFetchTool {
             });
         }
 
-        // Block requests to private/internal hosts (SSRF protection)
-        if let Ok(url) = reqwest::Url::parse(&input.url) {
-            if let Some(host) = url.host_str() {
-                // Check hostname string first (catches literal IPs and "localhost")
-                if super::ssrf::is_private_host(host) {
-                    return Ok(ToolResult {
-                        output: "Requests to private/internal hosts are not allowed".to_string(),
-                        success: false,
-                        ..Default::default()
-                    });
-                }
-
-                // Resolve DNS and check resolved IPs (prevents DNS rebinding)
-                let port = url.port_or_known_default().unwrap_or(443);
-                if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-                    for addr in addrs {
-                        if super::ssrf::is_private_ip(&addr.ip()) {
-                            return Ok(ToolResult {
-                                output: "Requests to private/internal hosts are not allowed (DNS resolved to private IP)".to_string(),
-                                success: false,
-                                ..Default::default()
-                            });
-                        }
-                    }
-                }
+        // Block requests to private/internal hosts (SSRF protection).
+        // We resolve DNS, reject private IPs, then pin the resolved address
+        // via reqwest's `resolve()` so the actual connection uses the same IP
+        // we validated (prevents DNS rebinding / TOCTOU attacks).
+        let parsed_url = match reqwest::Url::parse(&input.url) {
+            Ok(u) => u,
+            Err(_) => {
+                return Ok(ToolResult {
+                    output: "Invalid URL".to_string(),
+                    success: false,
+                    ..Default::default()
+                });
             }
+        };
+        let host = match parsed_url.host_str() {
+            Some(h) => h.to_string(),
+            None => {
+                return Ok(ToolResult {
+                    output: "URL has no host".to_string(),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        };
+
+        // Check hostname string first (catches literal IPs and "localhost")
+        if super::ssrf::is_private_host(&host) {
+            return Ok(ToolResult {
+                output: "Requests to private/internal hosts are not allowed".to_string(),
+                success: false,
+                ..Default::default()
+            });
         }
 
-        let response = match self.client.get(&input.url).send().await {
+        // Resolve DNS, filter private IPs, and pin the first safe address
+        let port = parsed_url.port_or_known_default().unwrap_or(443);
+        let pinned_addr = match tokio::net::lookup_host(format!("{host}:{port}")).await {
+            Ok(addrs) => {
+                let mut safe_addr = None;
+                for addr in addrs {
+                    if super::ssrf::is_private_ip(&addr.ip()) {
+                        return Ok(ToolResult {
+                            output: "Requests to private/internal hosts are not allowed (DNS resolved to private IP)".to_string(),
+                            success: false,
+                            ..Default::default()
+                        });
+                    }
+                    if safe_addr.is_none() {
+                        safe_addr = Some(addr);
+                    }
+                }
+                safe_addr
+            }
+            Err(_) => None,
+        };
+
+        // Build a per-request client with the DNS resolution pinned to prevent
+        // TOCTOU: the TLS handshake and HTTP request use the exact IP we checked.
+        let client = if let Some(addr) = pinned_addr {
+            match Client::builder()
+                .timeout(Duration::from_secs(30))
+                .user_agent("crew-rs/0.1 (web-fetch-tool)")
+                .resolve(&host, addr)
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => self.client.clone(),
+            }
+        } else {
+            self.client.clone()
+        };
+
+        let response = match client.get(&input.url).send().await {
             Ok(r) => r,
             Err(e) => {
                 return Ok(ToolResult {
@@ -165,10 +209,33 @@ impl Tool for WebFetchTool {
             });
         }
 
-        let body = response
-            .text()
-            .await
-            .wrap_err("failed to read response body")?;
+        // Cap response body to prevent OOM on huge responses.
+        // Reject early if Content-Length exceeds limit, then stream-read
+        // up to MAX_BODY_BYTES to avoid buffering unbounded data.
+        const MAX_BODY_BYTES: usize = 5_000_000;
+        if let Some(len) = response.content_length() {
+            if len > MAX_BODY_BYTES as u64 {
+                return Ok(ToolResult {
+                    output: format!("Response too large ({} bytes, max {})", len, MAX_BODY_BYTES),
+                    success: false,
+                    ..Default::default()
+                });
+            }
+        }
+        let body = {
+            let mut buf = Vec::with_capacity(MAX_BODY_BYTES.min(256_000));
+            let mut stream = response.bytes_stream();
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.wrap_err("error reading response stream")?;
+                buf.extend_from_slice(&chunk);
+                if buf.len() > MAX_BODY_BYTES {
+                    buf.truncate(MAX_BODY_BYTES);
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        };
 
         let is_html = content_type.contains("text/html");
         let mut content = if is_html {
