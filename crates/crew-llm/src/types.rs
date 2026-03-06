@@ -38,6 +38,19 @@ pub enum StopReason {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens used for internal chain-of-thought (o1/o3, Claude thinking, Gemini thinking).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u32,
+    /// Tokens served from provider cache (Anthropic cache_control, OpenAI automatic).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u32,
+    /// Tokens written to provider cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Tool specification for LLM.

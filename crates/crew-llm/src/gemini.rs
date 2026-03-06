@@ -184,6 +184,7 @@ impl LlmProvider for GeminiProvider {
             usage: TokenUsage {
                 input_tokens: usage.prompt_token_count,
                 output_tokens: usage.candidates_token_count,
+                ..Default::default()
             },
         })
     }
@@ -644,6 +645,7 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
             events.push(StreamEvent::Usage(TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
+                ..Default::default()
             }));
         }
     }

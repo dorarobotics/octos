@@ -12,6 +12,7 @@ pub mod bootstrap;
 pub mod builtin_skills;
 pub mod bundled_app_skills;
 mod compaction;
+pub mod loop_detect;
 pub mod hooks;
 pub mod mcp;
 pub mod plugins;

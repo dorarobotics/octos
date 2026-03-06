@@ -331,6 +331,7 @@ impl LlmProvider for OpenAIProvider {
             usage: TokenUsage {
                 input_tokens: api_response.usage.prompt_tokens,
                 output_tokens: api_response.usage.completion_tokens,
+                ..Default::default()
             },
         })
     }
@@ -649,6 +650,7 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         events.push(StreamEvent::Usage(TokenUsage {
             input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            ..Default::default()
         }));
     }
 
