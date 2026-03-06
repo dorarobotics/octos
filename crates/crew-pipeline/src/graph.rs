@@ -128,6 +128,20 @@ impl HandlerKind {
             _ => None,
         }
     }
+
+    /// Resolve handler from DOT `shape` attribute (Attractor spec mapping).
+    pub fn from_shape(shape: &str) -> Option<Self> {
+        match shape {
+            "Mdiamond" => Some(Self::Noop),             // start node
+            "Msquare" => Some(Self::Noop),              // exit node
+            "box" => Some(Self::Codergen),              // LLM task (default)
+            "hexagon" => Some(Self::Gate),              // human gate / conditional
+            "diamond" => Some(Self::Gate),              // conditional routing
+            "component" => Some(Self::Parallel),        // parallel fan-out
+            "parallelogram" => Some(Self::Shell),       // external tool/command
+            _ => None,
+        }
+    }
 }
 
 /// The outcome of executing a single pipeline node.

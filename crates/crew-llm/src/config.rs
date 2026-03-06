@@ -17,6 +17,20 @@ pub struct ChatConfig {
     /// Stop sequences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
+    /// Reasoning effort for thinking models (low/medium/high).
+    /// Maps to provider-specific parameters (OpenAI reasoning.effort,
+    /// Anthropic thinking budget, Gemini thinkingConfig).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Reasoning effort level for thinking/reasoning models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
 }
 
 impl Default for ChatConfig {
@@ -26,6 +40,7 @@ impl Default for ChatConfig {
             temperature: Some(0.0),
             tool_choice: ToolChoice::Auto,
             stop_sequences: Vec::new(),
+            reasoning_effort: None,
         }
     }
 }
@@ -71,6 +86,7 @@ mod tests {
             temperature: Some(0.7),
             tool_choice: ToolChoice::Required,
             stop_sequences: vec!["STOP".to_string()],
+            reasoning_effort: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -87,6 +103,7 @@ mod tests {
             temperature: None,
             tool_choice: ToolChoice::Auto,
             stop_sequences: vec![],
+            reasoning_effort: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());

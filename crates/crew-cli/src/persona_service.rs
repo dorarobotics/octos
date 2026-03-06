@@ -217,6 +217,7 @@ impl PersonaService {
             temperature: Some(0.7),
             tool_choice: ToolChoice::None,
             stop_sequences: vec![],
+            reasoning_effort: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {
@@ -372,6 +373,7 @@ impl PersonaService {
             temperature: Some(0.9),
             tool_choice: ToolChoice::None,
             stop_sequences: vec![],
+            reasoning_effort: None,
         };
 
         match self.llm.chat(&messages, &[], &config).await {

@@ -156,6 +156,7 @@ impl DeepResearchTool {
         let usage = TokenUsage {
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
+            ..Default::default()
         };
 
         // Try content first, then reasoning_content (reasoning models like kimi-k2.5
@@ -861,6 +862,7 @@ mod tests {
                 usage: crew_llm::TokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }

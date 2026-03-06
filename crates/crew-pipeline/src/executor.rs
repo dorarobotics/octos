@@ -145,6 +145,7 @@ async fn plan_dynamic_tasks(
     let usage = TokenUsage {
         input_tokens: response.usage.input_tokens,
         output_tokens: response.usage.output_tokens,
+        ..Default::default()
     };
 
     // Try content first, then reasoning_content (for reasoning models like kimi-k2.5)
@@ -1201,6 +1202,7 @@ mod tests {
                 usage: crew_llm::TokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }

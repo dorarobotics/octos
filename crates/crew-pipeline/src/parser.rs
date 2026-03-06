@@ -368,10 +368,36 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     }
 }
 
+/// Parse a duration string like "900s", "15m", "2h" into seconds.
+/// Falls back to plain integer parsing (interpreted as seconds).
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('s') {
+        n.trim().parse::<u64>().ok()
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.trim().parse::<u64>().ok().map(|v| v * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.trim().parse::<u64>().ok().map(|v| v * 3600)
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse a boolean string ("true", "false", "yes", "no", "1", "0").
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
+    // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
         .get("handler")
         .and_then(|s| HandlerKind::from_str(s))
+        .or_else(|| attrs.get("shape").and_then(|s| HandlerKind::from_shape(s)))
         .unwrap_or(HandlerKind::Codergen);
 
     let tools = attrs
@@ -387,12 +413,12 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         model: attrs.get("model").cloned(),
         context_window: attrs.get("context_window").and_then(|s| s.parse().ok()),
         tools,
-        goal_gate: attrs.get("goal_gate").is_some_and(|s| s == "true"),
+        goal_gate: attrs.get("goal_gate").and_then(|s| parse_bool(s)).unwrap_or(false),
         max_retries: attrs
             .get("max_retries")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        timeout_secs: attrs.get("timeout_secs").and_then(|s| s.parse().ok()),
+        timeout_secs: attrs.get("timeout_secs").and_then(|s| parse_duration_secs(s)),
         suggested_next: attrs.get("suggested_next").cloned(),
         converge: attrs.get("converge").cloned(),
         worker_prompt: attrs.get("worker_prompt").cloned(),
@@ -599,6 +625,56 @@ mod tests {
         assert_eq!(plan.model.as_deref(), Some("cheap"));
         assert_eq!(plan.tools, vec!["web_search", "read_file"]);
         assert_eq!(plan.timeout_secs, Some(300));
+    }
+
+    #[test]
+    fn test_parse_duration_secs() {
+        assert_eq!(parse_duration_secs("300"), Some(300));
+        assert_eq!(parse_duration_secs("900s"), Some(900));
+        assert_eq!(parse_duration_secs("15m"), Some(900));
+        assert_eq!(parse_duration_secs("2h"), Some(7200));
+        assert_eq!(parse_duration_secs("bad"), None);
+    }
+
+    #[test]
+    fn test_parse_bool_values() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("yes"), Some(true));
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("no"), Some(false));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn test_typed_duration_in_node() {
+        let dot = r#"
+            digraph test {
+                task [prompt="Do work", timeout_secs="15m"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.nodes["task"].timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn test_typed_bool_in_node() {
+        let dot = r#"
+            digraph test {
+                gate [prompt="Check", goal_gate="yes"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.nodes["gate"].goal_gate);
+
+        let dot2 = r#"
+            digraph test {
+                gate [prompt="Check", goal_gate="no"]
+            }
+        "#;
+        let graph2 = parse_dot(dot2).unwrap();
+        assert!(!graph2.nodes["gate"].goal_gate);
     }
 
     #[test]
