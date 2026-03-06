@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use eyre::{Result, WrapErr};
 
-use crate::graph::{HandlerKind, PipelineEdge, PipelineGraph, PipelineNode};
+use crate::graph::{HandlerKind, PipelineEdge, PipelineGraph, PipelineNode, Subgraph};
 
 /// Parse a DOT string into a `PipelineGraph`.
 pub fn parse_dot(input: &str) -> Result<PipelineGraph> {
@@ -52,6 +52,7 @@ impl<'a> DotParser<'a> {
             default_model: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
+            subgraphs: Vec::new(),
         };
 
         // Parse statements
@@ -106,6 +107,13 @@ impl<'a> DotParser<'a> {
             return Ok(());
         }
 
+        // Check for subgraph: `subgraph name { ... }`
+        if self.try_keyword("subgraph") {
+            self.parse_subgraph(graph)?;
+            self.skip_optional_semicolon();
+            return Ok(());
+        }
+
         // Parse an identifier (could be node or start of edge)
         let first_id = self
             .parse_identifier()
@@ -114,7 +122,7 @@ impl<'a> DotParser<'a> {
 
         // Check for edge: `->` means this is an edge
         if self.try_str("->") {
-            self.parse_edge_chain(graph, first_id)?;
+            let _ = self.parse_edge_chain(graph, first_id)?;
         } else {
             // Node declaration
             let attrs = if self.peek() == Some('[') {
@@ -130,8 +138,88 @@ impl<'a> DotParser<'a> {
         Ok(())
     }
 
-    /// Parse an edge chain: `a -> b -> c [attrs]`
-    fn parse_edge_chain(&mut self, graph: &mut PipelineGraph, first: String) -> Result<()> {
+    /// Parse a subgraph block: `subgraph name { ... }`.
+    /// Collects node/edge declarations inside the block and tags nodes
+    /// as belonging to the subgraph.
+    fn parse_subgraph(&mut self, graph: &mut PipelineGraph) -> Result<()> {
+        self.skip_ws();
+        let subgraph_id = self
+            .parse_identifier()
+            .wrap_err("expected subgraph name")?;
+        self.skip_ws();
+        self.expect_char('{')
+            .wrap_err("expected '{' after subgraph name")?;
+
+        let mut label = None;
+        let mut node_ids = Vec::new();
+
+        // Parse statements inside the subgraph
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('}') {
+                self.advance();
+                break;
+            }
+            if self.is_eof() {
+                eyre::bail!("unexpected EOF in subgraph '{}'", subgraph_id);
+            }
+
+            // Handle graph-level attrs inside subgraph (e.g. label)
+            if self.try_keyword("graph") {
+                self.skip_ws();
+                if self.peek() == Some('[') {
+                    let attrs = self.parse_attributes()?;
+                    if let Some(l) = attrs.get("label") {
+                        label = Some(l.clone());
+                    }
+                }
+                self.skip_optional_semicolon();
+                continue;
+            }
+
+            // Parse identifier — could be node or edge
+            let first_id = self
+                .parse_identifier()
+                .wrap_err("expected node ID in subgraph")?;
+            self.skip_ws();
+
+            if self.try_str("->") {
+                // Edge inside subgraph — add to main graph, track all chain nodes
+                let chain = self.parse_edge_chain(graph, first_id)?;
+                for id in chain {
+                    if !node_ids.contains(&id) {
+                        node_ids.push(id);
+                    }
+                }
+            } else {
+                // Node declaration
+                let attrs = if self.peek() == Some('[') {
+                    self.parse_attributes()?
+                } else {
+                    HashMap::new()
+                };
+                let node = build_node(&first_id, &attrs);
+                graph.nodes.insert(first_id.clone(), node);
+                if !node_ids.contains(&first_id) {
+                    node_ids.push(first_id);
+                }
+            }
+
+            self.skip_optional_semicolon();
+        }
+
+        graph.subgraphs.push(Subgraph {
+            id: subgraph_id,
+            label,
+            node_ids,
+        });
+
+        Ok(())
+    }
+
+    /// Parse an edge chain: `a -> b -> c [attrs]`.
+    /// Returns all node IDs in the chain.
+    fn parse_edge_chain(&mut self, graph: &mut PipelineGraph, first: String) -> Result<Vec<String>> {
         let mut chain = vec![first];
 
         loop {
@@ -159,7 +247,7 @@ impl<'a> DotParser<'a> {
             graph.edges.push(edge);
         }
 
-        Ok(())
+        Ok(chain)
     }
 
     /// Parse `[key=value, key=value, ...]` or `[key="value", ...]`.
@@ -701,5 +789,87 @@ mod tests {
         assert!(plan.worker_prompt.is_none());
         assert!(plan.planner_model.is_none());
         assert!(plan.max_tasks.is_none());
+    }
+
+    #[test]
+    fn test_parse_subgraph() {
+        let dot = r#"
+            digraph test {
+                start [prompt="Begin"]
+
+                subgraph cluster_research {
+                    graph [label="Research Phase"]
+                    search [prompt="Search"]
+                    analyze [prompt="Analyze"]
+                    search -> analyze
+                }
+
+                start -> search
+                analyze -> finish
+                finish [prompt="Done"]
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.subgraphs.len(), 1);
+        assert_eq!(graph.subgraphs[0].id, "cluster_research");
+        assert_eq!(graph.subgraphs[0].label.as_deref(), Some("Research Phase"));
+        assert!(graph.subgraphs[0].node_ids.contains(&"search".to_string()));
+        assert!(graph.subgraphs[0].node_ids.contains(&"analyze".to_string()));
+        // Nodes should be in the main graph too
+        assert!(graph.nodes.contains_key("search"));
+        assert!(graph.nodes.contains_key("analyze"));
+    }
+
+    #[test]
+    fn test_parse_multiple_subgraphs() {
+        let dot = r#"
+            digraph test {
+                subgraph phase1 {
+                    a [prompt="A"]
+                    b [prompt="B"]
+                }
+                subgraph phase2 {
+                    c [prompt="C"]
+                }
+                a -> c
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.subgraphs.len(), 2);
+        assert_eq!(graph.subgraphs[0].id, "phase1");
+        assert_eq!(graph.subgraphs[0].node_ids.len(), 2);
+        assert_eq!(graph.subgraphs[1].id, "phase2");
+        assert_eq!(graph.subgraphs[1].node_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_subgraph_edge_only_tracks_all_nodes() {
+        let dot = r#"
+            digraph test {
+                subgraph cluster_flow {
+                    a -> b -> c
+                }
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        let sg = &graph.subgraphs[0];
+        assert_eq!(sg.node_ids.len(), 3);
+        assert!(sg.node_ids.contains(&"a".to_string()));
+        assert!(sg.node_ids.contains(&"b".to_string()));
+        assert!(sg.node_ids.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_no_subgraphs_by_default() {
+        let dot = r#"
+            digraph test {
+                a -> b
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.subgraphs.is_empty());
     }
 }

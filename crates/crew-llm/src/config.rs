@@ -22,6 +22,34 @@ pub struct ChatConfig {
     /// Anthropic thinking budget, Gemini thinkingConfig).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Structured output format. When set, the model will return responses
+    /// conforming to the given schema (JSON mode or JSON Schema).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Structured output format for chat responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Plain text (default behavior).
+    Text,
+    /// JSON mode — model returns valid JSON but without schema enforcement.
+    JsonObject,
+    /// JSON Schema mode — model returns JSON conforming to the provided schema.
+    JsonSchema {
+        /// Schema name (required by OpenAI).
+        name: String,
+        /// JSON Schema the response must conform to.
+        schema: serde_json::Value,
+        /// Whether to enforce strict schema adherence (default: true).
+        #[serde(default = "default_strict")]
+        strict: bool,
+    },
+}
+
+fn default_strict() -> bool {
+    true
 }
 
 /// Reasoning effort level for thinking/reasoning models.
@@ -41,6 +69,7 @@ impl Default for ChatConfig {
             tool_choice: ToolChoice::Auto,
             stop_sequences: Vec::new(),
             reasoning_effort: None,
+            response_format: None,
         }
     }
 }
@@ -87,6 +116,7 @@ mod tests {
             tool_choice: ToolChoice::Required,
             stop_sequences: vec!["STOP".to_string()],
             reasoning_effort: None,
+            response_format: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ChatConfig = serde_json::from_str(&json).unwrap();
@@ -104,6 +134,7 @@ mod tests {
             tool_choice: ToolChoice::Auto,
             stop_sequences: vec![],
             reasoning_effort: None,
+            response_format: None,
         };
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("max_tokens").is_none());
@@ -132,5 +163,43 @@ mod tests {
         let json = serde_json::to_value(&choice).unwrap();
         let deserialized: ToolChoice = serde_json::from_value(json).unwrap();
         assert!(matches!(deserialized, ToolChoice::None));
+    }
+
+    #[test]
+    fn test_response_format_json_object_serde() {
+        let rf = ResponseFormat::JsonObject;
+        let json = serde_json::to_value(&rf).unwrap();
+        assert_eq!(json["type"], "json_object");
+        let deserialized: ResponseFormat = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, ResponseFormat::JsonObject));
+    }
+
+    #[test]
+    fn test_response_format_json_schema_serde() {
+        let rf = ResponseFormat::JsonSchema {
+            name: "person".into(),
+            schema: serde_json::json!({"type": "object", "properties": {"name": {"type": "string"}}}),
+            strict: true,
+        };
+        let json = serde_json::to_value(&rf).unwrap();
+        assert_eq!(json["type"], "json_schema");
+        assert_eq!(json["name"], "person");
+        assert!(json["strict"].as_bool().unwrap());
+
+        let deserialized: ResponseFormat = serde_json::from_value(json).unwrap();
+        match deserialized {
+            ResponseFormat::JsonSchema { name, strict, .. } => {
+                assert_eq!(name, "person");
+                assert!(strict);
+            }
+            _ => panic!("expected JsonSchema"),
+        }
+    }
+
+    #[test]
+    fn test_response_format_skipped_when_none() {
+        let config = ChatConfig::default();
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(json.get("response_format").is_none());
     }
 }
