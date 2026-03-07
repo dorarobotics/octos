@@ -385,6 +385,15 @@ impl GatewayCommand {
         );
         skills_loader
             .add_skills_path(project_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR));
+        // Extra skills dirs from CREW_SKILLS_PATH env var
+        if let Ok(extra) = std::env::var("CREW_SKILLS_PATH") {
+            for p in extra.split(':') {
+                let p = p.trim();
+                if !p.is_empty() {
+                    skills_loader.add_skills_path(p);
+                }
+            }
+        }
 
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
@@ -561,6 +570,9 @@ impl GatewayCommand {
                 crew_agent::DEFAULT_WORKER_PROMPT,
             ));
             provider_router_for_factory = provider_router.clone();
+
+            // Skill management tool (install/remove/search skills for this profile)
+            tools.register(crew_agent::ManageSkillsTool::new(data_dir.join("skills")));
 
             // Research synthesis tool (shared, no per-session state)
             tools.register(crew_agent::SynthesizeResearchTool::new(

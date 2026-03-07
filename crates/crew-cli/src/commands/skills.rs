@@ -1024,7 +1024,106 @@ fn download_binary(
     }
 
     let dest = dir.join("main");
-    std::fs::write(&dest, &bytes)?;
+
+    if info.url.ends_with(".tar.gz") || info.url.ends_with(".tgz") {
+        use std::io::Read;
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(gz);
+        let mut found = false;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_file() {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                std::fs::write(&dest, &buf)?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("  {} No file found in archive", "WARN".yellow());
+            return Ok(false);
+        }
+    } else {
+        std::fs::write(&dest, &bytes)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    println!(
+        "  {} Downloaded binary ({} bytes)",
+        "OK".green(),
+        bytes.len()
+    );
+    Ok(true)
+}
+
+/// Download a binary from a direct URL with optional SHA-256 verification.
+///
+/// Supports both raw binaries and `.tar.gz` archives (auto-detected from URL).
+fn download_binary_from_url(dir: &Path, url: &str, sha256: Option<&str>) -> Result<bool> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .wrap_err("failed to create HTTP client")?
+        .get(url)
+        .send()
+        .wrap_err_with(|| format!("failed to download binary from {url}"))?;
+
+    if !response.status().is_success() {
+        println!(
+            "  {} Download failed (HTTP {})",
+            "WARN".yellow(),
+            response.status()
+        );
+        return Ok(false);
+    }
+
+    let bytes = response
+        .bytes()
+        .wrap_err("failed to read binary response")?;
+
+    if let Some(expected) = sha256 {
+        use sha2::{Digest, Sha256};
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual != expected.to_lowercase() {
+            println!(
+                "  {} Binary integrity check failed (hash mismatch)",
+                "FAIL".red()
+            );
+            return Ok(false);
+        }
+        println!("  {} Hash verified", "OK".green());
+    }
+
+    let dest = dir.join("main");
+
+    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        use std::io::Read;
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut archive = tar::Archive::new(gz);
+        let mut found = false;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_file() {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                std::fs::write(&dest, &buf)?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("  {} No file found in archive", "WARN".yellow());
+            return Ok(false);
+        }
+    } else {
+        std::fs::write(&dest, &bytes)?;
+    }
 
     #[cfg(unix)]
     {
@@ -1043,8 +1142,9 @@ fn download_binary(
 /// Install binary for skill package.
 ///
 /// Resolution order:
-/// 1. Download pre-built binary from the registry (audited, with SHA-256 verification)
-/// 2. `cargo build --release` as fallback if Cargo.toml exists
+/// 1. Download from manifest.json `binaries` field (skill author's CI/CD)
+/// 2. Download from skill registry `binaries` field (registry-audited)
+/// 3. `cargo build --release` as fallback if Cargo.toml exists
 fn maybe_install_binary(dir: &Path) -> Result<()> {
     let has_manifest = dir.join("manifest.json").exists();
     let has_cargo = dir.join("Cargo.toml").exists();
@@ -1059,7 +1159,28 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Try 1: look up pre-built binary from registry
+    let key = platform_key();
+
+    // Try 1: download from manifest.json binaries (skill repo's own CI/CD)
+    if has_manifest {
+        if let Ok(manifest_str) = std::fs::read_to_string(dir.join("manifest.json")) {
+            if let Ok(manifest) =
+                serde_json::from_str::<crew_agent::plugins::manifest::PluginManifest>(&manifest_str)
+            {
+                if let Some(info) = manifest.binaries.get(&key) {
+                    println!(
+                        "  Downloading binary for {} from manifest...",
+                        key.cyan()
+                    );
+                    if download_binary_from_url(dir, &info.url, info.sha256.as_deref())? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    // Try 2: look up pre-built binary from registry
     if let Some(binaries) = lookup_registry_binaries(&dir_name, None) {
         if download_binary(dir, &binaries)? {
             return Ok(());

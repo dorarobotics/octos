@@ -416,6 +416,18 @@ impl Config {
                 dirs.push(global_skills);
             }
         }
+        // Extra dirs from CREW_SKILLS_PATH env var (colon-separated)
+        if let Ok(extra) = std::env::var("CREW_SKILLS_PATH") {
+            for p in extra.split(':') {
+                let p = p.trim();
+                if !p.is_empty() {
+                    let path = PathBuf::from(p);
+                    if path.exists() {
+                        dirs.push(path);
+                    }
+                }
+            }
+        }
         dirs.dedup();
         dirs
     }

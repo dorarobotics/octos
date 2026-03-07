@@ -15,6 +15,11 @@ pub struct PluginManifest {
     /// SHA-256 hash of the plugin executable for integrity verification.
     #[serde(default)]
     pub sha256: Option<String>,
+    /// Pre-built binaries keyed by `{os}-{arch}` (e.g. "darwin-aarch64", "linux-x86_64").
+    /// Each entry has `url` (download URL) and optional `sha256` (integrity hash).
+    /// CI/CD updates this on each release.
+    #[serde(default)]
+    pub binaries: std::collections::HashMap<String, BinaryDownload>,
     /// Whether the plugin needs network access (informational).
     #[serde(default)]
     pub requires_network: bool,
@@ -33,6 +38,16 @@ pub struct PluginToolDef {
     /// JSON Schema for input parameters.
     #[serde(default = "default_schema")]
     pub input_schema: serde_json::Value,
+}
+
+/// Binary download info for a specific platform.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinaryDownload {
+    /// Download URL for the pre-built binary.
+    pub url: String,
+    /// SHA-256 hash for integrity verification.
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 fn default_schema() -> serde_json::Value {
