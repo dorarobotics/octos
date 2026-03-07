@@ -25,7 +25,10 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod event_bus;
+pub mod exec_env;
+pub mod provider_tools;
 pub mod steering;
+pub mod turn;
 pub mod tools;
 
 pub use agent::{
@@ -41,6 +44,9 @@ pub use sandbox::{Sandbox, SandboxConfig, create_sandbox};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use event_bus::{EventBus, EventSubscriber};
+pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
+pub use provider_tools::{ProviderToolsets, ToolAdjustment};
+pub use turn::{Turn, TurnKind};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use tools::{
     BrowserTool, ConfigureToolTool, DeepResearchTool, DeepSearchTool, DiffEditTool, EditFileTool,
