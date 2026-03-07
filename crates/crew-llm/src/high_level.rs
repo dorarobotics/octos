@@ -134,14 +134,8 @@ mod tests {
             _tools: &[ToolSpec],
             config: &ChatConfig,
         ) -> Result<ChatResponse> {
-            // If response_format is JsonSchema, return valid JSON
-            let content = if config.response_format.is_some() {
-                self.response.clone()
-            } else {
-                self.response.clone()
-            };
             Ok(ChatResponse {
-                content: Some(content),
+                content: Some(self.response.clone()),
                 reasoning_content: None,
                 tool_calls: vec![],
                 stop_reason: StopReason::EndTurn,

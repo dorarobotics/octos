@@ -4,10 +4,15 @@
 //! human input before continuing. Supports approval gates, questionnaires,
 //! and free-form input.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use eyre::Result;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
+
+/// Default timeout for human input requests (5 minutes).
+const DEFAULT_INPUT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A request for human input during pipeline execution.
 #[derive(Debug, Clone, Serialize)]
@@ -90,12 +95,19 @@ pub trait HumanInputProvider: Send + Sync {
 /// responses come back via oneshot channels.
 pub struct ChannelInputProvider {
     tx: mpsc::Sender<(HumanRequest, oneshot::Sender<HumanResponse>)>,
+    timeout: Duration,
 }
 
 impl ChannelInputProvider {
     pub fn new() -> (Self, mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>) {
         let (tx, rx) = mpsc::channel(8);
-        (Self { tx }, rx)
+        (Self { tx, timeout: DEFAULT_INPUT_TIMEOUT }, rx)
+    }
+
+    /// Create with a custom timeout for human responses.
+    pub fn with_timeout(timeout: Duration) -> (Self, mpsc::Receiver<(HumanRequest, oneshot::Sender<HumanResponse>)>) {
+        let (tx, rx) = mpsc::channel(8);
+        (Self { tx, timeout }, rx)
     }
 }
 
@@ -107,8 +119,9 @@ impl HumanInputProvider for ChannelInputProvider {
             .send((request, resp_tx))
             .await
             .map_err(|_| eyre::eyre!("human input channel closed"))?;
-        resp_rx
+        tokio::time::timeout(self.timeout, resp_rx)
             .await
+            .map_err(|_| eyre::eyre!("human input timed out after {:?}", self.timeout))?
             .map_err(|_| eyre::eyre!("human response channel dropped"))
     }
 }

@@ -10,20 +10,48 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::graph::OutcomeStatus;
+use crate::graph::{OutcomeStatus, validate_pipeline_id};
+
+/// Maximum DOT source size (1 MB).
+const MAX_DOT_SOURCE_SIZE: usize = 1_048_576;
+
+/// Maximum input size (256 KB).
+const MAX_INPUT_SIZE: usize = 262_144;
+
+/// Maximum number of template variables.
+const MAX_VARIABLES: usize = 64;
 
 /// Request to submit a pipeline for execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
-    /// DOT source for the pipeline.
+    /// DOT source for the pipeline (max 1 MB).
     pub dot_source: String,
-    /// Input text for the pipeline.
+    /// Input text for the pipeline (max 256 KB).
     pub input: String,
     /// Optional pipeline ID (auto-generated if not provided).
     pub pipeline_id: Option<String>,
-    /// Additional variables for template expansion.
+    /// Additional variables for template expansion (max 64 entries).
     #[serde(default)]
     pub variables: HashMap<String, String>,
+}
+
+impl SubmitRequest {
+    /// Validate request fields against size limits and format constraints.
+    pub fn validate(&self) -> eyre::Result<()> {
+        if self.dot_source.len() > MAX_DOT_SOURCE_SIZE {
+            eyre::bail!("dot_source exceeds maximum size ({MAX_DOT_SOURCE_SIZE} bytes)");
+        }
+        if self.input.len() > MAX_INPUT_SIZE {
+            eyre::bail!("input exceeds maximum size ({MAX_INPUT_SIZE} bytes)");
+        }
+        if self.variables.len() > MAX_VARIABLES {
+            eyre::bail!("variables exceeds maximum count ({MAX_VARIABLES})");
+        }
+        if let Some(ref id) = self.pipeline_id {
+            validate_pipeline_id(id)?;
+        }
+        Ok(())
+    }
 }
 
 /// Response after submitting a pipeline.
@@ -165,5 +193,53 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: CancelRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.run_id, "run-42");
+    }
+
+    #[test]
+    fn should_validate_valid_request() {
+        let req = SubmitRequest {
+            dot_source: "digraph { a -> b }".into(),
+            input: "test".into(),
+            pipeline_id: Some("my-pipe".into()),
+            variables: HashMap::new(),
+        };
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn should_reject_oversized_dot_source() {
+        let req = SubmitRequest {
+            dot_source: "x".repeat(MAX_DOT_SOURCE_SIZE + 1),
+            input: String::new(),
+            pipeline_id: None,
+            variables: HashMap::new(),
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn should_reject_too_many_variables() {
+        let mut vars = HashMap::new();
+        for i in 0..=MAX_VARIABLES {
+            vars.insert(format!("k{i}"), "v".into());
+        }
+        let req = SubmitRequest {
+            dot_source: "digraph {}".into(),
+            input: String::new(),
+            pipeline_id: None,
+            variables: vars,
+        };
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn should_reject_traversal_in_pipeline_id() {
+        let req = SubmitRequest {
+            dot_source: "digraph {}".into(),
+            input: String::new(),
+            pipeline_id: Some("../evil".into()),
+            variables: HashMap::new(),
+        };
+        assert!(req.validate().is_err());
     }
 }

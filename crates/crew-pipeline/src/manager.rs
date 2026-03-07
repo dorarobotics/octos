@@ -154,7 +154,7 @@ pub struct ManagerOutcome {
 
 impl ManagerOutcome {
     /// Convert to a NodeOutcome for use in the pipeline.
-    pub fn to_node_outcome(&self) -> NodeOutcome {
+    pub fn to_node_outcome(&self, node_id: &str) -> NodeOutcome {
         let output = self
             .results
             .iter()
@@ -166,7 +166,7 @@ impl ManagerOutcome {
             .join("\n");
 
         NodeOutcome {
-            node_id: String::new(), // caller sets this
+            node_id: node_id.to_string(),
             status: if self.success {
                 OutcomeStatus::Pass
             } else {
@@ -261,7 +261,8 @@ mod tests {
             ],
             failures: vec![],
         };
-        let node = outcome.to_node_outcome();
+        let node = outcome.to_node_outcome("manager_node");
+        assert_eq!(node.node_id, "manager_node");
         assert_eq!(node.status, OutcomeStatus::Pass);
         assert!(node.content.contains("[pass] a: done"));
     }

@@ -46,7 +46,7 @@ pub use skills::{SkillInfo, SkillsLoader};
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use provider_tools::{ProviderToolsets, ToolAdjustment};
-pub use turn::{Turn, TurnKind};
+pub use turn::{Turn, TurnKind, turns_to_messages};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
 pub use tools::{
     BrowserTool, ConfigureToolTool, DeepResearchTool, DeepSearchTool, DiffEditTool, EditFileTool,

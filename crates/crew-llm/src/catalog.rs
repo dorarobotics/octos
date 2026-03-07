@@ -104,6 +104,7 @@ impl ModelCatalog {
     }
 
     /// Create a catalog with well-known models pre-registered.
+    /// Prices as of 2025-06-01. Update periodically as provider pricing changes.
     pub fn with_defaults() -> Self {
         let mut catalog = Self::new();
 

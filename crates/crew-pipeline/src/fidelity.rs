@@ -8,6 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum allowed `max_chars` for truncation (10 MB).
+const MAX_TRUNCATE_CHARS: usize = 10_000_000;
+
+/// Maximum allowed `max_lines` for summary.
+const MAX_SUMMARY_LINES: usize = 100_000;
+
 /// Fidelity mode controlling context carryover between nodes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,10 +40,14 @@ impl FidelityMode {
             "full" => Some(Self::Full),
             "compact" => Some(Self::Compact),
             _ if s.starts_with("truncate:") => {
-                s["truncate:".len()..].parse().ok().map(|n| Self::Truncate { max_chars: n })
+                s["truncate:".len()..].parse::<usize>().ok().map(|n| {
+                    Self::Truncate { max_chars: n.min(MAX_TRUNCATE_CHARS) }
+                })
             }
             _ if s.starts_with("summary:") => {
-                s["summary:".len()..].parse().ok().map(|n| Self::Summary { max_lines: n })
+                s["summary:".len()..].parse::<usize>().ok().map(|n| {
+                    Self::Summary { max_lines: n.min(MAX_SUMMARY_LINES) }
+                })
             }
             _ => None,
         }
@@ -65,9 +75,10 @@ impl FidelityMode {
             Self::Summary { max_lines } => {
                 let lines: Vec<&str> = output.lines().take(*max_lines).collect();
                 let mut result = lines.join("\n");
-                let total_lines = output.lines().count();
-                if total_lines > *max_lines {
-                    result.push_str(&format!("\n... [{} more lines]", total_lines - max_lines));
+                // Check if there are more lines without counting them all
+                let has_more = output.lines().nth(*max_lines).is_some();
+                if has_more {
+                    result.push_str("\n... [truncated]");
                 }
                 result
             }
@@ -76,6 +87,11 @@ impl FidelityMode {
 }
 
 /// Strip tool call blocks from output, keeping results and final text.
+///
+/// Recognizes lines prefixed with "Tool call: " and "Arguments: " as tool
+/// invocation blocks, and "Result: " / "Output: " as result lines.
+/// This heuristic works on text-formatted agent output (e.g. pipeline run
+/// summaries), not on structured `Message` types.
 fn compact_output(output: &str) -> String {
     let mut result = Vec::new();
     let mut in_tool_call = false;
@@ -154,7 +170,7 @@ mod tests {
         let input = "line1\nline2\nline3\nline4";
         let result = mode.apply(input);
         assert!(result.starts_with("line1\nline2"));
-        assert!(result.contains("[2 more lines]"));
+        assert!(result.contains("[truncated]"));
     }
 
     #[test]

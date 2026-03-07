@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use tracing;
+
 /// Categorized LLM error kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmErrorKind {
@@ -124,7 +126,8 @@ impl LlmError {
             _ => LlmErrorKind::Provider { code: None },
         };
         let truncated_body: String = body.chars().take(200).collect();
-        Self::new(kind, format!("HTTP {status}: {truncated_body}"))
+        tracing::debug!(status, body = %truncated_body, "LLM provider error response");
+        Self::new(kind, format!("HTTP {status}"))
     }
 }
 

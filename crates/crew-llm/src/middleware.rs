@@ -112,7 +112,13 @@ impl LlmProvider for MiddlewareStack {
         tools: &[ToolSpec],
         config: &ChatConfig,
     ) -> Result<ChatStream> {
-        // Middleware doesn't wrap streaming (complex); delegate directly
+        if !self.layers.is_empty() {
+            tracing::debug!(
+                layer_count = self.layers.len(),
+                "streaming call bypasses {} middleware layer(s)",
+                self.layers.len()
+            );
+        }
         self.inner.chat_stream(messages, tools, config).await
     }
 
@@ -170,29 +176,29 @@ impl LlmMiddleware for LoggingMiddleware {
 
 /// Middleware that tracks cumulative token usage.
 pub struct CostTracker {
-    total_input: std::sync::atomic::AtomicU32,
-    total_output: std::sync::atomic::AtomicU32,
-    request_count: std::sync::atomic::AtomicU32,
+    total_input: std::sync::atomic::AtomicU64,
+    total_output: std::sync::atomic::AtomicU64,
+    request_count: std::sync::atomic::AtomicU64,
 }
 
 impl CostTracker {
     pub fn new() -> Self {
         Self {
-            total_input: std::sync::atomic::AtomicU32::new(0),
-            total_output: std::sync::atomic::AtomicU32::new(0),
-            request_count: std::sync::atomic::AtomicU32::new(0),
+            total_input: std::sync::atomic::AtomicU64::new(0),
+            total_output: std::sync::atomic::AtomicU64::new(0),
+            request_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub fn total_input_tokens(&self) -> u32 {
+    pub fn total_input_tokens(&self) -> u64 {
         self.total_input.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn total_output_tokens(&self) -> u32 {
+    pub fn total_output_tokens(&self) -> u64 {
         self.total_output.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn request_count(&self) -> u32 {
+    pub fn request_count(&self) -> u64 {
         self.request_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
@@ -212,9 +218,9 @@ impl LlmMiddleware for CostTracker {
     ) -> Result<ChatResponse> {
         use std::sync::atomic::Ordering::Relaxed;
         self.total_input
-            .fetch_add(response.usage.input_tokens, Relaxed);
+            .fetch_add(u64::from(response.usage.input_tokens), Relaxed);
         self.total_output
-            .fetch_add(response.usage.output_tokens, Relaxed);
+            .fetch_add(u64::from(response.usage.output_tokens), Relaxed);
         self.request_count.fetch_add(1, Relaxed);
         Ok(response)
     }
