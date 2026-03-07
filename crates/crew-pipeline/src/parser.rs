@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use eyre::{Result, WrapErr};
 
-use crate::graph::{HandlerKind, PipelineEdge, PipelineGraph, PipelineNode};
+use crate::graph::{HandlerKind, PipelineEdge, PipelineGraph, PipelineNode, Subgraph};
 
 /// Parse a DOT string into a `PipelineGraph`.
 pub fn parse_dot(input: &str) -> Result<PipelineGraph> {
@@ -52,6 +52,7 @@ impl<'a> DotParser<'a> {
             default_model: None,
             nodes: HashMap::new(),
             edges: Vec::new(),
+            subgraphs: Vec::new(),
         };
 
         // Parse statements
@@ -106,6 +107,13 @@ impl<'a> DotParser<'a> {
             return Ok(());
         }
 
+        // Check for subgraph: `subgraph name { ... }`
+        if self.try_keyword("subgraph") {
+            self.parse_subgraph(graph)?;
+            self.skip_optional_semicolon();
+            return Ok(());
+        }
+
         // Parse an identifier (could be node or start of edge)
         let first_id = self
             .parse_identifier()
@@ -114,7 +122,7 @@ impl<'a> DotParser<'a> {
 
         // Check for edge: `->` means this is an edge
         if self.try_str("->") {
-            self.parse_edge_chain(graph, first_id)?;
+            let _ = self.parse_edge_chain(graph, first_id)?;
         } else {
             // Node declaration
             let attrs = if self.peek() == Some('[') {
@@ -130,8 +138,88 @@ impl<'a> DotParser<'a> {
         Ok(())
     }
 
-    /// Parse an edge chain: `a -> b -> c [attrs]`
-    fn parse_edge_chain(&mut self, graph: &mut PipelineGraph, first: String) -> Result<()> {
+    /// Parse a subgraph block: `subgraph name { ... }`.
+    /// Collects node/edge declarations inside the block and tags nodes
+    /// as belonging to the subgraph.
+    fn parse_subgraph(&mut self, graph: &mut PipelineGraph) -> Result<()> {
+        self.skip_ws();
+        let subgraph_id = self
+            .parse_identifier()
+            .wrap_err("expected subgraph name")?;
+        self.skip_ws();
+        self.expect_char('{')
+            .wrap_err("expected '{' after subgraph name")?;
+
+        let mut label = None;
+        let mut node_ids = Vec::new();
+
+        // Parse statements inside the subgraph
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('}') {
+                self.advance();
+                break;
+            }
+            if self.is_eof() {
+                eyre::bail!("unexpected EOF in subgraph '{}'", subgraph_id);
+            }
+
+            // Handle graph-level attrs inside subgraph (e.g. label)
+            if self.try_keyword("graph") {
+                self.skip_ws();
+                if self.peek() == Some('[') {
+                    let attrs = self.parse_attributes()?;
+                    if let Some(l) = attrs.get("label") {
+                        label = Some(l.clone());
+                    }
+                }
+                self.skip_optional_semicolon();
+                continue;
+            }
+
+            // Parse identifier — could be node or edge
+            let first_id = self
+                .parse_identifier()
+                .wrap_err("expected node ID in subgraph")?;
+            self.skip_ws();
+
+            if self.try_str("->") {
+                // Edge inside subgraph — add to main graph, track all chain nodes
+                let chain = self.parse_edge_chain(graph, first_id)?;
+                for id in chain {
+                    if !node_ids.contains(&id) {
+                        node_ids.push(id);
+                    }
+                }
+            } else {
+                // Node declaration
+                let attrs = if self.peek() == Some('[') {
+                    self.parse_attributes()?
+                } else {
+                    HashMap::new()
+                };
+                let node = build_node(&first_id, &attrs);
+                graph.nodes.insert(first_id.clone(), node);
+                if !node_ids.contains(&first_id) {
+                    node_ids.push(first_id);
+                }
+            }
+
+            self.skip_optional_semicolon();
+        }
+
+        graph.subgraphs.push(Subgraph {
+            id: subgraph_id,
+            label,
+            node_ids,
+        });
+
+        Ok(())
+    }
+
+    /// Parse an edge chain: `a -> b -> c [attrs]`.
+    /// Returns all node IDs in the chain.
+    fn parse_edge_chain(&mut self, graph: &mut PipelineGraph, first: String) -> Result<Vec<String>> {
         let mut chain = vec![first];
 
         loop {
@@ -159,7 +247,7 @@ impl<'a> DotParser<'a> {
             graph.edges.push(edge);
         }
 
-        Ok(())
+        Ok(chain)
     }
 
     /// Parse `[key=value, key=value, ...]` or `[key="value", ...]`.
@@ -368,10 +456,37 @@ fn apply_graph_attrs(graph: &mut PipelineGraph, attrs: &HashMap<String, String>)
     }
 }
 
+/// Parse a duration string like "900s", "15m", "2h" into seconds.
+/// Falls back to plain integer parsing (interpreted as seconds).
+/// Returns `None` on overflow or unrecognized format.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('s') {
+        n.trim().parse::<u64>().ok()
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(60))
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.trim().parse::<u64>().ok().and_then(|v| v.checked_mul(3600))
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// Parse a boolean string ("true", "false", "yes", "no", "1", "0").
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
+    // Resolution: explicit handler > shape-based > default (codergen)
     let handler = attrs
         .get("handler")
         .and_then(|s| HandlerKind::from_str(s))
+        .or_else(|| attrs.get("shape").and_then(|s| HandlerKind::from_shape(s)))
         .unwrap_or(HandlerKind::Codergen);
 
     let tools = attrs
@@ -387,12 +502,12 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         model: attrs.get("model").cloned(),
         context_window: attrs.get("context_window").and_then(|s| s.parse().ok()),
         tools,
-        goal_gate: attrs.get("goal_gate").is_some_and(|s| s == "true"),
+        goal_gate: attrs.get("goal_gate").and_then(|s| parse_bool(s)).unwrap_or(false),
         max_retries: attrs
             .get("max_retries")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0),
-        timeout_secs: attrs.get("timeout_secs").and_then(|s| s.parse().ok()),
+        timeout_secs: attrs.get("timeout_secs").and_then(|s| parse_duration_secs(s)),
         suggested_next: attrs.get("suggested_next").cloned(),
         converge: attrs.get("converge").cloned(),
         worker_prompt: attrs.get("worker_prompt").cloned(),
@@ -602,6 +717,63 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_secs() {
+        assert_eq!(parse_duration_secs("300"), Some(300));
+        assert_eq!(parse_duration_secs("900s"), Some(900));
+        assert_eq!(parse_duration_secs("15m"), Some(900));
+        assert_eq!(parse_duration_secs("2h"), Some(7200));
+        assert_eq!(parse_duration_secs("bad"), None);
+    }
+
+    #[test]
+    fn test_parse_duration_overflow() {
+        // Huge values should return None via checked_mul, not wrap
+        assert_eq!(parse_duration_secs("9999999999999999999h"), None);
+        assert_eq!(parse_duration_secs("9999999999999999999m"), None);
+    }
+
+    #[test]
+    fn test_parse_bool_values() {
+        assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("yes"), Some(true));
+        assert_eq!(parse_bool("1"), Some(true));
+        assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("no"), Some(false));
+        assert_eq!(parse_bool("0"), Some(false));
+        assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn test_typed_duration_in_node() {
+        let dot = r#"
+            digraph test {
+                task [prompt="Do work", timeout_secs="15m"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.nodes["task"].timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn test_typed_bool_in_node() {
+        let dot = r#"
+            digraph test {
+                gate [prompt="Check", goal_gate="yes"]
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.nodes["gate"].goal_gate);
+
+        let dot2 = r#"
+            digraph test {
+                gate [prompt="Check", goal_gate="no"]
+            }
+        "#;
+        let graph2 = parse_dot(dot2).unwrap();
+        assert!(!graph2.nodes["gate"].goal_gate);
+    }
+
+    #[test]
     fn test_parse_dynamic_parallel_defaults() {
         let dot = r#"
             digraph test {
@@ -617,5 +789,87 @@ mod tests {
         assert!(plan.worker_prompt.is_none());
         assert!(plan.planner_model.is_none());
         assert!(plan.max_tasks.is_none());
+    }
+
+    #[test]
+    fn test_parse_subgraph() {
+        let dot = r#"
+            digraph test {
+                start [prompt="Begin"]
+
+                subgraph cluster_research {
+                    graph [label="Research Phase"]
+                    search [prompt="Search"]
+                    analyze [prompt="Analyze"]
+                    search -> analyze
+                }
+
+                start -> search
+                analyze -> finish
+                finish [prompt="Done"]
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.subgraphs.len(), 1);
+        assert_eq!(graph.subgraphs[0].id, "cluster_research");
+        assert_eq!(graph.subgraphs[0].label.as_deref(), Some("Research Phase"));
+        assert!(graph.subgraphs[0].node_ids.contains(&"search".to_string()));
+        assert!(graph.subgraphs[0].node_ids.contains(&"analyze".to_string()));
+        // Nodes should be in the main graph too
+        assert!(graph.nodes.contains_key("search"));
+        assert!(graph.nodes.contains_key("analyze"));
+    }
+
+    #[test]
+    fn test_parse_multiple_subgraphs() {
+        let dot = r#"
+            digraph test {
+                subgraph phase1 {
+                    a [prompt="A"]
+                    b [prompt="B"]
+                }
+                subgraph phase2 {
+                    c [prompt="C"]
+                }
+                a -> c
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        assert_eq!(graph.subgraphs.len(), 2);
+        assert_eq!(graph.subgraphs[0].id, "phase1");
+        assert_eq!(graph.subgraphs[0].node_ids.len(), 2);
+        assert_eq!(graph.subgraphs[1].id, "phase2");
+        assert_eq!(graph.subgraphs[1].node_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_subgraph_edge_only_tracks_all_nodes() {
+        let dot = r#"
+            digraph test {
+                subgraph cluster_flow {
+                    a -> b -> c
+                }
+            }
+        "#;
+
+        let graph = parse_dot(dot).unwrap();
+        let sg = &graph.subgraphs[0];
+        assert_eq!(sg.node_ids.len(), 3);
+        assert!(sg.node_ids.contains(&"a".to_string()));
+        assert!(sg.node_ids.contains(&"b".to_string()));
+        assert!(sg.node_ids.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn test_no_subgraphs_by_default() {
+        let dot = r#"
+            digraph test {
+                a -> b
+            }
+        "#;
+        let graph = parse_dot(dot).unwrap();
+        assert!(graph.subgraphs.is_empty());
     }
 }

@@ -18,6 +18,9 @@ pub struct PipelineGraph {
     pub nodes: HashMap<String, PipelineNode>,
     /// Directed edges.
     pub edges: Vec<PipelineEdge>,
+    /// Named subgraphs (clusters).
+    #[serde(default)]
+    pub subgraphs: Vec<Subgraph>,
 }
 
 /// A single node in the pipeline graph.
@@ -128,6 +131,20 @@ impl HandlerKind {
             _ => None,
         }
     }
+
+    /// Resolve handler from DOT `shape` attribute (Attractor spec mapping).
+    pub fn from_shape(shape: &str) -> Option<Self> {
+        match shape {
+            "Mdiamond" => Some(Self::Noop),             // start node
+            "Msquare" => Some(Self::Noop),              // exit node
+            "box" => Some(Self::Codergen),              // LLM task (default)
+            "hexagon" => Some(Self::Gate),              // human gate / conditional
+            "diamond" => Some(Self::Gate),              // conditional routing
+            "component" => Some(Self::Parallel),        // parallel fan-out
+            "parallelogram" => Some(Self::Shell),       // external tool/command
+            _ => None,
+        }
+    }
 }
 
 /// The outcome of executing a single pipeline node.
@@ -150,6 +167,36 @@ pub enum OutcomeStatus {
     Pass,
     Fail,
     Error,
+}
+
+/// A named subgraph (cluster) within a pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subgraph {
+    /// Subgraph identifier (e.g. "cluster_research").
+    pub id: String,
+    /// Human-readable label.
+    pub label: Option<String>,
+    /// Node IDs belonging to this subgraph.
+    pub node_ids: Vec<String>,
+}
+
+/// Validate that a pipeline identifier (node ID, run ID, graph ID) is safe
+/// for use as a filesystem path component. Rejects path separators, `..`,
+/// control characters, and excessively long values.
+pub fn validate_pipeline_id(id: &str) -> eyre::Result<()> {
+    if id.is_empty() {
+        eyre::bail!("pipeline identifier must not be empty");
+    }
+    if id.len() > 128 {
+        eyre::bail!("pipeline identifier too long (max 128 chars): {}", &id[..32]);
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {
+        eyre::bail!("pipeline identifier contains unsafe characters: {id}");
+    }
+    if id.chars().any(|c| c.is_control()) {
+        eyre::bail!("pipeline identifier contains control characters: {id}");
+    }
+    Ok(())
 }
 
 /// Summary of a single node execution (for reporting).

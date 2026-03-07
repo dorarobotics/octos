@@ -16,6 +16,7 @@ use futures::StreamExt;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HookPayload, HookResult};
+use crate::loop_detect::LoopDetector;
 use crate::progress::{ProgressEvent, ProgressReporter, SilentReporter};
 use crate::tools::ToolRegistry;
 
@@ -330,6 +331,7 @@ impl Agent {
         let mut files_modified = Vec::new();
         let mut iteration = 0u32;
         let start = Instant::now();
+        let mut loop_detector = LoopDetector::new(12);
 
         loop {
             if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
@@ -398,6 +400,21 @@ impl Agent {
                     });
                 }
                 StopReason::ToolUse => {
+                    // Check for loop detection before executing
+                    for tc in &response.tool_calls {
+                        if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments) {
+                            warn!("loop detected in tool calls");
+                            messages.push(Message {
+                                role: MessageRole::System,
+                                content: warning,
+                                media: vec![],
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                                timestamp: chrono::Utc::now(),
+                            });
+                        }
+                    }
                     self.handle_tool_use(
                         &response,
                         &mut messages,
@@ -844,6 +861,9 @@ impl Agent {
                         let _ = hooks.run(HookEvent::AfterToolCall, &payload).await;
                     }
 
+                    // Per-tool output truncation with head/tail split
+                    let limit = crew_core::tool_output_limit(&tc_name);
+                    let content = crew_core::truncate_head_tail(&content, limit, 0.7);
                     let content = crate::sanitize::sanitize_tool_output(&content);
 
                     (
@@ -1228,6 +1248,7 @@ impl Agent {
             token_usage: crew_core::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
+                ..Default::default()
             },
         }
     }
@@ -1565,6 +1586,7 @@ mod tests {
             usage: LlmTokenUsage {
                 input_tokens: 0,
                 output_tokens,
+                ..Default::default()
             },
         }
     }
@@ -1631,6 +1653,7 @@ mod tests {
             token_usage: crew_core::TokenUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                ..Default::default()
             },
             files_modified: vec![],
             streamed: false,

@@ -170,6 +170,7 @@ impl LlmProvider for AnthropicProvider {
             usage: TokenUsage {
                 input_tokens: api_response.usage.input_tokens,
                 output_tokens: api_response.usage.output_tokens,
+                ..Default::default()
             },
         })
     }
@@ -424,6 +425,7 @@ fn map_anthropic_sse(
                 StreamEvent::Usage(TokenUsage {
                     input_tokens: state.input_tokens,
                     output_tokens,
+                    ..Default::default()
                 }),
                 StreamEvent::Done(stop_reason),
             ]

@@ -9,8 +9,12 @@
 //! primary  = "(" expr ")"
 //!          | "outcome.status" ("==" | "!=") STRING
 //!          | "outcome.contains(" STRING ")"
-//!          | STRING   // bare literal, compared to outcome.content
+//!          | "context." IDENT ("==" | "!=") STRING
 //! ```
+//!
+//! Context variable semantics:
+//! - `context.key == "val"` → `false` if key is missing (conservative)
+//! - `context.key != "val"` → `true` if key is missing (open-world assumption)
 
 use eyre::Result;
 
@@ -25,6 +29,10 @@ pub enum CondExpr {
     StatusNe(String),
     /// `outcome.contains("keyword")`
     Contains(String),
+    /// `context.key == "value"`
+    ContextEq(String, String),
+    /// `context.key != "value"`
+    ContextNe(String, String),
     /// `!expr`
     Not(Box<CondExpr>),
     /// `expr && expr`
@@ -34,6 +42,9 @@ pub enum CondExpr {
     /// Always true
     True,
 }
+
+/// Context for condition evaluation (previous node outcomes).
+pub type EvalContext = std::collections::HashMap<String, String>;
 
 /// Parse a condition expression string.
 pub fn parse_condition(input: &str) -> Result<CondExpr> {
@@ -50,15 +61,30 @@ pub fn parse_condition(input: &str) -> Result<CondExpr> {
     Ok(expr)
 }
 
-/// Evaluate a condition expression against a node outcome.
+/// Evaluate a condition expression against a node outcome and optional context.
 pub fn evaluate(expr: &CondExpr, outcome: &NodeOutcome) -> bool {
+    evaluate_with_context(expr, outcome, &EvalContext::new())
+}
+
+/// Evaluate with an explicit context map for `context.*` variables.
+pub fn evaluate_with_context(
+    expr: &CondExpr,
+    outcome: &NodeOutcome,
+    ctx: &EvalContext,
+) -> bool {
     match expr {
         CondExpr::StatusEq(s) => status_str(outcome) == s.as_str(),
         CondExpr::StatusNe(s) => status_str(outcome) != s.as_str(),
         CondExpr::Contains(s) => outcome.content.contains(s.as_str()),
-        CondExpr::Not(inner) => !evaluate(inner, outcome),
-        CondExpr::And(a, b) => evaluate(a, outcome) && evaluate(b, outcome),
-        CondExpr::Or(a, b) => evaluate(a, outcome) || evaluate(b, outcome),
+        CondExpr::ContextEq(key, val) => ctx.get(key).map(|v| v == val).unwrap_or(false),
+        CondExpr::ContextNe(key, val) => ctx.get(key).map(|v| v != val).unwrap_or(true),
+        CondExpr::Not(inner) => !evaluate_with_context(inner, outcome, ctx),
+        CondExpr::And(a, b) => {
+            evaluate_with_context(a, outcome, ctx) && evaluate_with_context(b, outcome, ctx)
+        }
+        CondExpr::Or(a, b) => {
+            evaluate_with_context(a, outcome, ctx) || evaluate_with_context(b, outcome, ctx)
+        }
         CondExpr::True => true,
     }
 }
@@ -129,14 +155,25 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
             b'"' => {
                 i += 1;
-                let start = i;
+                let mut s = String::new();
                 while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1; // skip escaped char
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1; // skip backslash
+                        match bytes[i] {
+                            b'n' => s.push('\n'),
+                            b't' => s.push('\t'),
+                            b'\\' => s.push('\\'),
+                            b'"' => s.push('"'),
+                            c => {
+                                s.push('\\');
+                                s.push(c as char);
+                            }
+                        }
+                    } else {
+                        s.push(bytes[i] as char);
                     }
                     i += 1;
                 }
-                let s = String::from_utf8_lossy(&bytes[start..i]).to_string();
                 tokens.push(Token::StringLit(s));
                 if i < bytes.len() {
                     i += 1; // skip closing quote
@@ -250,8 +287,27 @@ impl<'a> ExprParser<'a> {
                 }
                 other => eyre::bail!("unknown outcome field: {:?}", other),
             }
+        } else if self.peek() == Some(&Token::Ident("context".into())) {
+            // `context.key == "value"` or `context.key != "value"`
+            self.advance();
+            self.expect_token(&Token::Dot)?;
+            let key = match self.advance() {
+                Some(Token::Ident(k)) => k.clone(),
+                other => eyre::bail!("expected context key, got {:?}", other),
+            };
+            match self.advance() {
+                Some(Token::Eq) => {
+                    let val = self.expect_string()?;
+                    Ok(CondExpr::ContextEq(key, val))
+                }
+                Some(Token::Ne) => {
+                    let val = self.expect_string()?;
+                    Ok(CondExpr::ContextNe(key, val))
+                }
+                other => eyre::bail!("expected == or != after context.{key}, got {:?}", other),
+            }
         } else {
-            eyre::bail!("expected 'outcome' or '(', got {:?}", self.peek())
+            eyre::bail!("expected 'outcome', 'context', or '(', got {:?}", self.peek())
         }
     }
 
@@ -333,5 +389,72 @@ mod tests {
             parse_condition(r#"!(outcome.status == "error") && outcome.contains("ok")"#).unwrap();
         assert!(evaluate(&expr, &outcome(OutcomeStatus::Pass, "all ok")));
         assert!(!evaluate(&expr, &outcome(OutcomeStatus::Error, "ok")));
+    }
+
+    #[test]
+    fn test_context_eq() {
+        let expr = parse_condition(r#"context.tests_passed == "true""#).unwrap();
+        let o = outcome(OutcomeStatus::Pass, "");
+        let mut ctx = EvalContext::new();
+        ctx.insert("tests_passed".into(), "true".into());
+        assert!(evaluate_with_context(&expr, &o, &ctx));
+        ctx.insert("tests_passed".into(), "false".into());
+        assert!(!evaluate_with_context(&expr, &o, &ctx));
+    }
+
+    #[test]
+    fn test_context_ne() {
+        let expr = parse_condition(r#"context.state != "exhausted""#).unwrap();
+        let o = outcome(OutcomeStatus::Pass, "");
+        let mut ctx = EvalContext::new();
+        ctx.insert("state".into(), "active".into());
+        assert!(evaluate_with_context(&expr, &o, &ctx));
+        ctx.insert("state".into(), "exhausted".into());
+        assert!(!evaluate_with_context(&expr, &o, &ctx));
+    }
+
+    #[test]
+    fn test_context_missing_key() {
+        let expr = parse_condition(r#"context.missing == "val""#).unwrap();
+        let o = outcome(OutcomeStatus::Pass, "");
+        // Missing key: == returns false, != returns true
+        assert!(!evaluate_with_context(&expr, &o, &EvalContext::new()));
+
+        let ne_expr = parse_condition(r#"context.missing != "val""#).unwrap();
+        assert!(evaluate_with_context(&ne_expr, &o, &EvalContext::new()));
+    }
+
+    #[test]
+    fn test_context_combined_with_outcome() {
+        let expr = parse_condition(
+            r#"outcome.status == "pass" && context.tests_passed == "true""#,
+        )
+        .unwrap();
+        let o = outcome(OutcomeStatus::Pass, "");
+        let mut ctx = EvalContext::new();
+        ctx.insert("tests_passed".into(), "true".into());
+        assert!(evaluate_with_context(&expr, &o, &ctx));
+
+        let o_fail = outcome(OutcomeStatus::Fail, "");
+        assert!(!evaluate_with_context(&expr, &o_fail, &ctx));
+    }
+
+    #[test]
+    fn test_string_escape_handling() {
+        // Escaped quotes inside strings should be handled correctly
+        let expr = parse_condition(r#"outcome.contains("say \"hello\"")"#).unwrap();
+        assert!(evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, r#"please say "hello" now"#)
+        ));
+    }
+
+    #[test]
+    fn test_backslash_escape_sequences() {
+        let expr = parse_condition(r#"outcome.contains("line1\nline2")"#).unwrap();
+        assert!(evaluate(
+            &expr,
+            &outcome(OutcomeStatus::Pass, "line1\nline2")
+        ));
     }
 }

@@ -142,6 +142,19 @@ pub struct TaskResult {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens used for internal chain-of-thought (reasoning models).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u32,
+    /// Tokens served from provider cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u32,
+    /// Tokens written to provider cache.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_tokens: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[cfg(test)]
@@ -317,6 +330,7 @@ mod tests {
             token_usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&result).unwrap();

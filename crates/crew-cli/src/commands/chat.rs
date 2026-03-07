@@ -582,6 +582,24 @@ pub(crate) fn create_provider_with_api_type(
         return Ok(Arc::new(provider));
     }
 
+    // If api_type is "responses", use OpenAI Responses API directly.
+    // This forces the Responses API even for models not auto-detected.
+    if api_type == Some("responses") {
+        let key = api_key.ok_or_else(|| eyre::eyre!("API key required for responses api_type"))?;
+        let m = model.unwrap_or_else(|| {
+            entry.default_model.unwrap_or("gpt-4o").into()
+        });
+        let mut provider = crew_llm::openai_responses::OpenAIResponsesProvider::new(&key, &m);
+        if let Some(url) = base_url {
+            provider = provider.with_base_url(&url);
+        }
+        if let Some(t) = llm_timeout_secs {
+            let c = llm_connect_timeout_secs.unwrap_or(crew_llm::DEFAULT_LLM_CONNECT_TIMEOUT_SECS);
+            provider = provider.with_http_timeout(t, c);
+        }
+        return Ok(Arc::new(provider));
+    }
+
     let params = crew_llm::registry::CreateParams {
         api_key,
         model,

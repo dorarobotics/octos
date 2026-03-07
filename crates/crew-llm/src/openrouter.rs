@@ -170,6 +170,7 @@ impl LlmProvider for OpenRouterProvider {
             usage: TokenUsage {
                 input_tokens: api_response.usage.prompt_tokens,
                 output_tokens: api_response.usage.completion_tokens,
+                ..Default::default()
             },
         })
     }

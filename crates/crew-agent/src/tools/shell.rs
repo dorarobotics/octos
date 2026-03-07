@@ -200,20 +200,39 @@ impl Tool for ShellTool {
                 ..Default::default()
             }),
             Err(_) => {
-                // Kill the child process and all its children to prevent orphans.
+                // Graceful shutdown: SIGTERM first, then SIGKILL after grace period.
                 // wait_with_output() consumed the Child, so we kill via PID.
-                // Use negative PID to kill the entire process group, then
-                // fall back to killing just the PID if group kill fails.
+                // Use negative PID to target the entire process group.
                 #[cfg(unix)]
                 if let Some(pid) = child_pid {
-                    // Try to kill the process group first (catches child processes)
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &format!("-{pid}")])
+                    use std::process::Command as StdCommand;
+
+                    // 1. Send SIGTERM to process group for graceful shutdown
+                    let _ = StdCommand::new("kill")
+                        .args(["-15", &format!("-{pid}")])
                         .status();
-                    // Also kill the process directly as fallback
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
+                    let _ = StdCommand::new("kill")
+                        .args(["-15", &pid.to_string()])
                         .status();
+
+                    // 2. Brief grace period, then SIGKILL only if still alive.
+                    // Check /proc/{pid} (Linux) or kill -0 (portable) to avoid
+                    // killing a recycled PID.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    let still_alive = StdCommand::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .status()
+                        .is_ok_and(|s| s.success());
+
+                    if still_alive {
+                        let _ = StdCommand::new("kill")
+                            .args(["-9", &format!("-{pid}")])
+                            .status();
+                        let _ = StdCommand::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .status();
+                    }
                 }
                 Ok(ToolResult {
                     output: format!(

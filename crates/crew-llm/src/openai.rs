@@ -222,6 +222,29 @@ impl OpenAIProvider {
             config.temperature
         };
 
+        let response_format = config.response_format.as_ref().map(|rf| match rf {
+            crate::config::ResponseFormat::Text => {
+                serde_json::json!({"type": "text"})
+            }
+            crate::config::ResponseFormat::JsonObject => {
+                serde_json::json!({"type": "json_object"})
+            }
+            crate::config::ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                serde_json::json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": name,
+                        "schema": schema,
+                        "strict": strict,
+                    }
+                })
+            }
+        });
+
         OpenAIRequest {
             model: &self.model,
             messages: openai_messages,
@@ -237,6 +260,7 @@ impl OpenAIProvider {
             },
             temperature,
             tools: openai_tools,
+            response_format,
         }
     }
 }
@@ -331,6 +355,7 @@ impl LlmProvider for OpenAIProvider {
             usage: TokenUsage {
                 input_tokens: api_response.usage.prompt_tokens,
                 output_tokens: api_response.usage.completion_tokens,
+                ..Default::default()
             },
         })
     }
@@ -405,6 +430,8 @@ struct OpenAIRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -649,6 +676,7 @@ pub(crate) fn parse_openai_sse_events(event: &SseEvent) -> Vec<StreamEvent> {
         events.push(StreamEvent::Usage(TokenUsage {
             input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            ..Default::default()
         }));
     }
 

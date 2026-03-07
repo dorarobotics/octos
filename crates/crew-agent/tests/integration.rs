@@ -68,6 +68,7 @@ fn end_turn(text: &str, input: u32, output: u32) -> ChatResponse {
         usage: TokenUsage {
             input_tokens: input,
             output_tokens: output,
+            ..Default::default()
         },
     }
 }
@@ -81,6 +82,7 @@ fn tool_use(calls: Vec<ToolCall>, input: u32, output: u32) -> ChatResponse {
         usage: TokenUsage {
             input_tokens: input,
             output_tokens: output,
+            ..Default::default()
         },
     }
 }

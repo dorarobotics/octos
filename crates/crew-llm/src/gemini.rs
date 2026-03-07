@@ -95,10 +95,8 @@ impl LlmProvider for GeminiProvider {
                 parts: vec![GeminiPart::Text { text }],
             }),
             tools: gemini_tools,
-            generation_config: Some(GeminiGenerationConfig {
-                max_output_tokens: config.max_tokens,
-                temperature: config.temperature,
-            }),
+            generation_config: Some(build_gemini_generation_config(config)),
+            cached_content: None,
         };
 
         let url = format!("{}/models/{}:generateContent", self.base_url, self.model);
@@ -174,6 +172,8 @@ impl LlmProvider for GeminiProvider {
         let usage = api_response.usage_metadata.unwrap_or(GeminiUsageMetadata {
             prompt_token_count: 0,
             candidates_token_count: 0,
+            thoughts_token_count: 0,
+            cached_content_token_count: 0,
         });
 
         Ok(ChatResponse {
@@ -184,6 +184,9 @@ impl LlmProvider for GeminiProvider {
             usage: TokenUsage {
                 input_tokens: usage.prompt_token_count,
                 output_tokens: usage.candidates_token_count,
+                reasoning_tokens: usage.thoughts_token_count,
+                cache_read_tokens: usage.cached_content_token_count,
+                ..Default::default()
             },
         })
     }
@@ -221,10 +224,8 @@ impl LlmProvider for GeminiProvider {
                 parts: vec![GeminiPart::Text { text }],
             }),
             tools: gemini_tools,
-            generation_config: Some(GeminiGenerationConfig {
-                max_output_tokens: config.max_tokens,
-                temperature: config.temperature,
-            }),
+            generation_config: Some(build_gemini_generation_config(config)),
+            cached_content: None,
         };
 
         let url = format!(
@@ -281,6 +282,8 @@ struct GeminiRequest {
     tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_config: Option<GeminiGenerationConfig>,
+    #[serde(rename = "cachedContent", skip_serializing_if = "Option::is_none")]
+    cached_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -334,6 +337,40 @@ struct GeminiInlineData {
     #[serde(rename = "mimeType")]
     mime_type: String,
     data: String,
+}
+
+/// Build the Gemini generation config from ChatConfig.
+fn build_gemini_generation_config(config: &ChatConfig) -> GeminiGenerationConfig {
+    use crate::config::{ReasoningEffort, ResponseFormat};
+
+    let thinking_config = config.reasoning_effort.map(|effort| {
+        let budget = match effort {
+            ReasoningEffort::Low => Some(1024),
+            ReasoningEffort::Medium => Some(8192),
+            ReasoningEffort::High => None, // let model decide
+        };
+        GeminiThinkingConfig {
+            thinking_budget: budget,
+        }
+    });
+
+    let (response_mime_type, response_schema) = match &config.response_format {
+        Some(ResponseFormat::JsonObject) => (Some("application/json".into()), None),
+        Some(ResponseFormat::JsonSchema { schema, .. }) => {
+            let mut s = schema.clone();
+            sanitize_schema_for_gemini(&mut s);
+            (Some("application/json".into()), Some(s))
+        }
+        _ => (None, None),
+    };
+
+    GeminiGenerationConfig {
+        max_output_tokens: config.max_tokens,
+        temperature: config.temperature,
+        thinking_config,
+        response_mime_type,
+        response_schema,
+    }
 }
 
 /// Build the Gemini `contents` array and optional system instruction from messages.
@@ -501,6 +538,9 @@ struct GeminiFunctionDeclaration {
     parameters: serde_json::Value,
 }
 
+/// Maximum recursion depth for schema sanitization (matches MCP limit).
+const MAX_SCHEMA_DEPTH: usize = 64;
+
 /// Sanitize a JSON Schema for Gemini's restricted schema support.
 ///
 /// Gemini only supports a subset of JSON Schema. This recursively removes
@@ -509,6 +549,14 @@ struct GeminiFunctionDeclaration {
 /// - Empty `items` schemas (`"items": {}`)
 /// - `$schema`, `$ref`, `$id`
 fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
+    sanitize_schema_recursive(value, 0);
+}
+
+fn sanitize_schema_recursive(value: &mut serde_json::Value, depth: usize) {
+    if depth > MAX_SCHEMA_DEPTH {
+        return;
+    }
+
     if let Some(obj) = value.as_object_mut() {
         obj.remove("additionalProperties");
         obj.remove("$schema");
@@ -527,12 +575,12 @@ fn sanitize_schema_for_gemini(value: &mut serde_json::Value) {
         let keys: Vec<String> = obj.keys().cloned().collect();
         for key in keys {
             if let Some(v) = obj.get_mut(&key) {
-                sanitize_schema_for_gemini(v);
+                sanitize_schema_recursive(v, depth + 1);
             }
         }
     } else if let Some(arr) = value.as_array_mut() {
         for item in arr {
-            sanitize_schema_for_gemini(item);
+            sanitize_schema_recursive(item, depth + 1);
         }
     }
 }
@@ -543,6 +591,18 @@ struct GeminiGenerationConfig {
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
+    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -565,6 +625,10 @@ struct GeminiUsageMetadata {
     prompt_token_count: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates_token_count: u32,
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts_token_count: u32,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: u32,
 }
 
 // --- Streaming SSE helpers ---
@@ -640,10 +704,15 @@ fn map_gemini_sse(state: &mut GeminiStreamState, event: &crate::sse::SseEvent) -
     if let Some(usage) = data.get("usageMetadata").filter(|u| !u.is_null()) {
         let input = usage["promptTokenCount"].as_u64().unwrap_or(0) as u32;
         let output = usage["candidatesTokenCount"].as_u64().unwrap_or(0) as u32;
+        let thinking = usage["thoughtsTokenCount"].as_u64().unwrap_or(0) as u32;
+        let cached = usage["cachedContentTokenCount"].as_u64().unwrap_or(0) as u32;
         if input > 0 || output > 0 {
             events.push(StreamEvent::Usage(TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
+                reasoning_tokens: thinking,
+                cache_read_tokens: cached,
+                ..Default::default()
             }));
         }
     }
@@ -926,5 +995,81 @@ mod tests {
         let provider =
             GeminiProvider::new("key", "model").with_base_url("https://custom.googleapis.com");
         assert_eq!(provider.base_url, "https://custom.googleapis.com");
+    }
+
+    // --- Generation config tests ---
+
+    #[test]
+    fn test_thinking_config_low_effort() {
+        use crate::config::ReasoningEffort;
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..Default::default()
+        };
+        let gen_config = build_gemini_generation_config(&config);
+        let tc = gen_config.thinking_config.unwrap();
+        assert_eq!(tc.thinking_budget, Some(1024));
+    }
+
+    #[test]
+    fn test_thinking_config_high_effort() {
+        use crate::config::ReasoningEffort;
+        let config = ChatConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        };
+        let gen_config = build_gemini_generation_config(&config);
+        let tc = gen_config.thinking_config.unwrap();
+        assert!(tc.thinking_budget.is_none());
+    }
+
+    #[test]
+    fn test_no_thinking_config_by_default() {
+        let config = ChatConfig::default();
+        let gen_config = build_gemini_generation_config(&config);
+        assert!(gen_config.thinking_config.is_none());
+    }
+
+    #[test]
+    fn test_response_format_json_object() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonObject),
+            ..Default::default()
+        };
+        let gen_config = build_gemini_generation_config(&config);
+        assert_eq!(gen_config.response_mime_type.as_deref(), Some("application/json"));
+        assert!(gen_config.response_schema.is_none());
+    }
+
+    #[test]
+    fn test_response_format_json_schema() {
+        use crate::config::ResponseFormat;
+        let config = ChatConfig {
+            response_format: Some(ResponseFormat::JsonSchema {
+                name: "test".into(),
+                schema: serde_json::json!({"type": "object", "additionalProperties": false}),
+                strict: true,
+            }),
+            ..Default::default()
+        };
+        let gen_config = build_gemini_generation_config(&config);
+        assert_eq!(gen_config.response_mime_type.as_deref(), Some("application/json"));
+        // additionalProperties should be sanitized away
+        let schema = gen_config.response_schema.unwrap();
+        assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn test_gemini_sse_usage_with_thinking_tokens() {
+        let mut state = GeminiStreamState::default();
+        let event = crate::sse::SseEvent {
+            event: None,
+            data: r#"{"usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50, "thoughtsTokenCount": 20, "cachedContentTokenCount": 30}}"#.into(),
+        };
+        let events = map_gemini_sse(&mut state, &event);
+        assert!(events.iter().any(
+            |e| matches!(e, StreamEvent::Usage(u) if u.reasoning_tokens == 20 && u.cache_read_tokens == 30)
+        ));
     }
 }
