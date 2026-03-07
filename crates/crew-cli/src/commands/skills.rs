@@ -1020,7 +1020,12 @@ fn update_single(skills_dir: &Path, name: &str, branch_override: Option<&str>) -
 
 /// Get the current platform key for binary downloads (e.g. "darwin-aarch64").
 fn platform_key() -> String {
-    let os = std::env::consts::OS; // darwin, linux, windows
+    // Rust's std::env::consts::OS returns "macos" but the convention
+    // in manifest.json and the registry is "darwin".
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
     let arch = std::env::consts::ARCH; // aarch64, x86_64
     format!("{os}-{arch}")
 }
@@ -1257,6 +1262,8 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                         key.cyan()
                     );
                     if download_binary_from_url(dir, &info.url, info.sha256.as_deref())? {
+                        // Also install to ~/.cargo/bin/ for PATH access
+                        install_main_to_cargo_bin(dir, &manifest.name);
                         return Ok(());
                     }
                 }
@@ -1267,11 +1274,12 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     // Try 2: look up pre-built binary from registry
     if let Some(binaries) = lookup_registry_binaries(&dir_name, None) {
         if download_binary(dir, &binaries)? {
+            install_main_to_cargo_bin(dir, &dir_name);
             return Ok(());
         }
     }
 
-    // Try 2: cargo build if Cargo.toml exists
+    // Try 3: cargo build if Cargo.toml exists
     if !has_cargo {
         return Ok(());
     }
@@ -1305,7 +1313,8 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
         eyre::bail!("cargo build failed in {}", dir.display());
     }
 
-    // Copy the built binary to 'main' for PluginLoader to find
+    // Copy the built binary to 'main' for PluginLoader to find,
+    // and also install to ~/.cargo/bin/ so it's available as a CLI command.
     let target_dir = dir.join("target").join("release");
     if let Ok(cargo_toml) = std::fs::read_to_string(dir.join("Cargo.toml")) {
         for line in cargo_toml.lines() {
@@ -1324,6 +1333,8 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
                                 std::fs::Permissions::from_mode(0o755),
                             )?;
                         }
+                        // Also install to ~/.cargo/bin/ for PATH access
+                        install_main_to_cargo_bin(dir, name);
                         println!("  {} Built and installed binary '{}'", "OK".green(), name);
                         break;
                     }
@@ -1399,6 +1410,36 @@ fn maybe_npm_install(dir: &Path) -> Result<()> {
         eyre::bail!("npm install failed in {}", dir.display());
     }
     Ok(())
+}
+
+/// Copy the `main` binary from a skill directory to `~/.cargo/bin/{name}` for PATH access.
+fn install_main_to_cargo_bin(dir: &Path, name: &str) {
+    let main_path = dir.join("main");
+    if !main_path.exists() {
+        return;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let cargo_bin = home.join(".cargo").join("bin");
+        if cargo_bin.is_dir() {
+            let dest = cargo_bin.join(name);
+            if std::fs::copy(&main_path, &dest).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &dest,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                }
+                println!(
+                    "  {} Installed '{}' to {}",
+                    "OK".green(),
+                    name,
+                    cargo_bin.display()
+                );
+            }
+        }
+    }
 }
 
 fn cmd_remove(skills_dir: &Path, name: &str) -> Result<()> {
