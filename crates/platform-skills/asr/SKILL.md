@@ -12,7 +12,10 @@ On-device speech-to-text, text-to-speech, and multi-speaker podcast generation u
 
 ## Configuration
 
-Set `OMINIX_API_URL` to point to the ominix-api server. Default: `http://localhost:8081`.
+The asr skill auto-discovers the ominix-api server URL via (in priority order):
+1. `OMINIX_API_URL` environment variable
+2. Discovery file `~/.ominix/api_url` (written by ominix-api on startup)
+3. Default: `http://localhost:8080`
 
 ## Tools
 

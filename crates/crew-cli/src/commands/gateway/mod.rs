@@ -350,11 +350,18 @@ impl GatewayCommand {
             .join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR)
             .join("asr")
             .join("main");
-        let has_asr = asr_binary_path.exists() && std::env::var("OMINIX_API_URL").is_ok();
-        let asr_binary = if has_asr {
-            let url = std::env::var("OMINIX_API_URL").unwrap_or_default();
+        let ominix_url = std::env::var("OMINIX_API_URL").ok().or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            let discovery = std::path::Path::new(&home).join(".ominix").join("api_url");
+            std::fs::read_to_string(discovery).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        });
+        let asr_binary = if asr_binary_path.exists() && ominix_url.is_some() {
+            let url = ominix_url.unwrap();
             println!("{}: asr platform skill ({})", "Transcriber".green(), url);
             println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
+            // Export so the asr binary can find the server
+            #[allow(unsafe_code)]
+            unsafe { std::env::set_var("OMINIX_API_URL", &url); }
             Some(asr_binary_path)
         } else {
             None

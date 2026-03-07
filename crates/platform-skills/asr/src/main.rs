@@ -59,10 +59,21 @@ struct VoiceCloneInput {
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn api_base_url() -> String {
-    std::env::var("OMINIX_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string())
-        .trim_end_matches('/')
-        .to_string()
+    // Priority: env var > discovery file > default
+    if let Ok(url) = std::env::var("OMINIX_API_URL") {
+        return url.trim_end_matches('/').to_string();
+    }
+    // Read URL written by ominix-api on startup
+    if let Some(home) = std::env::var_os("HOME") {
+        let discovery = Path::new(&home).join(".ominix").join("api_url");
+        if let Ok(url) = std::fs::read_to_string(&discovery) {
+            let url = url.trim();
+            if !url.is_empty() {
+                return url.trim_end_matches('/').to_string();
+            }
+        }
+    }
+    "http://localhost:8080".to_string()
 }
 
 fn http_client() -> reqwest::blocking::Client {
@@ -151,8 +162,9 @@ fn handle_transcribe(input_json: &str) {
 
     let language = input.language.unwrap_or_else(|| "Chinese".to_string());
 
+    // ominix-api accepts file paths (starting with '/') or base64 in the "file" field
     let body = json!({
-        "file_path": input.audio_path,
+        "file": input.audio_path,
         "language": language,
         "response_format": "verbose_json"
     });
