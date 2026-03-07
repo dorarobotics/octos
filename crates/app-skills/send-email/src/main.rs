@@ -148,15 +148,11 @@ fn send_smtp(input: &Input) -> Result<(), String> {
             let filename = att
                 .name
                 .clone()
-                .or_else(|| {
-                    path.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                })
+                .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "attachment".to_string());
             let content_type =
                 ContentType::parse(mime_from_extension(path)).unwrap_or(ContentType::TEXT_PLAIN);
-            let attachment =
-                LettreAttachment::new(filename).body(data, content_type);
+            let attachment = LettreAttachment::new(filename).body(data, content_type);
             mixed = mixed.singlepart(attachment);
         }
 

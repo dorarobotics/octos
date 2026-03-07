@@ -223,10 +223,7 @@ impl OminixClient {
     }
 
     /// Fetch catalog from ominix-api, filtered to only platform-allowed models.
-    pub async fn platform_catalog(
-        &self,
-        allowlist: &PlatformModels,
-    ) -> Result<Vec<CatalogModel>> {
+    pub async fn platform_catalog(&self, allowlist: &PlatformModels) -> Result<Vec<CatalogModel>> {
         let all = self.fetch_catalog().await?;
         let filtered = all
             .into_iter()

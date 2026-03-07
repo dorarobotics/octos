@@ -255,13 +255,35 @@ pub fn list_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
     Ok(skills)
 }
 
-/// Install skills from a GitHub repo (blocking — uses git clone).
+/// Install skills from a GitHub repo or local path (blocking).
 pub fn install_skill(
     skills_dir: &Path,
     repo: &str,
     force: bool,
     branch: &str,
 ) -> Result<InstallResult> {
+    // Detect local path: starts with /, ./, ../, or ~
+    let local_path = if repo.starts_with('/')
+        || repo.starts_with("./")
+        || repo.starts_with("../")
+        || repo.starts_with('~')
+    {
+        let expanded = if let Some(rest) = repo.strip_prefix("~/") {
+            dirs::home_dir().unwrap_or_default().join(rest)
+        } else {
+            PathBuf::from(repo)
+        };
+        let resolved = std::fs::canonicalize(&expanded)
+            .wrap_err_with(|| format!("Local path not found: {}", expanded.display()))?;
+        Some(resolved)
+    } else {
+        None
+    };
+
+    if let Some(src) = local_path {
+        return install_from_local(skills_dir, &src, force);
+    }
+
     let spec = RepoSpec::parse(repo)?;
 
     match install_via_git_result(skills_dir, &spec, force, branch) {
@@ -288,6 +310,56 @@ pub fn install_skill(
             }
         }
     }
+}
+
+/// Install a skill from a local directory path.
+fn install_from_local(skills_dir: &Path, src: &Path, force: bool) -> Result<InstallResult> {
+    if !src.is_dir() {
+        eyre::bail!("Not a directory: {}", src.display());
+    }
+    if !src.join("SKILL.md").exists() {
+        eyre::bail!(
+            "No SKILL.md found in {}. Is this a valid skill directory?",
+            src.display()
+        );
+    }
+
+    let name = src
+        .file_name()
+        .ok_or_else(|| eyre::eyre!("Cannot determine skill name from path"))?
+        .to_string_lossy()
+        .to_string();
+
+    std::fs::create_dir_all(skills_dir)?;
+    let dest = skills_dir.join(&name);
+
+    if dest.exists() && !force {
+        println!(
+            "  {} '{}' already exists (use --force to overwrite)",
+            "SKIP".yellow(),
+            name
+        );
+        return Ok(InstallResult {
+            installed: vec![],
+            skipped: vec![name],
+            deps_installed: vec![],
+        });
+    }
+
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    copy_dir_recursive(src, &dest)?;
+
+    // Build binary if needed
+    maybe_install_binary(&dest)?;
+
+    println!("  {} Installed '{}' from local path", "OK".green(), name);
+    Ok(InstallResult {
+        installed: vec![name],
+        skipped: vec![],
+        deps_installed: vec![],
+    })
 }
 
 /// Remove an installed skill by name.
@@ -503,7 +575,19 @@ impl RepoSpec {
     }
 
     fn clone_url(&self) -> String {
-        format!("https://github.com/{}/{}.git", self.user, self.repo)
+        // Use SSH if the user has configured git to rewrite GitHub HTTPS to SSH,
+        // or if SSH auth to github.com works (avoids credential prompts).
+        let https = format!("https://github.com/{}/{}.git", self.user, self.repo);
+        // Check if git config has an insteadOf rewrite for github HTTPS -> SSH
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["config", "--get", "url.git@github.com:.insteadOf"])
+            .output()
+        {
+            if output.status.success() {
+                return format!("git@github.com:{}/{}.git", self.user, self.repo);
+            }
+        }
+        https
     }
 }
 
@@ -1069,6 +1153,15 @@ fn maybe_install_binary(dir: &Path) -> Result<()> {
     // Try 2: cargo build if Cargo.toml exists
     if !has_cargo {
         return Ok(());
+    }
+
+    // Ensure the skill crate is not absorbed into a parent workspace
+    let cargo_toml_path = dir.join("Cargo.toml");
+    if let Ok(content) = std::fs::read_to_string(&cargo_toml_path) {
+        if !content.contains("[workspace]") {
+            let patched = format!("{}\n[workspace]\n", content.trim_end());
+            let _ = std::fs::write(&cargo_toml_path, patched);
+        }
     }
 
     println!(

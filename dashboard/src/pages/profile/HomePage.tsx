@@ -94,10 +94,26 @@ export default function HomePage() {
   }
 
   const channels = config.channels || []
+  const needsSetup = !config.provider && !config.model
 
   return (
     <div>
       <h1 className="text-2xl font-bold text-white mb-6">Overview</h1>
+
+      {needsSetup && (
+        <div className="mb-6 bg-amber-500/10 border border-amber-500/30 rounded-xl p-5">
+          <h3 className="text-sm font-semibold text-amber-300 mb-2">Setup Required</h3>
+          <p className="text-sm text-amber-200/80 mb-3">
+            This profile hasn't been configured yet. Set up an LLM provider to get started.
+          </p>
+          <Link
+            to={`${isOwn ? '/my' : `/profile/${profileId}`}/llm`}
+            className="inline-flex px-4 py-2 text-sm font-medium rounded-lg bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/30 transition"
+          >
+            Configure LLM Provider
+          </Link>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Gateway Controls */}

@@ -28,7 +28,7 @@ export default function ProfileCard({ profile, subAccounts = [], onStart, onStop
   const model = profile.config.model || 'default'
 
   return (
-    <div className="bg-surface rounded-xl border border-gray-700/50 p-5 hover:border-gray-600/50 transition-colors group">
+    <div className="bg-surface rounded-xl border border-gray-700/50 p-5 hover:border-gray-600/50 transition-colors group flex flex-col">
       <div className="flex items-start justify-between mb-3">
         <Link
           to={`/profile/${profile.id}`}
@@ -48,10 +48,13 @@ export default function ProfileCard({ profile, subAccounts = [], onStart, onStop
           <span className="text-gray-500">Model:</span>
           <span className="truncate max-w-[140px]">{model}</span>
         </div>
-        {profile.status.running && profile.status.uptime_secs && (
+        {profile.status.running && profile.status.pid && (
           <div className="flex items-center gap-2 text-xs text-gray-400">
-            <span className="text-gray-500">Uptime:</span>
-            <span>{formatUptime(profile.status.uptime_secs)}</span>
+            <span className="text-gray-500">PID:</span>
+            <span className="font-mono">{profile.status.pid}</span>
+            {profile.status.uptime_secs ? (
+              <span className="text-gray-600 ml-1">({formatUptime(profile.status.uptime_secs)})</span>
+            ) : null}
           </div>
         )}
       </div>
@@ -72,7 +75,7 @@ export default function ProfileCard({ profile, subAccounts = [], onStart, onStop
         </div>
       )}
 
-      <div className="flex gap-2">
+      <div className="flex gap-2 mt-auto pt-4">
         {profile.status.running ? (
           <button
             onClick={() => onStop(profile.id)}

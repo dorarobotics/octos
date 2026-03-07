@@ -189,16 +189,40 @@ pub async fn me(
 ) -> Result<Json<MeResponse>, StatusCode> {
     // Handle admin token first — no user_store needed
     if matches!(&identity, AuthIdentity::Admin) {
+        let profile = if let Some(ref ps) = state.profile_store {
+            ensure_admin_profile(ps).ok();
+            if let Ok(Some(p)) = ps.get(ADMIN_PROFILE_ID) {
+                let status = if let Some(ref pm) = state.process_manager {
+                    pm.status(&p.id).await
+                } else {
+                    crate::process_manager::ProcessStatus {
+                        running: false,
+                        pid: None,
+                        started_at: None,
+                        uptime_secs: None,
+                    }
+                };
+                Some(ProfileResponse {
+                    profile: mask_secrets(&p),
+                    status,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         return Ok(Json(MeResponse {
             user: User {
-                id: "admin".into(),
+                id: ADMIN_PROFILE_ID.into(),
                 email: "admin@localhost".into(),
                 name: "Admin".into(),
                 role: UserRole::Admin,
                 created_at: chrono::Utc::now(),
                 last_login_at: None,
             },
-            profile: None,
+            profile,
         }));
     }
 
@@ -543,18 +567,16 @@ pub async fn my_provider_metrics(
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Resolve the profile ID for "my" endpoints.
-/// For regular users, returns their user ID. For admin token, returns the first profile's ID.
+/// For regular users, returns their user ID. For admin token, returns the admin's own profile ID
+/// (auto-creating the admin profile if it doesn't exist yet).
 fn resolve_my_profile_id(
     identity: &AuthIdentity,
     ps: &crate::profiles::ProfileStore,
 ) -> Result<String, StatusCode> {
     match identity {
         AuthIdentity::Admin => {
-            let profiles = ps.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            profiles
-                .first()
-                .map(|p| p.id.clone())
-                .ok_or(StatusCode::NOT_FOUND)
+            ensure_admin_profile(ps)?;
+            Ok(ADMIN_PROFILE_ID.into())
         }
         AuthIdentity::User { id, .. } => Ok(id.clone()),
     }
@@ -571,6 +593,10 @@ fn resolve_my_profile(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// The fixed profile ID used for token-based admin authentication.
+/// This ensures the admin has its own separate profile, distinct from any user profiles.
+pub const ADMIN_PROFILE_ID: &str = "admin";
+
 fn extract_bearer_token(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
     req.headers()
         .get("authorization")
@@ -579,10 +605,124 @@ fn extract_bearer_token(req: &axum::http::Request<axum::body::Body>) -> Option<S
         .map(String::from)
 }
 
+/// Ensure an admin profile exists in the store, creating one if needed.
+fn ensure_admin_profile(ps: &crate::profiles::ProfileStore) -> Result<(), StatusCode> {
+    if let Ok(Some(_)) = ps.get(ADMIN_PROFILE_ID) {
+        return Ok(());
+    }
+    let profile = crate::profiles::UserProfile {
+        id: ADMIN_PROFILE_ID.into(),
+        name: "Admin".into(),
+        enabled: false,
+        data_dir: None,
+        parent_id: None,
+        config: crate::profiles::ProfileConfig::default(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    ps.save(&profile).map_err(|e| {
+        tracing::error!(error = %e, "failed to auto-create admin profile");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profiles::ProfileStore;
     use axum::http::Request;
+
+    fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let ps = ProfileStore::open(dir.path()).unwrap();
+        (dir, ps)
+    }
+
+    fn make_user_profile(id: &str, name: &str) -> crate::profiles::UserProfile {
+        crate::profiles::UserProfile {
+            id: id.into(),
+            name: name.into(),
+            enabled: true,
+            data_dir: None,
+            parent_id: None,
+            config: crate::profiles::ProfileConfig::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn should_return_admin_id_when_admin_identity() {
+        let (_dir, ps) = temp_profile_store();
+        // Create a user profile that would have been returned by the old "first" logic
+        ps.save(&make_user_profile("guofoo", "Guo Foo")).unwrap();
+
+        let identity = AuthIdentity::Admin;
+        let result = resolve_my_profile_id(&identity, &ps).unwrap();
+        assert_eq!(
+            result, ADMIN_PROFILE_ID,
+            "admin should get its own profile ID, not the first user's"
+        );
+    }
+
+    #[test]
+    fn should_return_user_id_when_user_identity() {
+        let (_dir, ps) = temp_profile_store();
+        ps.save(&make_user_profile("user123", "Test User")).unwrap();
+
+        let identity = AuthIdentity::User {
+            id: "user123".into(),
+            role: UserRole::User,
+        };
+        let result = resolve_my_profile_id(&identity, &ps).unwrap();
+        assert_eq!(result, "user123");
+    }
+
+    #[test]
+    fn should_auto_create_admin_profile_when_not_exists() {
+        let (_dir, ps) = temp_profile_store();
+        assert!(ps.get(ADMIN_PROFILE_ID).unwrap().is_none());
+
+        ensure_admin_profile(&ps).unwrap();
+
+        let profile = ps
+            .get(ADMIN_PROFILE_ID)
+            .unwrap()
+            .expect("admin profile should exist");
+        assert_eq!(profile.id, ADMIN_PROFILE_ID);
+        assert_eq!(profile.name, "Admin");
+    }
+
+    #[test]
+    fn should_not_overwrite_existing_admin_profile() {
+        let (_dir, ps) = temp_profile_store();
+        let mut admin = make_user_profile(ADMIN_PROFILE_ID, "Custom Admin Name");
+        admin.enabled = true;
+        ps.save(&admin).unwrap();
+
+        ensure_admin_profile(&ps).unwrap();
+
+        let profile = ps.get(ADMIN_PROFILE_ID).unwrap().unwrap();
+        assert_eq!(
+            profile.name, "Custom Admin Name",
+            "should not overwrite existing profile"
+        );
+        assert!(profile.enabled);
+    }
+
+    #[test]
+    fn should_resolve_admin_profile_not_first_user() {
+        let (_dir, ps) = temp_profile_store();
+        // Create user profile first — old code would return this
+        ps.save(&make_user_profile("alice", "Alice")).unwrap();
+        // Ensure admin profile exists
+        ensure_admin_profile(&ps).unwrap();
+
+        let identity = AuthIdentity::Admin;
+        let profile = resolve_my_profile(&identity, &ps).unwrap();
+        assert_eq!(profile.id, ADMIN_PROFILE_ID);
+        assert_eq!(profile.name, "Admin");
+    }
 
     #[test]
     fn send_code_request_deserialize() {

@@ -293,10 +293,9 @@ impl Tool for PlatformSkillsTool {
                     .model_id
                     .as_deref()
                     .ok_or_else(|| eyre::eyre!("'model_id' is required for enable_model"))?;
-                let role = input
-                    .role
-                    .as_deref()
-                    .ok_or_else(|| eyre::eyre!("'role' is required for enable_model (e.g. 'asr', 'tts')"))?;
+                let role = input.role.as_deref().ok_or_else(|| {
+                    eyre::eyre!("'role' is required for enable_model (e.g. 'asr', 'tts')")
+                })?;
                 let body = serde_json::json!({ "model_id": model_id, "role": role });
                 match self
                     .ctx

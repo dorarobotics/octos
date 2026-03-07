@@ -341,9 +341,7 @@ impl GatewayCommand {
         } else {
             None
         };
-        let asr_language = voice_config
-            .as_ref()
-            .and_then(|vc| vc.asr_language.clone());
+        let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
         // Collect extra skills dirs: parent profile (for sub-accounts) + global
         let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
@@ -380,11 +378,9 @@ impl GatewayCommand {
         };
         // Add shared layered dirs (lower priority than profile skills)
         let mut skills_loader = skills_loader;
-        skills_loader.add_skills_path(
-            project_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR),
-        );
         skills_loader
-            .add_skills_path(project_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR));
+            .add_skills_path(project_dir.join(crew_agent::bootstrap::BUNDLED_APP_SKILLS_DIR));
+        skills_loader.add_skills_path(project_dir.join(crew_agent::bootstrap::PLATFORM_SKILLS_DIR));
 
         // Create message bus (before publisher is consumed by channel manager)
         let (mut agent_handle, publisher) = create_bus();
@@ -2311,10 +2307,7 @@ async fn transcribe_via_skill(
         serde_json::from_str(&stdout).wrap_err("invalid asr skill output")?;
 
     if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
-        Ok(result["output"]
-            .as_str()
-            .unwrap_or("")
-            .to_string())
+        Ok(result["output"].as_str().unwrap_or("").to_string())
     } else {
         let msg = result["output"].as_str().unwrap_or("unknown error");
         eyre::bail!("asr skill failed: {msg}")

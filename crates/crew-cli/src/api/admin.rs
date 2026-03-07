@@ -667,14 +667,7 @@ fn resolve_saved_key(
     let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            // Admin: resolve from first profile (same as /api/my/* endpoints)
-            let profiles = ps
-                .list()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            profiles
-                .first()
-                .map(|p| p.id.clone())
-                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
+            super::auth_handlers::ADMIN_PROFILE_ID.into()
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -849,14 +842,7 @@ fn resolve_saved_search_key(
     let profile_id = match identity {
         Some(axum::Extension(super::router::AuthIdentity::User { id, .. })) => id.clone(),
         Some(axum::Extension(super::router::AuthIdentity::Admin)) => {
-            // Admin: resolve from first profile (same as /api/my/* endpoints)
-            let profiles = ps
-                .list()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            profiles
-                .first()
-                .map(|p| p.id.clone())
-                .ok_or((StatusCode::NOT_FOUND, "no profiles exist".into()))?
+            super::auth_handlers::ADMIN_PROFILE_ID.into()
         }
         None => {
             return Err((StatusCode::UNAUTHORIZED, "not authenticated".into()));
@@ -1613,9 +1599,13 @@ pub async fn platform_models_catalog(
         Ok(catalog) => catalog
             .into_iter()
             .map(|m| {
-                let role = allowlist.find(&m.id).map(|p| p.role.as_str()).unwrap_or("unknown");
+                let role = allowlist
+                    .find(&m.id)
+                    .map(|p| p.role.as_str())
+                    .unwrap_or("unknown");
                 let mut v = serde_json::to_value(&m).unwrap_or_default();
-                v.as_object_mut().map(|o| o.insert("role".into(), role.into()));
+                v.as_object_mut()
+                    .map(|o| o.insert("role".into(), role.into()));
                 v
             })
             .collect(),
@@ -1659,10 +1649,17 @@ pub async fn platform_models_download(
     ))?;
     let allowlist = crew_llm::ominix::PlatformModels::load_or_create(store.crew_home_dir());
     if allowlist.find(model_id).is_none() {
-        let valid: Vec<&str> = allowlist.platform_models.iter().map(|m| m.id.as_str()).collect();
+        let valid: Vec<&str> = allowlist
+            .platform_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("Model '{model_id}' not in platform allowlist. Valid: {}", valid.join(", ")),
+            format!(
+                "Model '{model_id}' not in platform allowlist. Valid: {}",
+                valid.join(", ")
+            ),
         ));
     }
 
@@ -1795,10 +1792,10 @@ pub async fn platform_models_enable(
         .get("model_id")
         .and_then(|v| v.as_str())
         .ok_or((StatusCode::BAD_REQUEST, "missing model_id".into()))?;
-    let role = body
-        .get("role")
-        .and_then(|v| v.as_str())
-        .ok_or((StatusCode::BAD_REQUEST, "missing role (asr, tts, etc.)".into()))?;
+    let role = body.get("role").and_then(|v| v.as_str()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "missing role (asr, tts, etc.)".into(),
+    ))?;
 
     let store = state.profile_store.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1814,10 +1811,12 @@ pub async fn platform_models_enable(
         })));
     }
 
-    allowlist.platform_models.push(crew_llm::ominix::PlatformModel {
-        id: model_id.to_string(),
-        role: role.to_string(),
-    });
+    allowlist
+        .platform_models
+        .push(crew_llm::ominix::PlatformModel {
+            id: model_id.to_string(),
+            role: role.to_string(),
+        });
     allowlist.save(&crew_home).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
