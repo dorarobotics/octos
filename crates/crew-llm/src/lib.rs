@@ -22,6 +22,11 @@ mod swappable;
 mod types;
 pub mod vision;
 
+pub mod catalog;
+pub mod error;
+pub mod high_level;
+pub mod middleware;
+
 pub mod anthropic;
 pub mod gemini;
 pub mod ominix;
@@ -46,6 +51,10 @@ pub use provider::{
 };
 pub use retry::{RetryConfig, RetryProvider};
 pub use router::{ProviderRouter, SubProviderMeta};
+pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
+pub use error::{LlmError, LlmErrorKind};
+pub use high_level::LlmClient;
+pub use middleware::{LlmMiddleware, MiddlewareStack};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use transcription::GroqTranscriber;

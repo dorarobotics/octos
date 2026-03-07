@@ -69,6 +69,34 @@ pub struct Message {
     pub timestamp: DateTime<Utc>,
 }
 
+impl Message {
+    /// Create a user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create an assistant message.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: Utc::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MessageRole {
