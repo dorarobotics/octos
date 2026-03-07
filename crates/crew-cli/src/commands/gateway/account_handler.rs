@@ -2,6 +2,20 @@
 
 use std::sync::Arc;
 
+/// Verify a sub-account belongs to the given parent, returning the profile or an error message.
+fn verify_sub_account(
+    store: &crate::profiles::ProfileStore,
+    sub_id: &str,
+    parent_id: &str,
+) -> Result<crate::profiles::UserProfile, String> {
+    match store.get(sub_id) {
+        Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => Ok(p),
+        Ok(Some(_)) => Err(format!("'{sub_id}' is not a sub-account of this profile.")),
+        Ok(None) => Err(format!("Sub-account '{sub_id}' not found.")),
+        Err(e) => Err(format!("Error: {e}")),
+    }
+}
+
 /// Handle /account command — sub-account CRUD operations.
 pub async fn handle_account_command(
     args: &str,
@@ -81,17 +95,12 @@ pub async fn handle_account_command(
             if sub_id.is_empty() {
                 return "Usage: /account delete <sub-id>".to_string();
             }
-            // Safety: verify it's a sub-account of this parent
-            match store.get(sub_id) {
-                Ok(Some(sub)) if sub.parent_id.as_deref() == Some(parent_id) => {
-                    match store.delete(sub_id) {
-                        Ok(true) => format!("Deleted sub-account: {sub_id}"),
-                        Ok(false) => format!("Sub-account '{sub_id}' not found"),
-                        Err(e) => format!("Error: {e}"),
-                    }
-                }
-                Ok(Some(_)) => format!("'{sub_id}' is not a sub-account of this profile."),
-                Ok(None) => format!("Sub-account '{sub_id}' not found."),
+            if let Err(msg) = verify_sub_account(store, sub_id, parent_id) {
+                return msg;
+            }
+            match store.delete(sub_id) {
+                Ok(true) => format!("Deleted sub-account: {sub_id}"),
+                Ok(false) => format!("Sub-account '{sub_id}' not found"),
                 Err(e) => format!("Error: {e}"),
             }
         }
@@ -104,11 +113,9 @@ pub async fn handle_account_command(
             if sub_id.is_empty() {
                 return "Usage: /account start <sub-id>".to_string();
             }
-            let mut profile = match store.get(sub_id) {
-                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
-                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
-                Err(e) => return format!("Error: {e}"),
+            let mut profile = match verify_sub_account(store, sub_id, parent_id) {
+                Ok(p) => p,
+                Err(msg) => return msg,
             };
             profile.enabled = true;
             profile.updated_at = chrono::Utc::now();
@@ -126,11 +133,9 @@ pub async fn handle_account_command(
             if sub_id.is_empty() {
                 return "Usage: /account stop <sub-id>".to_string();
             }
-            let mut profile = match store.get(sub_id) {
-                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
-                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
-                Err(e) => return format!("Error: {e}"),
+            let mut profile = match verify_sub_account(store, sub_id, parent_id) {
+                Ok(p) => p,
+                Err(msg) => return msg,
             };
             profile.enabled = false;
             profile.updated_at = chrono::Utc::now();
@@ -148,11 +153,9 @@ pub async fn handle_account_command(
             if sub_id.is_empty() {
                 return "Usage: /account restart <sub-id>".to_string();
             }
-            let mut profile = match store.get(sub_id) {
-                Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-                Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
-                Ok(None) => return format!("Sub-account '{sub_id}' not found."),
-                Err(e) => return format!("Error: {e}"),
+            let mut profile = match verify_sub_account(store, sub_id, parent_id) {
+                Ok(p) => p,
+                Err(msg) => return msg,
             };
             if !profile.enabled {
                 return format!(
@@ -191,12 +194,9 @@ fn handle_account_update(
             Example: /account update my--bot telegram-token=123:ABC enabled=true"
             .to_string();
     }
-    // Verify it's a sub-account of this parent
-    let mut profile = match store.get(sub_id) {
-        Ok(Some(p)) if p.parent_id.as_deref() == Some(parent_id) => p,
-        Ok(Some(_)) => return format!("'{sub_id}' is not a sub-account of this profile."),
-        Ok(None) => return format!("Sub-account '{sub_id}' not found."),
-        Err(e) => return format!("Error: {e}"),
+    let mut profile = match verify_sub_account(store, sub_id, parent_id) {
+        Ok(p) => p,
+        Err(msg) => return msg,
     };
 
     let mut changed = Vec::new();
