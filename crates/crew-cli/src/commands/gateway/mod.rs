@@ -4,7 +4,6 @@ mod account_handler;
 mod prompt;
 mod session_ui;
 mod skills_handler;
-mod transcription;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1186,7 +1185,7 @@ impl GatewayCommand {
                         if let Some(ref lang) = asr_language {
                             input["language"] = serde_json::Value::String(lang.clone());
                         }
-                        match transcription::transcribe_via_skill(asr_bin, &input.to_string())
+                        match transcribe_via_skill(asr_bin, &input.to_string())
                             .await
                         {
                             Ok(text) => {
@@ -1326,15 +1325,7 @@ impl GatewayCommand {
                     // Clear current session (existing behavior)
                     match session_mgr.lock().await.clear(&session_key).await {
                         Ok(()) => {
-                            let msg = OutboundMessage {
-                                channel: reply_channel.clone(),
-                                chat_id: reply_chat_id.clone(),
-                                content: "Session cleared.".to_string(),
-                                reply_to: None,
-                                media: vec![],
-                                metadata: serde_json::json!({}),
-                            };
-                            let _ = agent_handle.send_outbound(msg).await;
+                            let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Session cleared.")).await;
                         }
                         Err(e) => {
                             warn!("session clear failed: {e}");
@@ -1343,30 +1334,14 @@ impl GatewayCommand {
                 } else {
                     // Create/switch to named session
                     if let Err(reason) = validate_topic_name(name) {
-                        let msg = OutboundMessage {
-                            channel: reply_channel.clone(),
-                            chat_id: reply_chat_id.clone(),
-                            content: format!("Invalid session name: {reason}"),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        };
-                        let _ = agent_handle.send_outbound(msg).await;
+                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Invalid session name: {reason}"))).await;
                     } else {
                         active_sessions
                             .lock()
                             .await
                             .switch_to(&base_key_str, name)
                             .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-                        let msg = OutboundMessage {
-                            channel: reply_channel.clone(),
-                            chat_id: reply_chat_id.clone(),
-                            content: format!("Switched to session: {name}"),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        };
-                        let _ = agent_handle.send_outbound(msg).await;
+                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched to session: {name}"))).await;
                     }
                 }
                 continue;
@@ -1382,29 +1357,13 @@ impl GatewayCommand {
                         .await
                         .switch_to(&base_key_str, "")
                         .unwrap_or_else(|e| warn!("switch_to failed: {e}"));
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: "Switched to default session.".to_string(),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    let _ = agent_handle.send_outbound(msg).await;
+                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Switched to default session.")).await;
 
                     // Flush any buffered messages from this session
                     let target_key = SessionKey::new(&inbound.channel, &inbound.chat_id);
                     actor_registry.flush_pending(&target_key.to_string()).await;
                 } else if let Err(reason) = validate_topic_name(name) {
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: format!("Invalid session name: {reason}"),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    let _ = agent_handle.send_outbound(msg).await;
+                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Invalid session name: {reason}"))).await;
                 } else {
                     active_sessions
                         .lock()
@@ -1431,15 +1390,7 @@ impl GatewayCommand {
                         }
                     };
 
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: format!("Switched to session: {name}{preview}"),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    let _ = agent_handle.send_outbound(msg).await;
+                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched to session: {name}{preview}"))).await;
 
                     // Flush any buffered messages from this session
                     actor_registry.flush_pending(&new_key.to_string()).await;
@@ -1460,26 +1411,12 @@ impl GatewayCommand {
                     .to_string();
 
                 if entries.is_empty() {
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: "No sessions found. Use /new <name> to create one.".to_string(),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    let _ = agent_handle.send_outbound(msg).await;
+                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "No sessions found. Use /new <name> to create one.")).await;
                 } else {
                     let keyboard = session_ui::build_session_keyboard(&entries, &active_topic);
                     let text = session_ui::build_session_text(&entries, &active_topic);
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: text,
-                        reply_to: None,
-                        media: vec![],
-                        metadata: keyboard,
-                    };
+                    let mut msg = make_reply(&reply_channel, &reply_chat_id, text);
+                    msg.metadata = keyboard;
                     let _ = agent_handle.send_outbound(msg).await;
                 }
                 continue;
@@ -1495,15 +1432,7 @@ impl GatewayCommand {
                         } else {
                             topic.clone()
                         };
-                        let msg = OutboundMessage {
-                            channel: reply_channel.clone(),
-                            chat_id: reply_chat_id.clone(),
-                            content: format!("Switched back to session: {label}"),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        };
-                        let _ = agent_handle.send_outbound(msg).await;
+                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Switched back to session: {label}"))).await;
 
                         // Flush any buffered messages from the target session
                         let target_key =
@@ -1511,15 +1440,7 @@ impl GatewayCommand {
                         actor_registry.flush_pending(&target_key.to_string()).await;
                     }
                     Ok(None) => {
-                        let msg = OutboundMessage {
-                            channel: reply_channel.clone(),
-                            chat_id: reply_chat_id.clone(),
-                            content: "No previous session to switch to.".to_string(),
-                            reply_to: None,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        };
-                        let _ = agent_handle.send_outbound(msg).await;
+                        let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "No previous session to switch to.")).await;
                     }
                     Err(e) => {
                         warn!("go_back failed: {e}");
@@ -1532,15 +1453,7 @@ impl GatewayCommand {
             if cmd.starts_with("/delete ") {
                 let name = cmd.strip_prefix("/delete").unwrap_or("").trim();
                 if name.is_empty() {
-                    let msg = OutboundMessage {
-                        channel: reply_channel.clone(),
-                        chat_id: reply_chat_id.clone(),
-                        content: "Usage: /delete <session-name>".to_string(),
-                        reply_to: None,
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    };
-                    let _ = agent_handle.send_outbound(msg).await;
+                    let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, "Usage: /delete <session-name>")).await;
                 } else {
                     let del_key = SessionKey::with_topic(&inbound.channel, &inbound.chat_id, name);
                     match session_mgr.lock().await.clear(&del_key).await {
@@ -1550,15 +1463,7 @@ impl GatewayCommand {
                                 .await
                                 .remove_topic(&base_key_str, name)
                                 .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
-                            let msg = OutboundMessage {
-                                channel: reply_channel.clone(),
-                                chat_id: reply_chat_id.clone(),
-                                content: format!("Deleted session: {name}"),
-                                reply_to: None,
-                                media: vec![],
-                                metadata: serde_json::json!({}),
-                            };
-                            let _ = agent_handle.send_outbound(msg).await;
+                            let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, format!("Deleted session: {name}"))).await;
                         }
                         Err(e) => {
                             warn!("delete session failed: {e}");
@@ -1578,15 +1483,7 @@ impl GatewayCommand {
                     .unwrap_or("")
                     .trim();
                 let response = tool_config.handle_config_command(args).await;
-                let msg = OutboundMessage {
-                    channel: reply_channel.clone(),
-                    chat_id: reply_chat_id.clone(),
-                    content: response,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                };
-                let _ = agent_handle.send_outbound(msg).await;
+                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
                 continue;
             }
 
@@ -1602,15 +1499,7 @@ impl GatewayCommand {
                     .trim();
                 let response =
                     account_handler::handle_account_command(args, profile_id.as_deref(), &profile_store).await;
-                let msg = OutboundMessage {
-                    channel: reply_channel.clone(),
-                    chat_id: reply_chat_id.clone(),
-                    content: response,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                };
-                let _ = agent_handle.send_outbound(msg).await;
+                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
                 continue;
             }
 
@@ -1626,15 +1515,7 @@ impl GatewayCommand {
                 let response =
                     skills_handler::handle_skills_command(args, profile_id.as_deref(), &data_dir, &profile_store)
                         .await;
-                let msg = OutboundMessage {
-                    channel: reply_channel.clone(),
-                    chat_id: reply_chat_id.clone(),
-                    content: response,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                };
-                let _ = agent_handle.send_outbound(msg).await;
+                let _ = agent_handle.send_outbound(make_reply(&reply_channel, &reply_chat_id, response)).await;
                 continue;
             }
 
@@ -1680,6 +1561,18 @@ impl GatewayCommand {
     }
 }
 
+/// Build a simple text reply to send back on the same channel/chat.
+fn make_reply(channel: &str, chat_id: &str, content: impl Into<String>) -> OutboundMessage {
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        content: content.into(),
+        reply_to: None,
+        media: vec![],
+        metadata: serde_json::json!({}),
+    }
+}
+
 /// Merge queued inbound messages by session key.
 /// Messages from the same session are concatenated with `\n\n`.
 /// Used by Collect queue mode (reserved for future concurrent collect support).
@@ -1712,4 +1605,41 @@ fn merge_queued_by_session(
             Some(base)
         })
         .collect()
+}
+
+/// Transcribe audio by spawning the asr platform skill binary.
+async fn transcribe_via_skill(
+    asr_binary: &std::path::Path,
+    input_json: &str,
+) -> eyre::Result<String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new(asr_binary)
+        .arg("voice_transcribe")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .wrap_err("failed to spawn asr skill binary")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input_json.as_bytes()).await?;
+        drop(stdin);
+    }
+
+    let output =
+        tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output())
+            .await
+            .map_err(|_| eyre::eyre!("asr transcription timed out"))??;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value =
+        serde_json::from_str(&stdout).wrap_err("invalid asr skill output")?;
+
+    if result.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(result["output"].as_str().unwrap_or("").to_string())
+    } else {
+        let msg = result["output"].as_str().unwrap_or("unknown error");
+        eyre::bail!("asr skill failed: {msg}")
+    }
 }
