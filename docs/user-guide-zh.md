@@ -167,6 +167,84 @@ Crew 开箱即用支持 14 个 LLM 提供商。每个提供商需要设置对应
 | `ollama` | *（无需）* | llama3.2 | OpenAI 兼容 | — |
 | `vllm` | `VLLM_API_KEY` | *（必须指定）* | OpenAI 兼容 | — |
 
+#### 如何获取 API 密钥
+
+**Google Gemini：**
+1. 访问 [Google AI Studio](https://aistudio.google.com/apikey)
+2. 使用 Google 账号登录
+3. 点击"Create API Key"，选择或创建一个 Google Cloud 项目
+4. 复制生成的 API 密钥
+5. 设置环境变量：`export GEMINI_API_KEY="your-key"`
+
+**阿里云灵积 DashScope（通义千问 Qwen）：**
+1. 访问[灵积控制台](https://dashscope.console.aliyun.com/)
+2. 注册或登录阿里云账号
+3. 进入 **API-KEY 管理** 页面
+4. 点击"创建新的 API-KEY"
+5. 复制生成的密钥
+6. 设置环境变量：`export DASHSCOPE_API_KEY="your-key"`
+
+**DeepSeek（深度求索）：**
+1. 访问 [DeepSeek 开放平台](https://platform.deepseek.com/api_keys)
+2. 注册或登录
+3. 点击"创建 API key"
+4. 复制密钥
+5. 设置环境变量：`export DEEPSEEK_API_KEY="your-key"`
+
+**Moonshot / Kimi（月之暗面）：**
+1. 访问 [Moonshot 开放平台](https://platform.moonshot.cn/console/api-keys)
+2. 注册或登录
+3. 点击"新建 API Key"
+4. 复制密钥
+5. 设置环境变量：`export MOONSHOT_API_KEY="your-key"`
+
+**OpenAI：**
+1. 访问 [OpenAI API Keys](https://platform.openai.com/api-keys)
+2. 注册或登录
+3. 点击"Create new secret key"
+4. 复制密钥
+5. 设置环境变量：`export OPENAI_API_KEY="your-key"`
+
+**Anthropic：**
+1. 访问 [Anthropic Console](https://console.anthropic.com/settings/keys)
+2. 注册或登录
+3. 点击"Create Key"
+4. 复制密钥
+5. 设置环境变量：`export ANTHROPIC_API_KEY="your-key"`
+
+**MiniMax（稀宇科技）：**
+1. 访问 [MiniMax 开放平台](https://platform.minimaxi.com/)
+2. 注册或登录
+3. 在控制台中进入 **API Keys** 管理页面
+4. 点击"创建 API Key"
+5. 复制密钥
+6. 设置环境变量：`export MINIMAX_API_KEY="your-key"`
+
+**Z.AI：**
+1. 访问 [Z.AI 平台](https://z.ai/)
+2. 注册或登录
+3. 进入 API 密钥管理页面
+4. 创建新的 API 密钥
+5. 复制密钥
+6. 设置环境变量：`export ZAI_API_KEY="your-key"`
+7. 注意：Z.AI 使用 Anthropic Messages API 协议（`api_type: "anthropic"`）
+
+**Nvidia NIM：**
+1. 访问 [Nvidia NIM](https://build.nvidia.com/)
+2. 使用 Nvidia 账号注册或登录
+3. 进入任意模型页面，点击"Get API Key"
+4. 复制生成的密钥
+5. 设置环境变量：`export NVIDIA_API_KEY="your-key"`
+6. 注意：Nvidia NIM 托管多种模型 — 必须显式指定模型名称（如 `meta/llama-3.3-70b-instruct`）
+
+**OpenRouter：**
+1. 访问 [OpenRouter](https://openrouter.ai/keys)
+2. 注册或登录
+3. 点击"Create Key"
+4. 复制密钥
+5. 设置环境变量：`export OPENROUTER_API_KEY="your-key"`
+6. 注意：OpenRouter 是多模型聚合器 — 使用类似 `anthropic/claude-sonnet-4-20250514`、`openai/gpt-4o` 等模型名称
+
 ### 3.2 配置方法
 
 #### 方法 1：配置文件

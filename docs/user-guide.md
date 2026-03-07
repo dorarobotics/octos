@@ -167,6 +167,84 @@ Crew supports 14 LLM providers out of the box. Each provider requires an API key
 | `ollama` | *(none)* | llama3.2 | OpenAI-compatible | — |
 | `vllm` | `VLLM_API_KEY` | *(must specify)* | OpenAI-compatible | — |
 
+#### How to Get API Keys
+
+**Google Gemini:**
+1. Go to [Google AI Studio](https://aistudio.google.com/apikey)
+2. Sign in with your Google account
+3. Click "Create API Key" and select or create a Google Cloud project
+4. Copy the generated API key
+5. Set it: `export GEMINI_API_KEY="your-key"`
+
+**Alibaba DashScope (Qwen):**
+1. Go to [DashScope Console](https://dashscope.console.aliyun.com/)
+2. Sign up or log in with an Alibaba Cloud account
+3. Navigate to **API-KEY Management** (API-KEY 管理)
+4. Click "Create API Key" (创建新的 API-KEY)
+5. Copy the generated key
+6. Set it: `export DASHSCOPE_API_KEY="your-key"`
+
+**DeepSeek:**
+1. Go to [DeepSeek Platform](https://platform.deepseek.com/api_keys)
+2. Sign up or log in
+3. Click "Create new API key"
+4. Copy the key
+5. Set it: `export DEEPSEEK_API_KEY="your-key"`
+
+**Moonshot / Kimi:**
+1. Go to [Moonshot Platform](https://platform.moonshot.cn/console/api-keys)
+2. Sign up or log in
+3. Click "Create new API key" (新建 API Key)
+4. Copy the key
+5. Set it: `export MOONSHOT_API_KEY="your-key"`
+
+**OpenAI:**
+1. Go to [OpenAI API Keys](https://platform.openai.com/api-keys)
+2. Sign up or log in
+3. Click "Create new secret key"
+4. Copy the key
+5. Set it: `export OPENAI_API_KEY="your-key"`
+
+**Anthropic:**
+1. Go to [Anthropic Console](https://console.anthropic.com/settings/keys)
+2. Sign up or log in
+3. Click "Create Key"
+4. Copy the key
+5. Set it: `export ANTHROPIC_API_KEY="your-key"`
+
+**MiniMax:**
+1. Go to [MiniMax Open Platform](https://platform.minimaxi.com/)
+2. Sign up or log in
+3. Navigate to **API Keys** in the console
+4. Click "Create API Key"
+5. Copy the key
+6. Set it: `export MINIMAX_API_KEY="your-key"`
+
+**Z.AI:**
+1. Go to [Z.AI Platform](https://z.ai/)
+2. Sign up or log in
+3. Navigate to the API key management page
+4. Create a new API key
+5. Copy the key
+6. Set it: `export ZAI_API_KEY="your-key"`
+7. Note: Z.AI uses the Anthropic Messages API protocol (`api_type: "anthropic"`)
+
+**Nvidia NIM:**
+1. Go to [Nvidia NIM](https://build.nvidia.com/)
+2. Sign up or log in with your Nvidia account
+3. Navigate to any model page and click "Get API Key"
+4. Copy the generated key
+5. Set it: `export NVIDIA_API_KEY="your-key"`
+6. Note: Nvidia NIM hosts many models — you must specify the model name explicitly (e.g., `meta/llama-3.3-70b-instruct`)
+
+**OpenRouter:**
+1. Go to [OpenRouter](https://openrouter.ai/keys)
+2. Sign up or log in
+3. Click "Create Key"
+4. Copy the key
+5. Set it: `export OPENROUTER_API_KEY="your-key"`
+6. Note: OpenRouter is a multi-model aggregator — use model names like `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4o`, etc.
+
 ### 3.2 Configuration Methods
 
 #### Method 1: Config File
