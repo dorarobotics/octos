@@ -62,6 +62,26 @@ impl ProgressReporter for ChannelStreamReporter {
 /// Minimum interval between message edits (avoids API rate limits).
 const EDIT_THROTTLE: Duration = Duration::from_millis(1000);
 
+/// Strip `<think>...</think>` blocks from streaming buffer.
+/// Handles partial tags (open `<think>` not yet closed) by hiding from that point.
+fn strip_think_from_buffer(buf: &str) -> String {
+    let mut result = String::new();
+    let mut rest = buf;
+
+    while let Some(start) = rest.find("<think>") {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + "<think>".len()..];
+        if let Some(end) = after.find("</think>") {
+            rest = &after[end + "</think>".len()..];
+        } else {
+            // Unclosed <think> — hide everything from here (still streaming)
+            return result.trim_end().to_string();
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Result of the stream forwarder — returns the message ID if streaming happened.
 pub struct StreamResult {
     /// The platform message ID of the streamed message, if any was sent.
@@ -108,16 +128,22 @@ pub async fn run_stream_forwarder(
 
                 buffer.push_str(&text);
 
-                // Throttled edit
+                // Throttled edit — strip <think> blocks before showing to user
                 if last_edit.elapsed() >= EDIT_THROTTLE && !buffer.is_empty() {
-                    flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
-                    last_edit = Instant::now();
+                    let visible = strip_think_from_buffer(&buffer);
+                    if !visible.is_empty() {
+                        flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+                        last_edit = Instant::now();
+                    }
                 }
             }
             StreamProgressEvent::StreamDone { .. } => {
-                // Flush remaining buffer
+                // Flush remaining buffer — strip think tags
                 if !buffer.is_empty() {
-                    flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+                    let visible = strip_think_from_buffer(&buffer);
+                    if !visible.is_empty() {
+                        flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+                    }
                 }
             }
             StreamProgressEvent::ToolStarted { name } => {
@@ -147,7 +173,10 @@ pub async fn run_stream_forwarder(
 
     // Final flush
     if !buffer.is_empty() && message_id.is_none() {
-        flush_to_channel(&channel, &chat_id, &buffer, &mut message_id).await;
+        let visible = strip_think_from_buffer(&buffer);
+        if !visible.is_empty() {
+            flush_to_channel(&channel, &chat_id, &visible, &mut message_id).await;
+        }
     }
 
     StreamResult {
