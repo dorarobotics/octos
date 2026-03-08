@@ -66,6 +66,10 @@ pub struct ConversationResponse {
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
     pub streamed: bool,
+    /// All messages generated during processing (assistant replies, tool calls,
+    /// tool results). Includes the user message at the front. Callers should
+    /// persist these to session history so subsequent calls see the full context.
+    pub messages: Vec<Message>,
 }
 
 /// Shared atomic counters for real-time token tracking (used by status indicators).
@@ -340,11 +344,14 @@ impl Agent {
 
         loop {
             if let Some(stop) = self.check_budget(iteration, start, &total_usage) {
+                // Skip system prompt + history; return only new messages
+                let new_start = (1 + history.len()).min(messages.len());
                 return Ok(ConversationResponse {
                     content: stop.message(),
                     token_usage: total_usage,
                     files_modified,
                     streamed: false,
+                    messages: messages[new_start..].to_vec(),
                 });
             }
 
@@ -397,11 +404,13 @@ impl Agent {
             match response.stop_reason {
                 StopReason::EndTurn | StopReason::StopSequence => {
                     self.emit_cost_update(&total_usage, &response.usage);
+                    let new_start = (1 + history.len()).min(messages.len());
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
                         files_modified,
                         streamed,
+                        messages: messages[new_start..].to_vec(),
                     });
                 }
                 StopReason::ToolUse => {
@@ -431,11 +440,13 @@ impl Agent {
                 }
                 StopReason::MaxTokens => {
                     self.emit_cost_update(&total_usage, &response.usage);
+                    let new_start = (1 + history.len()).min(messages.len());
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_default(),
                         token_usage: total_usage,
                         files_modified,
                         streamed,
+                        messages: messages[new_start..].to_vec(),
                     });
                 }
                 StopReason::ContentFiltered => {
@@ -443,6 +454,7 @@ impl Agent {
                     // Return a user-visible message instead of empty content.
                     self.emit_cost_update(&total_usage, &response.usage);
                     warn!("content filtered by provider safety/moderation after retries");
+                    let new_start = (1 + history.len()).min(messages.len());
                     return Ok(ConversationResponse {
                         content: response.content.unwrap_or_else(|| {
                             "[Content was blocked by the model's safety filter. \
@@ -452,6 +464,7 @@ impl Agent {
                         token_usage: total_usage,
                         files_modified,
                         streamed,
+                        messages: messages[new_start..].to_vec(),
                     });
                 }
             }
@@ -1821,6 +1834,7 @@ mod tests {
             },
             files_modified: vec![],
             streamed: false,
+            messages: vec![],
         };
         let cloned = resp.clone();
         assert_eq!(cloned.content, "test");
