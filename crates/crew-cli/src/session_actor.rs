@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use crew_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
 use crew_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
 use crew_bus::{ActiveSessionStore, SessionManager};
@@ -1171,21 +1170,11 @@ impl SessionActor {
 
         match result {
             Ok(Ok(conv_response)) => {
-                // Save messages to session
+                // Save all messages from the agent (user msg, tool calls, tool
+                // results, assistant replies) so the full context is preserved
+                // for subsequent calls.
                 {
                     let mut mgr = self.session_mgr.lock().await;
-                    let user_msg = Message {
-                        role: MessageRole::User,
-                        content: inbound.content.clone(),
-                        media: vec![],
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        timestamp: Utc::now(),
-                    };
-                    if let Err(e) = mgr.add_message(&self.session_key, user_msg).await {
-                        warn!(session = %self.session_key, error = %e, "failed to persist user message");
-                    }
 
                     // Auto-generate summary from first user message
                     {
@@ -1196,18 +1185,9 @@ impl SessionActor {
                         }
                     }
 
-                    if !conv_response.content.is_empty() {
-                        let assistant_msg = Message {
-                            role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
-                            media: vec![],
-                            tool_calls: None,
-                            tool_call_id: None,
-                            reasoning_content: None,
-                            timestamp: Utc::now(),
-                        };
-                        if let Err(e) = mgr.add_message(&self.session_key, assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant message");
+                    for msg in &conv_response.messages {
+                        if let Err(e) = mgr.add_message(&self.session_key, msg.clone()).await {
+                            warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
 
