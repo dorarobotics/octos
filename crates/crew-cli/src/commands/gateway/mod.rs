@@ -371,8 +371,7 @@ impl GatewayCommand {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         });
-        let asr_binary = if voice_binary_path.exists() && ominix_url.is_some() {
-            let url = ominix_url.unwrap();
+        let asr_binary = if let Some(url) = ominix_url.filter(|_| voice_binary_path.exists()) {
             println!("{}: voice platform skill ({})", "Transcriber".green(), url);
             println!("{}: {} ({})", "Voice".green(), "enabled".green(), url);
             // Export so the voice binary can find the server

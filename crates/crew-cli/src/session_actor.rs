@@ -1187,10 +1187,7 @@ impl SessionActor {
 
         // Wait for stream forwarder
         let stream_result = if let Some(handle) = stream_forwarder {
-            match handle.await {
-                Ok(sr) => Some(sr),
-                Err(_) => None,
-            }
+            (handle.await).ok()
         } else {
             None
         };
@@ -1563,10 +1560,7 @@ impl SessionActor {
 
         // Wait for stream forwarder to complete and get its result
         let stream_result = if let Some(handle) = stream_forwarder {
-            match handle.await {
-                Ok(sr) => Some(sr),
-                Err(_) => None,
-            }
+            (handle.await).ok()
         } else {
             None
         };
