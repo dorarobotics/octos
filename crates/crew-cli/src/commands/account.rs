@@ -476,5 +476,6 @@ fn channel_type(ch: &ChannelCredentials) -> &'static str {
         ChannelCredentials::Feishu { .. } => "feishu",
         ChannelCredentials::Email { .. } => "email",
         ChannelCredentials::Twilio { .. } => "twilio",
+        ChannelCredentials::WeComBot { .. } => "wecom-bot",
     }
 }

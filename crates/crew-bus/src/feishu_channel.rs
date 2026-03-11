@@ -1219,6 +1219,10 @@ impl Channel for FeishuChannel {
         "feishu"
     }
 
+    fn supports_edit(&self) -> bool {
+        true
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!(base_url = %self.base_url, mode = %self.mode, "Starting Feishu/Lark channel");
 

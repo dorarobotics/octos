@@ -124,6 +124,10 @@ impl Channel for DiscordChannel {
         1900
     }
 
+    fn supports_edit(&self) -> bool {
+        true
+    }
+
     async fn start(&self, inbound_tx: mpsc::Sender<InboundMessage>) -> Result<()> {
         info!("Starting Discord channel (gateway)");
 
