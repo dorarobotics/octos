@@ -453,12 +453,21 @@ impl WeComBotChannel {
                 break;
             }
 
+            let started = std::time::Instant::now();
+
             match self.run_connection(&inbound_tx).await {
                 Ok(()) => {
                     // Clean shutdown
                     break;
                 }
                 Err(e) => {
+                    // If the connection was alive for >30s it was a healthy session
+                    // that disconnected, not a connect-time failure.  Reset the
+                    // counter so cumulative disconnects over days don't hit the cap.
+                    if started.elapsed().as_secs() > 30 {
+                        attempts = 0;
+                    }
+
                     attempts += 1;
                     if attempts > MAX_RECONNECT_ATTEMPTS {
                         error!("WeComBot: max reconnect attempts reached, giving up");
@@ -516,7 +525,7 @@ impl Channel for WeComBotChannel {
                     .wrap_err("WeComBot: failed to send message")?;
             }
             None => {
-                warn!("WeComBot: WebSocket not connected, cannot send");
+                bail!("WeComBot: WebSocket not connected, cannot send");
             }
         }
 
