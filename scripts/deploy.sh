@@ -583,6 +583,41 @@ echo "  ominix-api plist generated"'"'"
         check_and_install poppler pdftoppm
         check_and_install node node
         check_and_install git git
+        check_and_install docker docker
+
+        # --- Colima (lightweight Docker runtime for macOS) ---
+        if ! command -v colima &>/dev/null; then
+            echo "  Installing Colima..."
+            brew install colima
+        else
+            echo "  Colima: OK"
+        fi
+        # Fix Docker credential helper error
+        mkdir -p "$HOME/.docker"
+        if [ ! -f "$HOME/.docker/config.json" ] || grep -q '"credsStore"' "$HOME/.docker/config.json" 2>/dev/null; then
+            echo '{"credsStore":""}' > "$HOME/.docker/config.json"
+        fi
+        # Ensure Colima is running (Docker daemon)
+        if command -v colima &>/dev/null && command -v docker &>/dev/null; then
+            docker context use colima 2>/dev/null || true
+            if ! docker info &>/dev/null 2>&1; then
+                echo "  Starting Colima..."
+                colima start --cpu 2 --memory 4 --disk 20 2>/dev/null || true
+                docker context use colima 2>/dev/null || true
+                brew services start colima 2>/dev/null || true
+            else
+                echo "  Docker daemon: OK"
+            fi
+            # Pre-pull common sandbox images
+            for img in ubuntu:24.04 python:3.12-alpine; do
+                if ! docker image inspect "$img" &>/dev/null 2>&1; then
+                    echo "  Pulling $img..."
+                    docker pull "$img" 2>/dev/null || true
+                else
+                    echo "  Image $img: OK"
+                fi
+            done
+        fi
 
         # --- LibreOffice (for PPTX/DOCX conversion) ---
         if [ -d "/Applications/LibreOffice.app" ] || command -v soffice &>/dev/null; then
