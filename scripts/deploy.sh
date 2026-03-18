@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy crew + app-skill binaries to remote macOS hosts.
+# Deploy octos + app-skill binaries to remote macOS hosts.
 #
 # Usage:
 #   ./scripts/deploy.sh [1|2|all]                          # Built-in Mac Minis
@@ -24,7 +24,7 @@
 #   ./scripts/deploy.sh all                                 # Both Mac Minis
 #   ./scripts/deploy.sh admin@10.0.1.50 --key ~/.ssh/id_ed25519 --init
 #   ./scripts/deploy.sh user@host --password s3cret --clone-from 1
-#   ./scripts/deploy.sh user@host --remote-bin /opt/crew/bin --remote-data /opt/crew/data
+#   ./scripts/deploy.sh user@host --remote-bin /opt/octos/bin --remote-data /opt/octos/data
 set -euo pipefail
 
 # --- Built-in targets ---
@@ -43,7 +43,7 @@ INIT_FRESH=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
-BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather)
+BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather)
 
 # --- Parse arguments ---
 # We build parallel arrays: DEPLOY_HOSTS[], DEPLOY_AUTH_TYPE[], DEPLOY_AUTH_VAL[], DEPLOY_LABEL[]
@@ -259,7 +259,7 @@ clone_data_from_builtin() {
 
 # Generate octos serve launchd plist.
 # Build content locally with all values resolved, pipe to remote via stdin.
-generate_crew_plist() {
+generate_octos_plist() {
     local i=$1
     local rbin=$2
     local rdata=$3
@@ -278,7 +278,7 @@ generate_crew_plist() {
     <string>${PLIST}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${rbin}/crew</string>
+        <string>${rbin}/octos</string>
         <string>serve</string>
         <string>--port</string>
         <string>${port}</string>
@@ -402,7 +402,7 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
                     echo "    Skipping data setup, keeping existing data."
                     # Still generate plist if it doesn't exist
                     if ! ssh_target "$i" "[ -f ~/Library/LaunchAgents/${PLIST}.plist ]" 2>/dev/null; then
-                        generate_crew_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
+                        generate_octos_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
                     fi
                     # Jump past the data setup block
                     SKIP_DATA_SETUP=true
@@ -454,11 +454,11 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
             else
                 # Clean slate — create minimal cron.json
                 ssh_target "$i" "[ -f '$RDATA/cron.json' ] || echo '{\"version\":1,\"jobs\":[]}' > '$RDATA/cron.json'"
-                echo "    Clean slate initialized (no profiles — create with 'crew profile create')"
+                echo "    Clean slate initialized (no profiles — create with 'octos profile create')"
             fi
 
             # Generate octos serve launchd plist
-            generate_crew_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
+            generate_octos_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
         fi
         unset SKIP_DATA_SETUP
     fi
@@ -712,7 +712,7 @@ echo "  ominix-api plist generated"'"'"
 
     echo "==> Verifying..."
     sleep 2
-    ssh_target "$i" "launchctl list | grep crew || echo 'WARNING: service not found'"
+    ssh_target "$i" "launchctl list | grep octos || echo 'WARNING: service not found'"
     echo "==> $LABEL deploy complete."
 done
 
