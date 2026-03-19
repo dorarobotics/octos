@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy crew + app-skill binaries to remote macOS hosts.
+# Deploy octos + app-skill binaries to remote macOS hosts.
 #
 # Usage:
 #   ./scripts/deploy.sh [1|2|all]                          # Built-in Mac Minis
@@ -18,13 +18,16 @@
 #   --init                Initialize data dir on fresh machine (clean slate)
 #   --clone-from <1|2>    Clone profiles & config from built-in Mac Mini
 #   --serve-port <port>   Port for octos serve (default: 3000)
+#   --factory-reset       Stop all services, wipe old data (~/.crew + ~/.octos),
+#                         remove legacy plists, and do a clean install from scratch
+#   --keep-profiles       With --factory-reset: preserve profiles/*.json and config.json
 #
 # Examples:
 #   ./scripts/deploy.sh 1                                   # Mac Mini 1
 #   ./scripts/deploy.sh all                                 # Both Mac Minis
 #   ./scripts/deploy.sh admin@10.0.1.50 --key ~/.ssh/id_ed25519 --init
 #   ./scripts/deploy.sh user@host --password s3cret --clone-from 1
-#   ./scripts/deploy.sh user@host --remote-bin /opt/crew/bin --remote-data /opt/crew/data
+#   ./scripts/deploy.sh user@host --remote-bin /opt/octos/bin --remote-data /opt/octos/data
 set -euo pipefail
 
 # --- Built-in targets ---
@@ -40,10 +43,12 @@ PLIST="io.ominix.octos-serve"
 SKIP_BUILD=false
 SKIP_OMINIX=false
 INIT_FRESH=false
+FACTORY_RESET=false
+KEEP_PROFILES=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
-BINARIES=(crew news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather)
+BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather)
 
 # --- Parse arguments ---
 # We build parallel arrays: DEPLOY_HOSTS[], DEPLOY_AUTH_TYPE[], DEPLOY_AUTH_VAL[], DEPLOY_LABEL[]
@@ -103,6 +108,12 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             shift 2 ;;
+        --factory-reset)
+            FACTORY_RESET=true
+            shift ;;
+        --keep-profiles)
+            KEEP_PROFILES=true
+            shift ;;
         --serve-port)
             SERVE_PORT="$2"
             shift 2 ;;
@@ -259,7 +270,7 @@ clone_data_from_builtin() {
 
 # Generate octos serve launchd plist.
 # Build content locally with all values resolved, pipe to remote via stdin.
-generate_crew_plist() {
+generate_plist() {
     local i=$1
     local rbin=$2
     local rdata=$3
@@ -278,7 +289,7 @@ generate_crew_plist() {
     <string>${PLIST}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${rbin}/crew</string>
+        <string>${rbin}/octos</string>
         <string>serve</string>
         <string>--port</string>
         <string>${port}</string>
@@ -362,6 +373,60 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
     echo "==> Remote data: $RDATA"
     echo "========================================"
 
+    # --- Factory reset (wipe everything, clean slate) ---
+    if [[ "$FACTORY_RESET" == true ]]; then
+        echo "==> FACTORY RESET: wiping old data and services on $LABEL..."
+
+        # Stop all octos-related launchd services
+        ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/${PLIST}.plist 2>/dev/null || true"
+        ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/io.ominix.ominix-api.plist 2>/dev/null || true"
+        # Remove legacy plists (old names from crew era)
+        ssh_target "$i" 'bash -c '"'"'
+            for plist in ~/Library/LaunchAgents/io.ominix.*.plist; do
+                [ -f "$plist" ] || continue
+                launchctl unload "$plist" 2>/dev/null || true
+                rm -f "$plist"
+                echo "    Removed $(basename "$plist")"
+            done
+        '"'"
+        # Kill any lingering processes
+        ssh_target "$i" "pkill -f 'octos serve' 2>/dev/null || true; pkill -f 'octos gateway' 2>/dev/null || true; pkill -f 'crew serve' 2>/dev/null || true"
+        sleep 1
+
+        # Save profiles to local tmp if --keep-profiles
+        RHOME=$(resolve_remote_home "$i")
+        SAVED_PROFILES_DIR=""
+        if [[ "$KEEP_PROFILES" == true ]]; then
+            SAVED_PROFILES_DIR=$(mktemp -d)
+            echo "    Downloading profiles to preserve..."
+            # Try both old (.crew) and new (.octos) data dirs; prefer .octos
+            for data_candidate in "$RHOME/.octos" "$RHOME/.crew"; do
+                scp_target "$i" "$REMOTE:${data_candidate}/profiles/*.json" "$SAVED_PROFILES_DIR/" 2>/dev/null && break || true
+            done
+            # Also save config.json
+            for data_candidate in "$RHOME/.octos" "$RHOME/.crew"; do
+                scp_target "$i" "$REMOTE:${data_candidate}/config.json" "$SAVED_PROFILES_DIR/" 2>/dev/null && break || true
+            done
+            SAVED_COUNT=$(ls "$SAVED_PROFILES_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+            echo "    Saved $SAVED_COUNT files to local tmp"
+        fi
+
+        # Remove old data directories
+        for old_dir in "$RHOME/.crew" "$RHOME/.octos"; do
+            ssh_target "$i" "if [ -d '$old_dir' ]; then echo '    Removing $old_dir...'; rm -rf '$old_dir'; fi"
+        done
+
+        # Remove old binaries (both crew and octos names)
+        ssh_target "$i" "rm -f '${RBIN}/crew' '${RBIN}/octos'" 2>/dev/null || true
+        for bin in "${BINARIES[@]}"; do
+            ssh_target "$i" "rm -f '${RBIN}/${bin}'" 2>/dev/null || true
+        done
+        echo "    Factory reset complete. Proceeding with clean install..."
+
+        # Force init mode so data directory gets set up
+        INIT_FRESH=true
+    fi
+
     # Ensure remote dirs exist
     ssh_target "$i" "mkdir -p '$RBIN'"
     ssh_target "$i" "mkdir -p '$RDATA'"
@@ -402,7 +467,7 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
                     echo "    Skipping data setup, keeping existing data."
                     # Still generate plist if it doesn't exist
                     if ! ssh_target "$i" "[ -f ~/Library/LaunchAgents/${PLIST}.plist ]" 2>/dev/null; then
-                        generate_crew_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
+                        generate_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
                     fi
                     # Jump past the data setup block
                     SKIP_DATA_SETUP=true
@@ -454,13 +519,33 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
             else
                 # Clean slate — create minimal cron.json
                 ssh_target "$i" "[ -f '$RDATA/cron.json' ] || echo '{\"version\":1,\"jobs\":[]}' > '$RDATA/cron.json'"
-                echo "    Clean slate initialized (no profiles — create with 'crew profile create')"
+                echo "    Clean slate initialized (no profiles — create with 'octos profile create')"
             fi
 
             # Generate octos serve launchd plist
-            generate_crew_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
+            generate_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
         fi
         unset SKIP_DATA_SETUP
+    fi
+
+    # Restore saved profiles after factory reset
+    if [[ -n "${SAVED_PROFILES_DIR:-}" ]] && [[ -d "${SAVED_PROFILES_DIR:-}" ]]; then
+        echo "==> Restoring preserved profiles..."
+        ssh_target "$i" "mkdir -p '$RDATA/profiles'"
+        for pfile in "$SAVED_PROFILES_DIR"/*.json; do
+            [ -f "$pfile" ] || continue
+            pname=$(basename "$pfile")
+            if [[ "$pname" == "config.json" ]]; then
+                echo "    config.json"
+                scp_target "$i" "$pfile" "$REMOTE:$RDATA/config.json"
+            else
+                echo "    $pname"
+                scp_target "$i" "$pfile" "$REMOTE:$RDATA/profiles/$pname"
+            fi
+        done
+        rm -rf "$SAVED_PROFILES_DIR"
+        SAVED_PROFILES_DIR=""
+        echo "    Profiles restored."
     fi
 
     echo "==> Uploading binaries..."
@@ -712,7 +797,7 @@ echo "  ominix-api plist generated"'"'"
 
     echo "==> Verifying..."
     sleep 2
-    ssh_target "$i" "launchctl list | grep crew || echo 'WARNING: service not found'"
+    ssh_target "$i" "launchctl list | grep octos || echo 'WARNING: service not found'"
     echo "==> $LABEL deploy complete."
 done
 
