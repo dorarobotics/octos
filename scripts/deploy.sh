@@ -333,7 +333,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
 
     echo "==> Building release binaries..."
     (cd "$OCTOS_BUILD_DIR" && cargo build --release -p octos-cli --features telegram,whatsapp,feishu,twilio,wecom,api)
-    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p voice-skill -p clock -p weather)
+    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p voice-skill -p clock -p weather -p pipeline-guard)
 
     # Build ominix-api if source is available
     OMINIX_DIR="${OMINIX_DIR:-$HOME/home/ominix-api}"
