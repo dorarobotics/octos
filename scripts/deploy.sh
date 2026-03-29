@@ -48,7 +48,7 @@ KEEP_PROFILES=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
-BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice voice-skill clock weather pipeline-guard)
+BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard)
 
 # --- Parse arguments ---
 # We build parallel arrays: DEPLOY_HOSTS[], DEPLOY_AUTH_TYPE[], DEPLOY_AUTH_VAL[], DEPLOY_LABEL[]
@@ -333,7 +333,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
 
     echo "==> Building release binaries..."
     (cd "$OCTOS_BUILD_DIR" && cargo build --release -p octos-cli --features telegram,whatsapp,feishu,twilio,wecom,api)
-    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p voice-skill -p clock -p weather -p pipeline-guard)
+    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard)
 
     # Build ominix-api if source is available
     OMINIX_DIR="${OMINIX_DIR:-$HOME/home/ominix-api}"
@@ -769,7 +769,7 @@ echo "  ominix-api plist generated"'"'"
     done
 
     echo "==> Cleaning stale skill dirs (bootstrap recreates them)..."
-    for skill in news deep-search deep-crawl send-email account-manager voice voice-skill clock weather; do
+    for skill in news deep-search deep-crawl send-email account-manager voice clock weather; do
         ssh_target "$i" "rm -rf '${RDATA}/skills/${skill}'" 2>/dev/null || true
     done
     ssh_target "$i" "rm -rf '${RDATA}/bundled-app-skills' '${RDATA}/platform-skills'" 2>/dev/null || true
