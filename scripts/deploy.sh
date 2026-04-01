@@ -21,6 +21,8 @@
 #   --factory-reset       Stop all services, wipe old data (~/.crew + ~/.octos),
 #                         remove legacy plists, and do a clean install from scratch
 #   --keep-profiles       With --factory-reset: preserve profiles/*.json and config.json
+#   --test                Run Playwright e2e tests after deploy (web client smoke tests)
+#   --no-test             Skip post-deploy tests (default: tests run if --test is set)
 #
 # Examples:
 #   ./scripts/deploy.sh 1                                   # Mac Mini 1
@@ -45,6 +47,7 @@ SKIP_OMINIX=false
 INIT_FRESH=false
 FACTORY_RESET=false
 KEEP_PROFILES=false
+RUN_TESTS=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
@@ -117,6 +120,12 @@ while [[ $# -gt 0 ]]; do
         --serve-port)
             SERVE_PORT="$2"
             shift 2 ;;
+        --test)
+            RUN_TESTS=true
+            shift ;;
+        --no-test)
+            RUN_TESTS=false
+            shift ;;
         -h|--help)
             awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
             exit 0 ;;
@@ -824,6 +833,60 @@ done
 # Cleanup
 if [[ -n "$CLONE_TMPDIR" ]] && [[ -d "$CLONE_TMPDIR" ]]; then
     rm -rf "$CLONE_TMPDIR"
+fi
+
+# --- Post-deploy e2e tests ---
+if [[ "$RUN_TESTS" == "true" ]]; then
+    E2E_DIR="$(cd "$(dirname "$0")/../e2e" && pwd)"
+    if [[ ! -f "$E2E_DIR/package.json" ]]; then
+        echo "⚠️  e2e/ directory not found, skipping tests"
+    else
+        # Install deps if needed
+        if [[ ! -d "$E2E_DIR/node_modules" ]]; then
+            echo "==> Installing e2e test dependencies..."
+            (cd "$E2E_DIR" && npm ci --silent)
+        fi
+
+        # Map deployed hosts to test URLs
+        resolve_test_url() {
+            case "$1" in
+                "$HOST_1") echo "https://dspfac.crew.ominix.io" ;;
+                "$HOST_2") echo "https://dspfac.bot.ominix.io" ;;
+                *) echo "" ;;
+            esac
+        }
+
+        TESTS_PASSED=0
+        TESTS_FAILED=0
+
+        for i in "${!DEPLOY_HOSTS[@]}"; do
+            host="${DEPLOY_HOSTS[$i]}"
+            label="${DEPLOY_LABEL[$i]}"
+            test_url="$(resolve_test_url "$host")"
+
+            if [[ -z "$test_url" ]]; then
+                echo "==> Skipping tests for $label (no test URL mapped)"
+                continue
+            fi
+
+            echo ""
+            echo "==> Running e2e tests against $label ($test_url)..."
+            if (cd "$E2E_DIR" && OCTOS_TEST_URL="$test_url" npx playwright test web-client --reporter=list 2>&1); then
+                echo "✓  $label: all tests passed"
+                TESTS_PASSED=$((TESTS_PASSED + 1))
+            else
+                echo "✗  $label: tests failed"
+                TESTS_FAILED=$((TESTS_FAILED + 1))
+            fi
+        done
+
+        echo ""
+        if [[ $TESTS_FAILED -gt 0 ]]; then
+            echo "⚠️  Tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
+        elif [[ $TESTS_PASSED -gt 0 ]]; then
+            echo "✓  Tests: all $TESTS_PASSED targets passed"
+        fi
+    fi
 fi
 
 echo ""
