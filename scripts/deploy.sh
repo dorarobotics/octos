@@ -23,6 +23,8 @@
 #   --keep-profiles       With --factory-reset: preserve profiles/*.json and config.json
 #   --test                Run Playwright e2e tests after deploy (web client smoke tests)
 #   --no-test             Skip post-deploy tests (default: tests run if --test is set)
+#   --caddy-domain <dom>  Set up Caddy reverse proxy with on-demand TLS for *.dom
+#                         (requires wildcard DNS A record pointing to the host)
 #
 # Examples:
 #   ./scripts/deploy.sh 1                                   # Mac Mini 1
@@ -51,6 +53,7 @@ RUN_TESTS=false
 CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
+CADDY_DOMAIN=""
 BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard)
 
 # --- Parse arguments ---
@@ -126,6 +129,9 @@ while [[ $# -gt 0 ]]; do
         --no-test)
             RUN_TESTS=false
             shift ;;
+        --caddy-domain)
+            CADDY_DOMAIN="$2"
+            shift 2 ;;
         -h|--help)
             awk '/^#!/{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
             exit 0 ;;
@@ -827,6 +833,103 @@ echo "  ominix-api plist generated"'"'"
     echo "==> Verifying..."
     sleep 2
     ssh_target "$i" "launchctl list | grep octos || echo 'WARNING: service not found'"
+    # --- Caddy setup (optional) ---
+    if [[ -n "$CADDY_DOMAIN" ]]; then
+        echo "==> Setting up Caddy for $CADDY_DOMAIN..."
+        ssh_target "$i" '
+            # Install Caddy if missing
+            if ! command -v caddy &>/dev/null; then
+                if command -v brew &>/dev/null; then
+                    brew install caddy
+                elif command -v apt-get &>/dev/null; then
+                    sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
+                    curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+                    curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+                    sudo apt-get update -qq && sudo apt-get install -y caddy
+                else
+                    echo "ERROR: Cannot install Caddy — install manually"
+                    exit 1
+                fi
+            fi
+            echo "  Caddy: $(caddy version 2>/dev/null | head -1)"
+        '"
+
+        CADDY_UPSTREAM=\"localhost:${SERVE_PORT}\"
+        ssh_target "$i" 'cat > ~/Caddyfile << CEOF
+{
+    on_demand_tls {
+        ask http://localhost:9999/check
+    }
+}
+
+:9999 {
+    respond /check 200
+}
+
+'"${CADDY_DOMAIN}"' {
+    handle /api/* {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+    handle /admin* {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+    handle /auth/* {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+    handle /webhook/* {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+    handle {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+}
+
+*.'"${CADDY_DOMAIN}"' {
+    tls {
+        on_demand
+    }
+
+    @api path /api/*
+    @admin path /admin*
+    @auth path /auth/*
+
+    handle @api {
+        reverse_proxy '"${CADDY_UPSTREAM}"' {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @admin {
+        reverse_proxy '"${CADDY_UPSTREAM}"' {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle @auth {
+        reverse_proxy '"${CADDY_UPSTREAM}"' {
+            header_up X-Profile-Id {labels.2}
+        }
+    }
+    handle {
+        reverse_proxy '"${CADDY_UPSTREAM}"'
+    }
+}
+CEOF
+            caddy fmt --overwrite ~/Caddyfile 2>/dev/null || true
+            if caddy validate --config ~/Caddyfile 2>/dev/null; then
+                echo "  Caddyfile valid"
+            else
+                echo "  WARNING: Caddyfile validation failed"
+            fi
+            if pgrep -x caddy > /dev/null 2>&1; then
+                caddy reload --config ~/Caddyfile 2>/dev/null
+                echo "  Caddy reloaded"
+            else
+                caddy start --config ~/Caddyfile 2>/dev/null
+                echo "  Caddy started"
+            fi
+        '"
+        echo "  Caddy configured for ${CADDY_DOMAIN} + *.${CADDY_DOMAIN}"
+    fi
+
     echo "==> $LABEL deploy complete."
 done
 
