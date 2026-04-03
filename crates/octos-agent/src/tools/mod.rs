@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use eyre::Result;
 use octos_core::TokenUsage;
 
+use crate::permissions::SafetyTier;
 use crate::progress::ProgressReporter;
 
 /// Execution context available to tools via task-local.
@@ -69,6 +70,13 @@ pub trait Tool: Send + Sync {
     /// Default: empty (tool passes all tag filters).
     fn tags(&self) -> &[&str] {
         &[]
+    }
+
+    /// Minimum safety tier required to execute this tool.
+    /// Default: `Observe` (read-only, safe for all sessions).
+    /// Override for tools that perform actuation or dangerous operations.
+    fn required_safety_tier(&self) -> SafetyTier {
+        SafetyTier::Observe
     }
 
     /// Execute the tool with the given arguments.

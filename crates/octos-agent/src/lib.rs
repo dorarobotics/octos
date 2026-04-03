@@ -16,6 +16,7 @@ pub mod event_bus;
 pub mod exec_env;
 pub mod hooks;
 pub mod loop_detect;
+pub mod permissions;
 pub mod mcp;
 pub mod plugins;
 pub mod policy;
@@ -39,6 +40,7 @@ pub use agent::{
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
 pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor};
+pub use permissions::{PermissionDenied, RobotPermissionPolicy, SafetyTier, WorkspaceBounds};
 pub use mcp::{McpClient, McpServerConfig};
 pub use plugins::{PluginLoadResult, PluginLoader};
 pub use progress::{ConsoleReporter, ProgressEvent, ProgressReporter, SilentReporter};
