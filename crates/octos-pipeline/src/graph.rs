@@ -126,6 +126,14 @@ pub struct PipelineNode {
     pub planner_model: Option<String>,
     /// For `DynamicParallel`: maximum number of dynamic tasks (default 8).
     pub max_tasks: Option<u32>,
+    /// Deadline in seconds for this node. On expiry, `deadline_action` fires.
+    pub deadline_secs: Option<u64>,
+    /// Action to take when deadline expires.
+    pub deadline_action: DeadlineAction,
+    /// Invariants that must hold during execution.
+    pub invariants: Vec<Invariant>,
+    /// Whether to save a checkpoint after this node completes.
+    pub checkpoint: bool,
 }
 
 impl Default for PipelineNode {
@@ -147,6 +155,10 @@ impl Default for PipelineNode {
             worker_prompt: None,
             planner_model: None,
             max_tasks: None,
+            deadline_secs: None,
+            deadline_action: DeadlineAction::Abort,
+            invariants: Vec::new(),
+            checkpoint: false,
         }
     }
 }
@@ -184,6 +196,16 @@ pub enum HandlerKind {
     /// Dynamic fan-out: LLM plans N sub-tasks at runtime, executes them
     /// in parallel, merges results, then jumps to the `converge` node.
     DynamicParallel,
+    /// Read sensor data and evaluate condition.
+    SensorCheck,
+    /// Execute a robot motion command.
+    Motion,
+    /// Execute a grasp/release action.
+    Grasp,
+    /// Safety gate — requires safety condition before proceeding.
+    SafetyGate,
+    /// Wait for an external event (sensor trigger, timer, etc.).
+    WaitForEvent,
 }
 
 impl HandlerKind {
@@ -197,6 +219,11 @@ impl HandlerKind {
             "noop" => Some(Self::Noop),
             "parallel" => Some(Self::Parallel),
             "dynamic_parallel" => Some(Self::DynamicParallel),
+            "sensor_check" => Some(Self::SensorCheck),
+            "motion" => Some(Self::Motion),
+            "grasp" => Some(Self::Grasp),
+            "safety_gate" => Some(Self::SafetyGate),
+            "wait_for_event" => Some(Self::WaitForEvent),
             _ => None,
         }
     }
@@ -211,9 +238,50 @@ impl HandlerKind {
             "diamond" => Some(Self::Gate),        // conditional routing
             "component" => Some(Self::Parallel),  // parallel fan-out
             "parallelogram" => Some(Self::Shell), // external tool/command
+            "ellipse" => Some(Self::SensorCheck), // sensor read/evaluate
+            "house" => Some(Self::Motion),        // robot motion command
+            "trapezium" => Some(Self::Grasp),     // grasp/release action
+            "octagon" => Some(Self::SafetyGate),  // safety gate
+            "doublecircle" => Some(Self::WaitForEvent), // wait for external event
             _ => None,
         }
     }
+}
+
+/// Action to take when a pipeline node exceeds its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeadlineAction {
+    /// Abort the node and mark as failed.
+    Abort,
+    /// Skip to the next node.
+    Skip,
+    /// Trigger emergency stop.
+    EmergencyStop,
+}
+
+/// Runtime invariant that must hold true during node execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Invariant {
+    /// Human-readable description.
+    pub description: String,
+    /// Condition expression to evaluate.
+    pub condition: String,
+    /// Action on violation.
+    pub on_violation: DeadlineAction,
+}
+
+/// Checkpoint saved during mission execution for recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionCheckpoint {
+    /// The node ID where this checkpoint was saved.
+    pub node_id: String,
+    /// Timestamp when the checkpoint was created.
+    pub timestamp_ms: u64,
+    /// Serialized state data.
+    pub state: serde_json::Value,
+    /// Whether this checkpoint is resumable.
+    pub resumable: bool,
 }
 
 /// The outcome of executing a single pipeline node.
@@ -283,4 +351,84 @@ pub struct NodeSummary {
     pub token_usage: TokenUsage,
     pub duration_ms: u64,
     pub success: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn should_parse_robot_handler_kinds() {
+        assert_eq!(HandlerKind::from_str("sensor_check"), Some(HandlerKind::SensorCheck));
+        assert_eq!(HandlerKind::from_str("motion"), Some(HandlerKind::Motion));
+        assert_eq!(HandlerKind::from_str("grasp"), Some(HandlerKind::Grasp));
+        assert_eq!(HandlerKind::from_str("safety_gate"), Some(HandlerKind::SafetyGate));
+        assert_eq!(HandlerKind::from_str("wait_for_event"), Some(HandlerKind::WaitForEvent));
+        // Existing variants still work
+        assert_eq!(HandlerKind::from_str("codergen"), Some(HandlerKind::Codergen));
+        assert_eq!(HandlerKind::from_str("unknown_kind"), None);
+    }
+
+    #[test]
+    fn should_parse_robot_shapes() {
+        assert_eq!(HandlerKind::from_shape("ellipse"), Some(HandlerKind::SensorCheck));
+        assert_eq!(HandlerKind::from_shape("house"), Some(HandlerKind::Motion));
+        assert_eq!(HandlerKind::from_shape("trapezium"), Some(HandlerKind::Grasp));
+        assert_eq!(HandlerKind::from_shape("octagon"), Some(HandlerKind::SafetyGate));
+        assert_eq!(HandlerKind::from_shape("doublecircle"), Some(HandlerKind::WaitForEvent));
+        // Existing shapes still work
+        assert_eq!(HandlerKind::from_shape("box"), Some(HandlerKind::Codergen));
+        assert_eq!(HandlerKind::from_shape("unknown_shape"), None);
+    }
+
+    #[test]
+    fn should_default_deadline_action_to_abort() {
+        let node = PipelineNode::default();
+        assert_eq!(node.deadline_action, DeadlineAction::Abort);
+        assert!(node.deadline_secs.is_none());
+        assert!(node.invariants.is_empty());
+        assert!(!node.checkpoint);
+    }
+
+    #[test]
+    fn should_detect_cycle_in_graph() {
+        let mut nodes = HashMap::new();
+        for id in &["a", "b", "c"] {
+            let mut n = PipelineNode::default();
+            n.id = id.to_string();
+            nodes.insert(id.to_string(), n);
+        }
+        let edges = vec![
+            PipelineEdge { source: "a".into(), target: "b".into(), label: None, condition: None, weight: 1.0 },
+            PipelineEdge { source: "b".into(), target: "c".into(), label: None, condition: None, weight: 1.0 },
+            PipelineEdge { source: "c".into(), target: "a".into(), label: None, condition: None, weight: 1.0 },
+        ];
+        let graph = PipelineGraph {
+            id: "cyclic".into(),
+            label: None,
+            default_model: None,
+            nodes,
+            edges,
+            subgraphs: vec![],
+        };
+        let result = graph.detect_cycles();
+        assert!(result.is_err(), "expected cycle detection to return Err");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("cycle detected"), "error message should mention cycle: {msg}");
+    }
+
+    #[test]
+    fn should_serialize_invariant() {
+        let inv = Invariant {
+            description: "Force must be below 50N".into(),
+            condition: "force_sensor < 50.0".into(),
+            on_violation: DeadlineAction::EmergencyStop,
+        };
+        let json = serde_json::to_string(&inv).expect("serialize invariant");
+        let decoded: Invariant = serde_json::from_str(&json).expect("deserialize invariant");
+        assert_eq!(decoded.description, inv.description);
+        assert_eq!(decoded.condition, inv.condition);
+        assert_eq!(decoded.on_violation, DeadlineAction::EmergencyStop);
+    }
 }

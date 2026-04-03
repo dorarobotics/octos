@@ -131,6 +131,11 @@ fn handler_kind_str(kind: &HandlerKind) -> &'static str {
         HandlerKind::Noop => "noop",
         HandlerKind::Parallel => "parallel",
         HandlerKind::DynamicParallel => "dynamic_parallel",
+        HandlerKind::SensorCheck => "sensor_check",
+        HandlerKind::Motion => "motion",
+        HandlerKind::Grasp => "grasp",
+        HandlerKind::SafetyGate => "safety_gate",
+        HandlerKind::WaitForEvent => "wait_for_event",
     }
 }
 

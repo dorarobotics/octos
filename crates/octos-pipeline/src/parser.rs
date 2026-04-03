@@ -559,6 +559,16 @@ fn build_node(id: &str, attrs: &HashMap<String, String>) -> PipelineNode {
         worker_prompt: attrs.get("worker_prompt").cloned(),
         planner_model: attrs.get("planner_model").cloned(),
         max_tasks: attrs.get("max_tasks").and_then(|s| s.parse().ok()),
+        deadline_secs: attrs.get("deadline_secs").and_then(|s| s.parse().ok()),
+        deadline_action: attrs
+            .get("deadline_action")
+            .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+            .unwrap_or(crate::graph::DeadlineAction::Abort),
+        invariants: Vec::new(),
+        checkpoint: attrs
+            .get("checkpoint")
+            .and_then(|s| parse_bool(s))
+            .unwrap_or(false),
     }
 }
 
