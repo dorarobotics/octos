@@ -3671,6 +3671,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "octos-dora-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "eyre",
+ "octos-agent",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "octos-llm"
 version = "0.1.0"
 dependencies = [
