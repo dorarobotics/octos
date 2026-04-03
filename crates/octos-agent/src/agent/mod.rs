@@ -8,6 +8,7 @@ mod llm_call;
 mod loop_runner;
 mod memory;
 mod message_repair;
+pub mod realtime;
 mod streaming;
 
 use std::path::PathBuf;
