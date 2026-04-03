@@ -29,6 +29,17 @@ pub enum HookEvent {
     AfterToolCall,
     BeforeLlmCall,
     AfterLlmCall,
+    // Robot safety events
+    /// Fired before any motion command. Hook can deny to prevent motion.
+    BeforeMotion,
+    /// Fired after a motion command completes.
+    AfterMotion,
+    /// Fired when a force/torque sensor exceeds limits.
+    ForceLimit,
+    /// Fired when a tool tries to move outside workspace bounds.
+    WorkspaceBoundary,
+    /// Fired when an emergency stop is triggered.
+    EmergencyStop,
 }
 
 /// Configuration for a single hook.
@@ -48,6 +59,50 @@ pub struct HookConfig {
 
 fn default_timeout_ms() -> u64 {
     5000
+}
+
+/// Robot-specific payload included in robot safety hook events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RobotPayload {
+    /// Joint positions in radians.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joint_positions: Vec<f64>,
+    /// End-effector position [x, y, z] in meters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_position: Option<[f64; 3]>,
+    /// Linear velocity magnitude in m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity: Option<f64>,
+    /// Force/torque readings [fx, fy, fz, tx, ty, tz].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub force_torque: Vec<f64>,
+    /// Safety tier of the triggering tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_tier: Option<String>,
+}
+
+impl RobotPayload {
+    /// Create a payload for a motion event.
+    pub fn for_motion(joint_positions: Vec<f64>, velocity: Option<f64>) -> Self {
+        Self {
+            joint_positions,
+            tcp_position: None,
+            velocity,
+            force_torque: Vec::new(),
+            safety_tier: None,
+        }
+    }
+
+    /// Create a payload for a force limit event.
+    pub fn for_force(force_torque: Vec<f64>) -> Self {
+        Self {
+            joint_positions: Vec::new(),
+            tcp_position: None,
+            velocity: None,
+            force_torque,
+            safety_tier: None,
+        }
+    }
 }
 
 /// Payload sent to hook process as JSON on stdin.
@@ -102,6 +157,10 @@ pub struct HookPayload {
     pub provider_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+
+    // Robot safety payload (robot events only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub robot: Option<RobotPayload>,
 }
 
 /// Maximum byte length for arguments/result fields in hook payloads.
@@ -308,7 +367,52 @@ impl HookPayload {
             response_cost: None,
             provider_name: None,
             latency_ms: None,
+            robot: None,
         }
+    }
+
+    /// Payload for a before-motion hook.
+    pub fn before_motion(robot: RobotPayload, ctx: Option<&HookContext>) -> Self {
+        let mut p = Self {
+            event: HookEvent::BeforeMotion,
+            robot: Some(robot),
+            ..Self::empty(HookEvent::BeforeMotion)
+        };
+        p.apply_context(ctx);
+        p
+    }
+
+    /// Payload for a force-limit hook.
+    pub fn force_limit(robot: RobotPayload, ctx: Option<&HookContext>) -> Self {
+        let mut p = Self {
+            event: HookEvent::ForceLimit,
+            robot: Some(robot),
+            ..Self::empty(HookEvent::ForceLimit)
+        };
+        p.apply_context(ctx);
+        p
+    }
+
+    /// Payload for a workspace-boundary hook.
+    pub fn workspace_boundary(robot: RobotPayload, ctx: Option<&HookContext>) -> Self {
+        let mut p = Self {
+            event: HookEvent::WorkspaceBoundary,
+            robot: Some(robot),
+            ..Self::empty(HookEvent::WorkspaceBoundary)
+        };
+        p.apply_context(ctx);
+        p
+    }
+
+    /// Payload for an emergency-stop hook.
+    pub fn emergency_stop(robot: RobotPayload, ctx: Option<&HookContext>) -> Self {
+        let mut p = Self {
+            event: HookEvent::EmergencyStop,
+            robot: Some(robot),
+            ..Self::empty(HookEvent::EmergencyStop)
+        };
+        p.apply_context(ctx);
+        p
     }
 }
 
@@ -772,6 +876,7 @@ mod tests {
             response_cost: None,
             provider_name: None,
             latency_ms: None,
+            robot: None,
         };
         let result = executor.run(HookEvent::AfterToolCall, &payload).await;
         // Hook should be skipped (circuit broken), not denied
@@ -1040,5 +1145,55 @@ mod tests {
         assert!(json.contains("*.rs"));
         assert!(!json.contains("truncated"));
         assert!(!json.contains("redacted"));
+    }
+
+    #[test]
+    fn test_robot_hook_events_serialize() {
+        let events = vec![
+            HookEvent::BeforeMotion,
+            HookEvent::AfterMotion,
+            HookEvent::ForceLimit,
+            HookEvent::WorkspaceBoundary,
+            HookEvent::EmergencyStop,
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            let deserialized: HookEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event, deserialized);
+        }
+    }
+
+    #[test]
+    fn test_before_motion_payload() {
+        let robot = RobotPayload::for_motion(vec![0.0, 1.0, 2.0], Some(0.5));
+        let payload = HookPayload::before_motion(robot, None);
+        assert_eq!(payload.event, HookEvent::BeforeMotion);
+        let robot = payload.robot.unwrap();
+        assert_eq!(robot.joint_positions, vec![0.0, 1.0, 2.0]);
+        assert_eq!(robot.velocity, Some(0.5));
+    }
+
+    #[test]
+    fn test_force_limit_payload() {
+        let robot = RobotPayload::for_force(vec![10.0, 0.0, 5.0, 0.0, 0.0, 0.0]);
+        let payload = HookPayload::force_limit(robot, None);
+        assert_eq!(payload.event, HookEvent::ForceLimit);
+        assert_eq!(payload.robot.unwrap().force_torque.len(), 6);
+    }
+
+    #[test]
+    fn test_robot_payload_serialization() {
+        let robot = RobotPayload {
+            joint_positions: vec![0.1, 0.2],
+            tcp_position: Some([1.0, 2.0, 3.0]),
+            velocity: Some(0.5),
+            force_torque: vec![],
+            safety_tier: Some("safe_motion".to_string()),
+        };
+        let json = serde_json::to_string(&robot).unwrap();
+        assert!(json.contains("tcp_position"));
+        assert!(json.contains("safe_motion"));
+        // Empty force_torque should be skipped
+        assert!(!json.contains("force_torque"));
     }
 }
