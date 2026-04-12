@@ -69,6 +69,9 @@ rand = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 subtle = "2"
 
+# Dora-RS runtime
+dora-node-api = { version = "0.3", default-features = false }
+
 # Error handling (dora-rs pattern)
 eyre = "0.6"
 color-eyre = "0.6"

@@ -7,13 +7,21 @@ authors.workspace = true
 license.workspace = true
 description = "Dora-RS to MCP tool bridge for octos"
 
+[[bin]]
+name = "octos-dora-agent"
+path = "src/bin/agent.rs"
+
 [dependencies]
 octos-agent = { workspace = true }
+octos-pipeline = { workspace = true }
+octos-llm = { workspace = true }
+dora-node-api = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 eyre = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

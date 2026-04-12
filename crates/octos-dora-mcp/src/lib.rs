@@ -22,12 +22,15 @@
 //! ```
 
 mod config;
+pub mod bridge;
 
 use async_trait::async_trait;
 use octos_agent::tools::{Tool, ToolResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::mpsc;
 
+pub use bridge::{bridge_channel, BridgeReceiver, BridgeSender, ToolRequest};
 pub use config::BridgeConfig;
 
 /// Safety tiers for dora tool operations.
@@ -100,18 +103,29 @@ fn default_timeout() -> u64 {
 
 /// A bridge that wraps a [`DoraToolMapping`] as an MCP-compatible [`Tool`].
 ///
-/// In production the `execute` method would forward the request to the dora
-/// dataflow via an IPC channel and await the response.  The current
-/// implementation returns a placeholder describing the would-be forwarded
-/// payload so the bridge can be tested without a running dora runtime.
+/// When a `BridgeSender` is provided, `execute` forwards requests through
+/// the bridge channel to the dora event loop and awaits the response.
+/// Without a sender (test mode), returns a placeholder.
 pub struct DoraToolBridge {
     mapping: DoraToolMapping,
+    sender: Option<BridgeSender>,
 }
 
 impl DoraToolBridge {
-    /// Create a new bridge from the given mapping.
+    /// Create a new bridge from the given mapping (test mode — no dora runtime).
     pub fn new(mapping: DoraToolMapping) -> Self {
-        Self { mapping }
+        Self {
+            mapping,
+            sender: None,
+        }
+    }
+
+    /// Create a bridge connected to a dora event loop via the bridge channel.
+    pub fn with_sender(mapping: DoraToolMapping, sender: BridgeSender) -> Self {
+        Self {
+            mapping,
+            sender: Some(sender),
+        }
     }
 
     /// Return a reference to the underlying mapping.
@@ -175,38 +189,99 @@ impl Tool for DoraToolBridge {
     }
 
     async fn execute(&self, args: &serde_json::Value) -> eyre::Result<ToolResult> {
-        // In a real implementation this would send args to the dora node
-        // via the dora dataflow and await the response.  We return a
-        // placeholder indicating the bridge would forward to dora.
-        let request = serde_json::json!({
-            "tool": self.mapping.tool_name,
-            "node_id": self.mapping.dora_node_id,
-            "output_id": self.mapping.dora_output_id,
-            "args": args,
-            "timeout_secs": self.mapping.timeout_secs,
-        });
+        // If we have a bridge sender, forward to the dora event loop
+        if let Some(ref sender) = self.sender {
+            let payload = serde_json::json!({
+                "tool": self.mapping.tool_name,
+                "args": args,
+            });
 
-        Ok(ToolResult {
-            success: true,
-            output: format!(
-                "DoraToolBridge: would forward to node '{}' output '{}': {}",
-                self.mapping.dora_node_id,
-                self.mapping.dora_output_id,
-                serde_json::to_string_pretty(&request).unwrap_or_default()
-            ),
-            file_modified: None,
-            files_to_send: vec![],
-            tokens_used: None,
-        })
+            let (reply_tx, reply_rx) = mpsc::channel();
+
+            let request = ToolRequest {
+                output_id: self.mapping.dora_output_id.clone(),
+                payload: serde_json::to_vec(&payload)?,
+                response_id: format!("{}_result", self.mapping.dora_output_id
+                    .strip_suffix("_request").unwrap_or(&self.mapping.dora_output_id)),
+                timeout_secs: self.mapping.timeout_secs,
+                reply_tx,
+            };
+
+            sender
+                .send(request)
+                .map_err(|e| eyre::eyre!("bridge channel closed: {e}"))?;
+
+            let timeout = std::time::Duration::from_secs(self.mapping.timeout_secs);
+            match reply_rx.recv_timeout(timeout) {
+                Ok(Ok(response)) => Ok(ToolResult {
+                    success: true,
+                    output: response,
+                    file_modified: None,
+                    files_to_send: vec![],
+                    tokens_used: None,
+                }),
+                Ok(Err(err)) => Ok(ToolResult {
+                    success: false,
+                    output: format!("Tool execution failed: {err}"),
+                    file_modified: None,
+                    files_to_send: vec![],
+                    tokens_used: None,
+                }),
+                Err(_) => Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Timeout: no response from dora node '{}' after {}s",
+                        self.mapping.dora_node_id, self.mapping.timeout_secs
+                    ),
+                    file_modified: None,
+                    files_to_send: vec![],
+                    tokens_used: None,
+                }),
+            }
+        } else {
+            // Test mode — no dora runtime
+            let request = serde_json::json!({
+                "tool": self.mapping.tool_name,
+                "node_id": self.mapping.dora_node_id,
+                "output_id": self.mapping.dora_output_id,
+                "args": args,
+                "timeout_secs": self.mapping.timeout_secs,
+            });
+
+            Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "DoraToolBridge: would forward to node '{}' output '{}': {}",
+                    self.mapping.dora_node_id,
+                    self.mapping.dora_output_id,
+                    serde_json::to_string_pretty(&request).unwrap_or_default()
+                ),
+                file_modified: None,
+                files_to_send: vec![],
+                tokens_used: None,
+            })
+        }
     }
 }
 
-/// Load tool mappings from a [`BridgeConfig`] and create bridge tools.
+/// Load tool mappings from a [`BridgeConfig`] and create bridge tools (test mode).
 pub fn load_bridges(config: &BridgeConfig) -> Vec<DoraToolBridge> {
     config
         .mappings
         .iter()
         .map(|m| DoraToolBridge::new(m.clone()))
+        .collect()
+}
+
+/// Load tool mappings connected to a dora event loop via the bridge channel.
+pub fn load_bridges_with_sender(
+    config: &BridgeConfig,
+    sender: BridgeSender,
+) -> Vec<DoraToolBridge> {
+    config
+        .mappings
+        .iter()
+        .map(|m| DoraToolBridge::with_sender(m.clone(), sender.clone()))
         .collect()
 }
 
