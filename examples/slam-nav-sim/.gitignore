@@ -1,0 +1,6 @@
+# Local symlinks (created by start_macos.sh or manually)
+dora-mujoco
+models/hunter_se
+models/GEN72
+out/
+__pycache__/
