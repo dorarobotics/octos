@@ -352,6 +352,33 @@ class Agent:
                             total = self._pipeline_executor.total_steps
                             print(f"  [pipeline] Step {step_num}/{total}: {step_node.label}")
 
+                            # Direct tool execution from DOT node attributes
+                            if step_node.has_direct_tool():
+                                tool_name = step_node.tool
+                                try:
+                                    tool_args = json.loads(step_node.args) if step_node.args else {}
+                                except json.JSONDecodeError:
+                                    tool_args = {}
+                                print(f"  [pipeline] Direct: {tool_name}({tool_args})")
+                                try:
+                                    result = tool_executor(tool_name, tool_args)
+                                    messages.append({
+                                        "role": "user",
+                                        "content": f"[Step {step_num}] {step_node.label}",
+                                    })
+                                    messages.append({
+                                        "role": "assistant",
+                                        "content": f"Executed {tool_name}: {result[:500] if result else 'ok'}",
+                                    })
+                                    if step_node.checkpoint:
+                                        print(f"  [pipeline] Checkpoint: {step_node.checkpoint}")
+                                    continue  # skip LLM, go to next pipeline step
+                                except Exception as e:
+                                    print(f"  [pipeline] Tool {tool_name} failed: {e}")
+                                    if step_node.deadline_action == "skip":
+                                        continue
+                                    break  # abort on failure
+
                             # Try to parse and directly execute tool call from label
                             direct_result = self._try_direct_execute(
                                 step_node.label, tool_executor

@@ -19,13 +19,20 @@ class PipelineNode:
     name: str
     node_type: str  # "codergen", "gate", "dynamic_parallel", "sensor_check", "motion", "grasp", "safety_gate", "wait_for_event"
     label: str  # Instructions for the agent
+    tool: str = ""  # Tool name to call directly (bypasses LLM)
+    args: str = ""  # JSON-encoded tool arguments
     deadline_secs: float | None = None
     deadline_action: str = "abort"  # "abort", "skip", "emergency_stop"
     invariants: list = field(default_factory=list)
-    checkpoint: bool = False
+    checkpoint: str = ""  # Checkpoint name for recovery
+    invariant: str = ""  # Post-condition expression
 
     def is_gate(self) -> bool:
         return self.node_type in ("gate", "safety_gate")
+
+    def has_direct_tool(self) -> bool:
+        """True if this node has an explicit tool call (no LLM needed)."""
+        return bool(self.tool)
 
 
 @dataclass
@@ -63,21 +70,62 @@ class Pipeline:
             if max_cycles_match:
                 pipeline.max_cycles = int(max_cycles_match.group(1))
 
-        # Parse node definitions: name [type=X label="..."]
-        node_pattern = re.compile(
-            r"(\w+)\s*\["
-            r"[^\]]*?type=(\w+)"
-            r"[^\]]*?label=\"([^\"]*)\""
-            r"[^\]]*?\]"
-        )
-        for match in node_pattern.finditer(text):
+        # Parse node definitions: name [attr=val ...]
+        # Matches both: name [type=X label="..."] and name [label="..." tool="..."]
+        node_block_pattern = re.compile(r"(\w+)\s*\[([^\]]+)\]")
+
+        def _parse_attr(attrs_str, key):
+            """Extract attribute value, handling both quoted and unquoted."""
+            # Quoted: key="value" or key='value'
+            m = re.search(rf'{key}\s*=\s*"([^"]*)"', attrs_str)
+            if m:
+                return m.group(1)
+            m = re.search(rf"{key}\s*=\s*'([^']*)'", attrs_str)
+            if m:
+                return m.group(1)
+            # Unquoted: key=value (word chars)
+            m = re.search(rf'{key}\s*=\s*(\w+)', attrs_str)
+            if m:
+                return m.group(1)
+            return ""
+
+        def _parse_json_attr(attrs_str, key):
+            """Extract JSON object attribute like args='{...}'."""
+            m = re.search(rf"""{key}\s*=\s*["'](\{{[^}}]*\}})["']""", attrs_str)
+            if m:
+                # Unescape DOT-escaped quotes: \" → "
+                return m.group(1).replace('\\"', '"')
+            return ""
+
+        for match in node_block_pattern.finditer(text):
             node_name = match.group(1)
-            node_type = match.group(2)
-            label = match.group(3)
+            attrs = match.group(2)
+
+            # Skip graph-level attributes
+            if node_name in ("graph", "node", "edge", "digraph"):
+                continue
+
+            label = _parse_attr(attrs, "label") or node_name
+            node_type = _parse_attr(attrs, "type") or "codergen"
+            tool = _parse_attr(attrs, "tool")
+            args = _parse_json_attr(attrs, "args")
+            deadline_str = _parse_attr(attrs, "deadline")
+            deadline_action = _parse_attr(attrs, "deadline_action") or "abort"
+            invariant = _parse_attr(attrs, "invariant")
+            checkpoint = _parse_attr(attrs, "checkpoint")
+
+            deadline_secs = float(deadline_str) if deadline_str else None
+
             pipeline.nodes[node_name] = PipelineNode(
                 name=node_name,
                 node_type=node_type,
                 label=label,
+                tool=tool,
+                args=args,
+                deadline_secs=deadline_secs,
+                deadline_action=deadline_action,
+                invariant=invariant,
+                checkpoint=checkpoint,
             )
 
         # Parse edges: handles chains like "a -> b -> c -> d"
