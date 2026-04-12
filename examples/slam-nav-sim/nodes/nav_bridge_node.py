@@ -15,6 +15,7 @@ Dataflow connections:
 
 import json
 import math
+import os
 import struct
 import time
 
@@ -55,6 +56,13 @@ TRQ_TO_VEL = 0.0015
 # ---- Navigation parameters ----
 NAV_TIMEOUT = 120.0
 SETTLE_STEPS = 20
+
+# ---- Simulated obstacle (set via env var OBSTACLE_Y) ----
+# When set, navigate_to will report "obstacle detected" if the robot
+# reaches this Y coordinate before arriving at the target station.
+# Used to test LLM replanning for unexpected situations.
+OBSTACLE_Y = float(os.environ.get("OBSTACLE_Y", "0")) if os.environ.get("OBSTACLE_Y") else None
+OBSTACLE_MARGIN = 0.5  # meters — trigger zone around OBSTACLE_Y
 
 
 # ---- Encoding helpers ----
@@ -201,6 +209,19 @@ class NavBridge:
                 print(f"[nav-bridge] NAV: x={self.gt_x:.3f} y={self.gt_y:.3f} "
                       f"θ={self.gt_theta_deg:.1f}° dy={dy:.3f}")
                 last_log = now
+
+            # Simulated obstacle check
+            if OBSTACLE_Y is not None and abs(self.gt_y - OBSTACLE_Y) < OBSTACLE_MARGIN:
+                self.nav_forwarding = False
+                self.stop_wheels()
+                pos = [round(self.gt_x, 3), round(self.gt_y, 3)]
+                print(f"[nav-bridge] OBSTACLE at y={OBSTACLE_Y:.1f}! Robot stopped at {pos}")
+                return _result(
+                    f"Navigation to {wp} FAILED: obstacle detected at y={OBSTACLE_Y:.1f}. "
+                    f"Robot stopped at {pos}. Path to {wp} is blocked. "
+                    f"Consider skipping this station or trying an alternative route.",
+                    {"position": "blocked", "coordinates": pos,
+                     "obstacle_y": OBSTACLE_Y, "target": wp, "error": "obstacle_detected"})
 
             if dy < STATION_Y_THRESHOLD:
                 self.nav_forwarding = False
