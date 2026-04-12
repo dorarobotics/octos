@@ -1,10 +1,12 @@
-//! octos-dora-agent — Rust binary that runs as a dora dataflow node.
+//! octos-dora-agent — Rust dora node for bridging octos tools to dataflow.
 //!
-//! Replaces the Python agent_node.py with the real octos-agent Rust crate.
-//! Loads tool mappings from a JSON config, connects to the dora dataflow,
-//! and forwards tool calls between the octos agent and dora nodes.
+//! Phase 1: Tool bridge — loads tool mappings from JSON, forwards
+//! skill_request/skill_result between the octos agent and dora nodes.
 //!
-//! # Dora dataflow YAML
+//! Phase 2 (planned): Embed the full octos Agent loop with LLM provider,
+//! pipeline executor, and safety tier enforcement.
+//!
+//! # Usage
 //!
 //! ```yaml
 //! - id: agent
@@ -17,7 +19,7 @@
 //!       - skill_request
 //!   env:
 //!     OCTOS_TOOL_MAP: "nav_tool_map.json"
-//!     USER_COMMAND: "Patrol stations A, B, home"
+//!     SAFETY_TIER: "safe_motion"
 //! ```
 
 use dora_node_api::DoraNode;
@@ -31,31 +33,28 @@ use std::time::{Duration, Instant};
 
 fn main() -> Result<()> {
     let tool_map_path = env::var("OCTOS_TOOL_MAP").unwrap_or_default();
-    let provider_name = env::var("OCTOS_PROVIDER").unwrap_or_else(|_| "mock".to_string());
-    let user_command = env::var("USER_COMMAND").unwrap_or_else(|_| "Execute pipeline".to_string());
     let safety_tier = env::var("SAFETY_TIER").unwrap_or_else(|_| "safe_motion".to_string());
 
     println!("==================================================");
-    println!("  octos-dora-agent (Rust)");
+    println!("  octos-dora-agent v{}", env!("CARGO_PKG_VERSION"));
     if !tool_map_path.is_empty() {
         println!("  tool_map:  {tool_map_path}");
     }
-    println!("  provider:  {provider_name}");
     println!("  tier:      {safety_tier}");
-    println!("  command:   {user_command}");
     println!("==================================================");
 
     // Initialize dora node
     let (mut node, mut events) = DoraNode::init_from_env()?;
     println!("[agent] Dora node initialized");
 
-    // Load tool mappings and create bridge
+    // Create bridge channel
     let (bridge_tx, bridge_rx) = bridge_channel();
 
+    // Load tool mappings
     if !tool_map_path.is_empty() {
         let config = BridgeConfig::from_file(&tool_map_path)?;
         let bridges = load_bridges_with_sender(&config, bridge_tx.clone());
-        println!("[agent] Loaded {} tools from {tool_map_path}", bridges.len());
+        println!("[agent] Loaded {} tools:", bridges.len());
         for b in &bridges {
             println!(
                 "  {} [{}] → {}/{}",
@@ -65,27 +64,31 @@ fn main() -> Result<()> {
                 b.mapping().dora_output_id,
             );
         }
+    } else {
+        println!("[agent] No tool map — running as event forwarder");
     }
 
-    println!("[agent] Entering event loop — command: {user_command}");
+    println!("[agent] Event loop started");
 
-    // Main event loop: forward bridge requests to dora and route responses back
+    // Main event loop
     loop {
-        // Check for bridge requests (from tool execute() calls)
+        // 1. Check for bridge requests (from tool execute() calls in agent thread)
         if let Ok(req) = bridge_rx.try_recv() {
             let output_id = DataId::from(req.output_id.clone());
             println!("[agent] → {} ({} bytes)", req.output_id, req.payload.len());
 
-            node.send_output_raw(
+            if let Err(e) = node.send_output_raw(
                 output_id,
                 Default::default(),
                 req.payload.len(),
-                |out| {
-                    out.copy_from_slice(&req.payload);
-                },
-            )?;
+                |out| out.copy_from_slice(&req.payload),
+            ) {
+                eprintln!("[agent] Send error: {e}");
+                let _ = req.reply_tx.send(Err(format!("send failed: {e}")));
+                continue;
+            }
 
-            // Wait for the response event
+            // Wait for response
             let deadline = Instant::now() + Duration::from_secs(req.timeout_secs);
             let mut got_response = false;
 
@@ -108,8 +111,8 @@ fn main() -> Result<()> {
                             }
                         }
                         dora_node_api::Event::Stop(_) => {
-                            println!("[agent] Received STOP");
-                            let _ = req.reply_tx.send(Err("Node stopped".to_string()));
+                            let _ = req.reply_tx.send(Err("stopped".to_string()));
+                            println!("[agent] STOP");
                             return Ok(());
                         }
                         _ => {}
@@ -118,16 +121,14 @@ fn main() -> Result<()> {
             }
 
             if !got_response {
-                println!("[agent] Timeout waiting for {}", req.response_id);
                 let _ = req.reply_tx.send(Err(format!(
-                    "Timeout: {} ({}s)",
-                    req.response_id, req.timeout_secs
+                    "timeout: {} ({}s)", req.response_id, req.timeout_secs
                 )));
             }
             continue;
         }
 
-        // Process dora events when no bridge requests pending
+        // 2. Process dora events
         if let Some(event) = events.recv() {
             match event {
                 dora_node_api::Event::Stop(_) => {
