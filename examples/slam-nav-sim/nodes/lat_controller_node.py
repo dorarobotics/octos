@@ -53,8 +53,9 @@ def pure_pursuit(path_x, path_y, la_dist):
     gy = path_y[goal_idx]
 
     # Ackermann steering geometry
-    # tgangle = angle from vehicle forward axis to goal point
-    tgangle = math.atan2(gx, gy) - math.pi / 2.0
+    # tgangle = angle from vehicle forward (+Y) axis to goal point
+    # C++ original: atan2(goal_y, goal_x) - pi/2
+    tgangle = math.atan2(gy, gx) - math.pi / 2.0
 
     # Pure pursuit: delta = atan2(2 * L * sin(alpha), La)
     sin_tg = math.sin(tgangle)
