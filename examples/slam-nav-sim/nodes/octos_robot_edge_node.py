@@ -55,7 +55,7 @@ STATIONS = {
 DATAFLOW_INFO = {
     "nodes": [
         {"id": "mujoco-sim", "description": "MuJoCo simulation (Hunter SE + warehouse)"},
-        {"id": "moveit-skills", "description": "Nav skill bridge: dora-nav → wheel commands"},
+        {"id": "nav-bridge", "description": "Navigation bridge: dora-nav → wheel commands"},
         {"id": "dora-nav", "description": "Path following pipeline (pub-road → planning → control)"},
         {"id": "rerun", "description": "3D visualization (Rerun)"},
     ],

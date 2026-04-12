@@ -4,7 +4,7 @@
 
 - Add `slam-nav-sim` example: 9-node dora dataflow for visual SLAM navigation with MuJoCo + dora-nav + Rerun
 - Hunter SE robot follows 1065-waypoint warehouse path with live 3D visualization (pointcloud, path, robot body)
-- Nav-only skill bridge: SteeringCmd/TrqBreCmd → differential-drive wheel commands
+- Navigation bridge node: SteeringCmd/TrqBreCmd → differential-drive wheel commands
 - Optional LLM agent (robot-edge-a) for autonomous navigation via octos agent pattern
 - `nav_tool_map.json` with 6 tools across 3 safety tiers (observe, safe_motion, full_actuation)
 - `patrol_mission.dot` pipeline with deadlines, invariants, and checkpoints

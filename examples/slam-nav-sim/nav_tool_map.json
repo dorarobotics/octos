@@ -35,14 +35,6 @@
       "description": "Emergency stop the mobile base"
     },
     {
-      "name": "scan_station",
-      "dora_node_id": "moveit-skills",
-      "handler_kind": "request_response",
-      "safety_tier": "full_actuation",
-      "timeout_secs": 60,
-      "description": "Scan objects at current station (requires arm — full example only)"
-    },
-    {
       "name": "read_lidar",
       "dora_node_id": "pub-road",
       "handler_kind": "observe",

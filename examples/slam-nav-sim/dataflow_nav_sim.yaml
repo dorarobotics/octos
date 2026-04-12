@@ -2,7 +2,7 @@
 #
 # 9-node dataflow stripped from octos_inspection (16 nodes).
 # Removed: iot-gateway, cloud-brain, planning-scene, planner, ik-solver, trajectory-executor
-# Kept: MuJoCo sim + dora-nav pipeline + Rerun visualization + nav skill bridge
+# Kept: MuJoCo sim + dora-nav pipeline + Rerun visualization + nav bridge
 #
 # Robot follows a 1065-waypoint path through a warehouse.
 # Rerun shows live 3D: robot body, pointcloud, planned path, trajectory trail.
@@ -25,10 +25,10 @@ nodes:
   # =======================================
 
   - id: mujoco-sim
-    path: ${DORA_MOVEIT2_PATH:-/home/demo/Public/dora-moveit2}/dora-mujoco/dora_mujoco/main.py
+    path: ${DORA_MUJOCO_PATH:-/home/demo/Public/dora-moveit2/dora-mujoco}/dora_mujoco/main.py
     inputs:
       tick: dora/timer/millis/10
-      wheel_control: moveit-skills/wheel_commands
+      wheel_control: nav-bridge/wheel_commands
     outputs:
       - joint_positions
       - ground_truth_pose
@@ -121,11 +121,11 @@ nodes:
       MAP_PCD_FILE: "${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/data/map.pcd"
 
   # =======================================
-  # Navigation Skill Bridge (nav → wheels)
+  # Navigation Bridge (dora-nav → wheels)
   # =======================================
 
-  - id: moveit-skills
-    path: nodes/moveit_skill_node.py
+  - id: nav-bridge
+    path: nodes/nav_bridge_node.py
     inputs:
       # skill_request: robot-edge-a/skill_request  # uncomment with robot-edge-a
       ground_truth_pose: mujoco-sim/ground_truth_pose
@@ -144,7 +144,7 @@ nodes:
   # - id: robot-edge-a
   #   path: nodes/octos_robot_edge_node.py
   #   inputs:
-  #     skill_result: moveit-skills/skill_result
+  #     skill_result: nav-bridge/skill_result
   #   outputs:
   #     - agent_registration
   #     - result

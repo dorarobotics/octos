@@ -32,7 +32,7 @@ The robot follows a 1065-waypoint path through a simulated warehouse, visiting s
          SteeringCmd     TrqBreCmd
                   ↓         ↓
               ┌─────────────────┐
-              │  moveit-skills  │ (nav forwarding → wheel_commands)
+              │  nav-bridge  │ (dora-nav → wheel_commands)
               └────────┬────────┘
                        │ wheel_control
                        ↓
@@ -45,7 +45,7 @@ The robot follows a 1065-waypoint path through a simulated warehouse, visiting s
 
 - [dora-rs](https://github.com/dora-rs/dora) (`pip install dora-rs`)
 - [dora-nav](https://github.com/dorarobotics/dora-nav) — built C++ nodes
-- [dora-moveit2](https://github.com/dorarobotics/dora-moveit2) — MuJoCo Python sim
+- [dora-mujoco](https://github.com/dorarobotics/dora-moveit2/tree/main/dora-mujoco) — MuJoCo Python simulation node
 - MuJoCo (installed via `pip install mujoco`)
 - [Rerun](https://rerun.io) (`pip install rerun-sdk`)
 - Python packages: `pyarrow`, `numpy`
@@ -57,7 +57,7 @@ The robot follows a 1065-waypoint path through a simulated warehouse, visiting s
 ```bash
 # Set paths to your built dependencies
 export DORA_NAV_PATH=/home/demo/Public/dora-nav
-export DORA_MOVEIT2_PATH=/home/demo/Public/dora-moveit2
+export DORA_MUJOCO_PATH=/home/demo/Public/dora-moveit2/dora-mujoco
 
 cd /path/to/octos
 dora up && dora start examples/slam-nav-sim/dataflow_nav_sim.yaml --attach
@@ -105,7 +105,7 @@ This example demonstrates several octos safety concepts:
 | File | Purpose |
 |------|---------|
 | `dataflow_nav_sim.yaml` | 9-node dora dataflow topology |
-| `nodes/moveit_skill_node.py` | Nav skill bridge (SteeringCmd/TrqBreCmd → wheels) |
+| `nodes/nav_bridge_node.py` | Nav skill bridge (SteeringCmd/TrqBreCmd → wheels) |
 | `nodes/octos_robot_edge_node.py` | LLM agent (optional, ONE-SHOT mode) |
 | `nodes/task_pub_stub.py` | Road attribute publisher |
 | `nodes/rerun_viz_node.py` | Rerun 3D visualizer |

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Navigation Skill Bridge — nav-only version for slam-nav-sim example.
+Navigation Bridge Node — nav-only dora-nav → wheel control for slam-nav-sim example.
 
-Stripped from octos_inspection/nodes/moveit_skill_node.py:
-  - Removed: arm control (plan_request, ik_request, scene_command, MoveGroup protocol)
-  - Removed: arm inspection poses (INSPECT_TURN, INSPECT_OVER, HOME_CONFIG)
-  - Kept: dora-nav SteeringCmd/TrqBreCmd → Hunter SE wheel_commands forwarding
-  - Kept: station navigation (navigate_to with stall detection)
-  - Kept: object detection (static cubes)
+Translates dora-nav SteeringCmd/TrqBreCmd into Hunter SE differential-drive
+wheel_commands via MuJoCo velocity actuators.
+
+Also provides navigation tools (navigate_to, stop_base, get_map, etc.) that
+can be called via skill_request from the optional octos LLM agent.
 
 Dataflow connections:
-  Inputs:  skill_request, ground_truth_pose, SteeringCmd, TrqBreCmd
+  Inputs:  skill_request (optional), ground_truth_pose, SteeringCmd, TrqBreCmd
   Outputs: skill_result, wheel_commands
 """
 
@@ -73,8 +72,8 @@ def _result(msg: str, state: dict) -> pa.Array:
     return _encode_json([msg, state])
 
 
-class NavSkillBridge:
-    """Navigation-only skill bridge for dora-nav → Hunter SE wheel control."""
+class NavBridge:
+    """Navigation bridge: dora-nav → Hunter SE wheel control."""
 
     def __init__(self, node: Node):
         self.node = node
@@ -180,7 +179,7 @@ class NavSkillBridge:
             return _result(f"Navigation failed: unknown waypoint '{waypoint}'", {})
 
         target_y = STATIONS[wp]["path_y"]
-        print(f"[moveit-skills] Navigating to {wp}: target_y={target_y:.1f}, current_y={self.gt_y:.3f}")
+        print(f"[nav-bridge] Navigating to {wp}: target_y={target_y:.1f}, current_y={self.gt_y:.3f}")
 
         self.nav_forwarding = True
         deadline = time.time() + NAV_TIMEOUT
@@ -197,7 +196,7 @@ class NavSkillBridge:
             now = time.time()
 
             if now - last_log > log_interval:
-                print(f"[moveit-skills] NAV: x={self.gt_x:.3f} y={self.gt_y:.3f} "
+                print(f"[nav-bridge] NAV: x={self.gt_x:.3f} y={self.gt_y:.3f} "
                       f"θ={self.gt_theta_deg:.1f}° dy={dy:.3f}")
                 last_log = now
 
@@ -209,7 +208,7 @@ class NavSkillBridge:
 
                 self.current_station = wp
                 pos = [round(self.gt_x, 3), round(self.gt_y, 3)]
-                print(f"[moveit-skills] Arrived at {wp} (x={pos[0]}, y={pos[1]})")
+                print(f"[nav-bridge] Arrived at {wp} (x={pos[0]}, y={pos[1]})")
                 return _result(
                     f"Successfully navigated to waypoint {wp}. Base position: {pos}",
                     {"position": wp, "coordinates": pos})
@@ -221,7 +220,7 @@ class NavSkillBridge:
                 self.nav_forwarding = False
                 self.stop_wheels()
                 pos = [round(self.gt_x, 3), round(self.gt_y, 3)]
-                print(f"[moveit-skills] NAV STALL at y={self.gt_y:.3f}, target was {target_y}")
+                print(f"[nav-bridge] NAV STALL at y={self.gt_y:.3f}, target was {target_y}")
                 return _result(
                     f"Navigation to {wp} stopped — path ended at {pos}.",
                     {"position": "path_end", "coordinates": pos})
@@ -284,7 +283,7 @@ class NavSkillBridge:
 
         tool = request.get("tool", "")
         args = request.get("args", {})
-        print(f"[moveit-skills] Executing: {tool}({args})")
+        print(f"[nav-bridge] Executing: {tool}({args})")
 
         dispatch = {
             "get_map": lambda: self.tool_get_map(),
@@ -303,9 +302,9 @@ class NavSkillBridge:
 
 def main():
     node = Node()
-    bridge = NavSkillBridge(node)
+    bridge = NavBridge(node)
 
-    print("[moveit-skills] Nav-only mode — waiting for initial pose...")
+    print("[nav-bridge] Waiting for initial pose...")
 
     deadline = time.time() + 30.0
     got_state = False
@@ -315,19 +314,19 @@ def main():
             if event["id"] == "ground_truth_pose":
                 bridge.update_pose(event)
                 got_state = True
-                print(f"[moveit-skills] Initial pose: ({bridge.gt_x:.2f}, {bridge.gt_y:.2f}) "
+                print(f"[nav-bridge] Initial pose: ({bridge.gt_x:.2f}, {bridge.gt_y:.2f}) "
                       f"θ={bridge.gt_theta_deg:.1f}°")
                 break
             elif event["id"] in ("SteeringCmd", "TrqBreCmd"):
                 bridge.update_nav_control(event["id"], event)
 
     if not got_state:
-        print("[moveit-skills] ERROR: No pose received in 30s")
+        print("[nav-bridge] ERROR: No pose received in 30s")
         return
 
     # In standalone mode (no robot-edge-a), always forward nav commands
     bridge.nav_forwarding = True
-    print("[moveit-skills] Nav skill bridge ready — 6 tools, nav forwarding enabled")
+    print("[nav-bridge] Nav skill bridge ready — 6 tools, nav forwarding enabled")
 
     while True:
         event = node.next(timeout=0.1)
@@ -335,7 +334,7 @@ def main():
             bridge.forward_nav_to_wheels()
             continue
         if event["type"] == "STOP":
-            print("[moveit-skills] Shutting down")
+            print("[nav-bridge] Shutting down")
             break
         if event["type"] != "INPUT":
             continue
@@ -349,9 +348,9 @@ def main():
         elif eid == "skill_request":
             result = bridge.handle_skill_request(event)
             node.send_output("skill_result", result, {"encoding": "json"})
-            print("[moveit-skills] Skill result sent")
+            print("[nav-bridge] Skill result sent")
 
-    print("[moveit-skills] Node finished")
+    print("[nav-bridge] Node finished")
 
 
 if __name__ == "__main__":
