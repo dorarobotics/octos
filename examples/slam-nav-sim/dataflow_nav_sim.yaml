@@ -1,0 +1,160 @@
+# dataflow_nav_sim.yaml — Minimal SLAM navigation visual simulation
+#
+# 9-node dataflow stripped from octos_inspection (16 nodes).
+# Removed: iot-gateway, cloud-brain, planning-scene, planner, ik-solver, trajectory-executor
+# Kept: MuJoCo sim + dora-nav pipeline + Rerun visualization + nav skill bridge
+#
+# Robot follows a 1065-waypoint path through a warehouse.
+# Rerun shows live 3D: robot body, pointcloud, planned path, trajectory trail.
+#
+# Prerequisites:
+#   1. Build dora-nav C++ nodes: cd $DORA_NAV_PATH && bash build_all.sh
+#   2. Install dora-rs: pip install dora-rs
+#   3. Install Python deps: pip install pyarrow numpy rerun-sdk
+#
+# Run:
+#   dora up && dora start examples/slam-nav-sim/dataflow_nav_sim.yaml --attach
+#
+# Optional autonomous mode (requires vLLM):
+#   USER_COMMAND="navigate to station A then return home" \
+#   dora up && dora start examples/slam-nav-sim/dataflow_nav_sim.yaml --attach
+
+nodes:
+  # =======================================
+  # MuJoCo Simulation (Hunter SE + warehouse)
+  # =======================================
+
+  - id: mujoco-sim
+    path: ${DORA_MOVEIT2_PATH:-/home/demo/Public/dora-moveit2}/dora-mujoco/dora_mujoco/main.py
+    inputs:
+      tick: dora/timer/millis/10
+      wheel_control: moveit-skills/wheel_commands
+    outputs:
+      - joint_positions
+      - ground_truth_pose
+      - pointcloud
+    env:
+      MODEL_NAME: ${MODEL_NAME:-models/hunter_se_warehouse.xml}
+      MUJOCO_GL: "glfw"
+      NAV_MODE: "1"
+      PHYSICS_STEPS: "5"
+      LIDAR_RAYS: "360"
+      LIDAR_VERTICAL_BEAMS: "16"
+      LIDAR_RANGE: "100.0"
+      LIDAR_MIN_RANGE: "0.5"
+      LIDAR_BODY_NAME: "lidar"
+      ROBOT_BODY_NAME: "hunter_base"
+      POINTCLOUD_RATE: "10"
+
+  # =======================================
+  # dora-nav Navigation Pipeline (C++ nodes)
+  # =======================================
+
+  - id: pub-road
+    custom:
+      source: Local
+      path: ${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/map/pub_road/build/pubroad
+      inputs:
+        tick: dora/timer/millis/200
+      outputs:
+        - road_lane
+
+  - id: road-lane-publisher
+    custom:
+      source: Local
+      path: ${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/map/road_line_publisher/build/road_lane_publisher_node
+      inputs:
+        road_lane: pub-road/road_lane
+        cur_pose: mujoco-sim/ground_truth_pose
+      outputs:
+        - cur_pose_all
+
+  - id: task-pub-stub
+    path: nodes/task_pub_stub.py
+    inputs:
+      tick: dora/timer/millis/100
+    outputs:
+      - road_attri_msg
+
+  - id: planning
+    custom:
+      source: Local
+      path: ${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/planning/routing_planning/build/routing_planning_node
+      inputs:
+        road_lane: pub-road/road_lane
+        cur_pose_all: road-lane-publisher/cur_pose_all
+        road_attri_msg: task-pub-stub/road_attri_msg
+      outputs:
+        - raw_path
+        - Request
+
+  - id: lon-control
+    custom:
+      source: Local
+      path: ${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/control/vehicle_control/lon_controller/build/lon_controller_node
+      inputs:
+        Request: planning/Request
+      outputs:
+        - TrqBreCmd
+
+  - id: lat-control
+    custom:
+      source: Local
+      path: ${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/control/vehicle_control/lat_controller/build/lat_controller_node
+      inputs:
+        raw_path: planning/raw_path
+      outputs:
+        - SteeringCmd
+
+  # =======================================
+  # Rerun 3D Visualization
+  # =======================================
+
+  - id: rerun
+    path: nodes/rerun_viz_node.py
+    inputs:
+      pointcloud: mujoco-sim/pointcloud
+      raw_path: planning/raw_path
+      cur_pose: mujoco-sim/ground_truth_pose
+    env:
+      WAYPOINTS_FILE: "Waypoints.txt"
+      MAP_PCD_FILE: "${DORA_NAV_PATH:-/home/demo/Public/dora-nav}/data/map.pcd"
+
+  # =======================================
+  # Navigation Skill Bridge (nav → wheels)
+  # =======================================
+
+  - id: moveit-skills
+    path: nodes/moveit_skill_node.py
+    inputs:
+      # skill_request: robot-edge-a/skill_request  # uncomment with robot-edge-a
+      ground_truth_pose: mujoco-sim/ground_truth_pose
+      SteeringCmd: lat-control/SteeringCmd
+      TrqBreCmd: lon-control/TrqBreCmd
+    outputs:
+      - skill_result
+      - wheel_commands
+
+  # =======================================
+  # Octos LLM Agent (optional — ONE-SHOT mode)
+  # =======================================
+  # Uncomment to enable autonomous navigation via LLM.
+  # Without this node, the robot follows the full dora-nav path automatically.
+
+  # - id: robot-edge-a
+  #   path: nodes/octos_robot_edge_node.py
+  #   inputs:
+  #     skill_result: moveit-skills/skill_result
+  #   outputs:
+  #     - agent_registration
+  #     - result
+  #     - agent_status
+  #     - environment_update
+  #     - skill_request
+  #   env:
+  #     ROBOT_NAME: demo_robot
+  #     OPENAI_API_BASE: "${OPENAI_API_BASE:-http://10.10.5.26:4567/v1}"
+  #     OPENAI_API_KEY: "${OPENAI_API_KEY:-none}"
+  #     OPENAI_MODEL: "${OPENAI_MODEL:-robobrain}"
+  #     OCTOS_PROVIDER: "openai"
+  #     OCTOS_SKILLS_DIR: "skills/robot/"
