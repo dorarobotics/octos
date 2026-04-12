@@ -147,9 +147,9 @@ nodes:
       - skill_request
     env:
       ROBOT_NAME: demo_robot
-      OPENAI_API_BASE: "${OPENAI_API_BASE:-http://localhost:11434/v1}"
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-none}"
-      OPENAI_MODEL: "${OPENAI_MODEL:-llama3.1}"
+      OPENAI_API_BASE: "http://localhost:11434/v1"
+      OPENAI_API_KEY: "none"
+      OPENAI_MODEL: "qwen3:30b"
       OCTOS_PROVIDER: "openai"
       OCTOS_SKILLS_DIR: "skills/robot/"
       USER_COMMAND: >-
