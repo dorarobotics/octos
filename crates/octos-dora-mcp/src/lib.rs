@@ -23,6 +23,7 @@
 
 mod config;
 pub mod bridge;
+pub mod pipeline;
 
 use async_trait::async_trait;
 use octos_agent::tools::{Tool, ToolResult};

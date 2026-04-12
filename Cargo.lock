@@ -4314,6 +4314,7 @@ dependencies = [
  "octos-agent",
  "octos-llm",
  "octos-pipeline",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
