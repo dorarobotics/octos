@@ -312,12 +312,22 @@ class CyclicPipelineExecutor:
         """
         self._pipeline = pipeline
         self._order = self._edge_order(pipeline)
+        self._steps = self._order  # alias for agent compatibility
         self._max_cycles = max_cycles or pipeline.max_cycles
         self._current_idx = 0
         self._cycle_count = 0
         self._break_requested = False
         self._gate_pending: PipelineNode | None = None
         self._completed: list[str] = []
+
+    def resume_from(self, step_name: str) -> bool:
+        """Reset to the start of the cycle (cyclic pipelines always restart)."""
+        self._current_idx = 0
+        self._cycle_count = 0
+        self._break_requested = False
+        self._gate_pending = None
+        self._completed = []
+        return True
 
     @staticmethod
     def _edge_order(pipeline: Pipeline) -> list[PipelineNode]:

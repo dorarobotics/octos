@@ -183,7 +183,12 @@ class Agent:
         self._loop_detector = LoopDetector()
         self._repairer = MessageRepairer()
         self._safety = SafetyHook()
-        self._pipeline_executor = PipelineExecutor(pipeline) if pipeline else None
+        if pipeline and pipeline.is_cyclic:
+            self._pipeline_executor = CyclicPipelineExecutor(pipeline)
+        elif pipeline:
+            self._pipeline_executor = PipelineExecutor(pipeline)
+        else:
+            self._pipeline_executor = None
         self._system_prompt = self._build_system_prompt()
 
     @staticmethod
