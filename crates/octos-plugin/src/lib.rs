@@ -34,8 +34,8 @@ pub mod manifest;
 pub mod types;
 
 // Re-export primary types for convenience.
-pub use discovery::{PluginSource, discover_plugins};
-pub use gating::{GateCheck, GatingResult, check_requirements};
+pub use discovery::{discover_plugins, PluginSource};
+pub use gating::{check_requirements, GateCheck, GatingResult};
 pub use lifecycle::{HardwareLifecycle, LifecycleExecutor, LifecycleStep, PhaseResult};
 pub use manifest::{InstallSpec, PluginManifest, PluginType, Requirements, ToolDefinition};
 pub use types::{DiscoveredPlugin, PluginOrigin, PluginStatus};

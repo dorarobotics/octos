@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use eyre::{Result, bail};
+use eyre::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 /// A single step in a hardware lifecycle phase.
@@ -152,18 +152,18 @@ impl LifecycleExecutor {
                 Ok(())
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!(
-                    "command exited with {}: {}",
-                    output.status,
-                    stderr.trim()
-                )
+                bail!("command exited with {}: {}", output.status, stderr.trim())
             }
         })
         .await;
 
         match result {
             Ok(inner) => inner,
-            Err(_) => bail!("step '{}' timed out after {}s", step.label, step.timeout_secs),
+            Err(_) => bail!(
+                "step '{}' timed out after {}s",
+                step.label,
+                step.timeout_secs
+            ),
         }
     }
 }

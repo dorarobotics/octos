@@ -323,10 +323,7 @@ mod tests {
     #[tokio::test]
     async fn should_execute_bridge_tool_with_empty_args() {
         let bridge = DoraToolBridge::new(sample_mapping());
-        let result = bridge
-            .execute(&serde_json::json!({}))
-            .await
-            .unwrap();
+        let result = bridge.execute(&serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.file_modified.is_none());
         assert!(result.files_to_send.is_empty());

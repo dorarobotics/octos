@@ -231,17 +231,17 @@ impl HandlerKind {
     /// Resolve handler from DOT `shape` attribute (Attractor spec mapping).
     pub fn from_shape(shape: &str) -> Option<Self> {
         match shape {
-            "Mdiamond" => Some(Self::Noop),       // start node
-            "Msquare" => Some(Self::Noop),        // exit node
-            "box" => Some(Self::Codergen),        // LLM task (default)
-            "hexagon" => Some(Self::Gate),        // human gate / conditional
-            "diamond" => Some(Self::Gate),        // conditional routing
-            "component" => Some(Self::Parallel),  // parallel fan-out
-            "parallelogram" => Some(Self::Shell), // external tool/command
-            "ellipse" => Some(Self::SensorCheck), // sensor read/evaluate
-            "house" => Some(Self::Motion),        // robot motion command
-            "trapezium" => Some(Self::Grasp),     // grasp/release action
-            "octagon" => Some(Self::SafetyGate),  // safety gate
+            "Mdiamond" => Some(Self::Noop),             // start node
+            "Msquare" => Some(Self::Noop),              // exit node
+            "box" => Some(Self::Codergen),              // LLM task (default)
+            "hexagon" => Some(Self::Gate),              // human gate / conditional
+            "diamond" => Some(Self::Gate),              // conditional routing
+            "component" => Some(Self::Parallel),        // parallel fan-out
+            "parallelogram" => Some(Self::Shell),       // external tool/command
+            "ellipse" => Some(Self::SensorCheck),       // sensor read/evaluate
+            "house" => Some(Self::Motion),              // robot motion command
+            "trapezium" => Some(Self::Grasp),           // grasp/release action
+            "octagon" => Some(Self::SafetyGate),        // safety gate
             "doublecircle" => Some(Self::WaitForEvent), // wait for external event
             _ => None,
         }
@@ -360,23 +360,47 @@ mod tests {
 
     #[test]
     fn should_parse_robot_handler_kinds() {
-        assert_eq!(HandlerKind::from_str("sensor_check"), Some(HandlerKind::SensorCheck));
+        assert_eq!(
+            HandlerKind::from_str("sensor_check"),
+            Some(HandlerKind::SensorCheck)
+        );
         assert_eq!(HandlerKind::from_str("motion"), Some(HandlerKind::Motion));
         assert_eq!(HandlerKind::from_str("grasp"), Some(HandlerKind::Grasp));
-        assert_eq!(HandlerKind::from_str("safety_gate"), Some(HandlerKind::SafetyGate));
-        assert_eq!(HandlerKind::from_str("wait_for_event"), Some(HandlerKind::WaitForEvent));
+        assert_eq!(
+            HandlerKind::from_str("safety_gate"),
+            Some(HandlerKind::SafetyGate)
+        );
+        assert_eq!(
+            HandlerKind::from_str("wait_for_event"),
+            Some(HandlerKind::WaitForEvent)
+        );
         // Existing variants still work
-        assert_eq!(HandlerKind::from_str("codergen"), Some(HandlerKind::Codergen));
+        assert_eq!(
+            HandlerKind::from_str("codergen"),
+            Some(HandlerKind::Codergen)
+        );
         assert_eq!(HandlerKind::from_str("unknown_kind"), None);
     }
 
     #[test]
     fn should_parse_robot_shapes() {
-        assert_eq!(HandlerKind::from_shape("ellipse"), Some(HandlerKind::SensorCheck));
+        assert_eq!(
+            HandlerKind::from_shape("ellipse"),
+            Some(HandlerKind::SensorCheck)
+        );
         assert_eq!(HandlerKind::from_shape("house"), Some(HandlerKind::Motion));
-        assert_eq!(HandlerKind::from_shape("trapezium"), Some(HandlerKind::Grasp));
-        assert_eq!(HandlerKind::from_shape("octagon"), Some(HandlerKind::SafetyGate));
-        assert_eq!(HandlerKind::from_shape("doublecircle"), Some(HandlerKind::WaitForEvent));
+        assert_eq!(
+            HandlerKind::from_shape("trapezium"),
+            Some(HandlerKind::Grasp)
+        );
+        assert_eq!(
+            HandlerKind::from_shape("octagon"),
+            Some(HandlerKind::SafetyGate)
+        );
+        assert_eq!(
+            HandlerKind::from_shape("doublecircle"),
+            Some(HandlerKind::WaitForEvent)
+        );
         // Existing shapes still work
         assert_eq!(HandlerKind::from_shape("box"), Some(HandlerKind::Codergen));
         assert_eq!(HandlerKind::from_shape("unknown_shape"), None);
@@ -400,9 +424,27 @@ mod tests {
             nodes.insert(id.to_string(), n);
         }
         let edges = vec![
-            PipelineEdge { source: "a".into(), target: "b".into(), label: None, condition: None, weight: 1.0 },
-            PipelineEdge { source: "b".into(), target: "c".into(), label: None, condition: None, weight: 1.0 },
-            PipelineEdge { source: "c".into(), target: "a".into(), label: None, condition: None, weight: 1.0 },
+            PipelineEdge {
+                source: "a".into(),
+                target: "b".into(),
+                label: None,
+                condition: None,
+                weight: 1.0,
+            },
+            PipelineEdge {
+                source: "b".into(),
+                target: "c".into(),
+                label: None,
+                condition: None,
+                weight: 1.0,
+            },
+            PipelineEdge {
+                source: "c".into(),
+                target: "a".into(),
+                label: None,
+                condition: None,
+                weight: 1.0,
+            },
         ];
         let graph = PipelineGraph {
             id: "cyclic".into(),
@@ -415,7 +457,10 @@ mod tests {
         let result = graph.detect_cycles();
         assert!(result.is_err(), "expected cycle detection to return Err");
         let msg = result.unwrap_err();
-        assert!(msg.contains("cycle detected"), "error message should mention cycle: {msg}");
+        assert!(
+            msg.contains("cycle detected"),
+            "error message should mention cycle: {msg}"
+        );
     }
 
     #[test]

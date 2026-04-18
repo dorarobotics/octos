@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use eyre::{Context, Result, bail};
+use eyre::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::HardwareLifecycle;

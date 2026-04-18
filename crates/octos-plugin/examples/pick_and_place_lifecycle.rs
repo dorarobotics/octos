@@ -78,37 +78,115 @@ async fn main() {
     //   short timeouts. This is the e-stop path.
     let lifecycle = HardwareLifecycle {
         preflight: vec![
-            step("Check gripper air supply", "echo 'Air pressure: 6.2 bar OK'", 5, 1, true),
-            step("Check camera connection", "echo 'Camera /dev/video0 ready'", 5, 0, true),
+            step(
+                "Check gripper air supply",
+                "echo 'Air pressure: 6.2 bar OK'",
+                5,
+                1,
+                true,
+            ),
+            step(
+                "Check camera connection",
+                "echo 'Camera /dev/video0 ready'",
+                5,
+                0,
+                true,
+            ),
             // Non-critical: conveyor encoder is nice-to-have for tracking, not essential
-            step("Check conveyor encoder", "echo 'Encoder pulses: nominal'", 5, 0, false),
+            step(
+                "Check conveyor encoder",
+                "echo 'Encoder pulses: nominal'",
+                5,
+                0,
+                false,
+            ),
         ],
         init: vec![
             // Retries=2: servo drivers sometimes need a second power-on attempt
-            step("Power on servo drives", "echo 'Servo drives powered'", 10, 2, true),
+            step(
+                "Power on servo drives",
+                "echo 'Servo drives powered'",
+                10,
+                2,
+                true,
+            ),
             // Homing is slow (up to 30s) but must succeed — arm position is unknown otherwise
-            step("Home all axes", "echo 'Homing complete: 6 axes at zero'", 30, 1, true),
+            step(
+                "Home all axes",
+                "echo 'Homing complete: 6 axes at zero'",
+                30,
+                1,
+                true,
+            ),
             step("Open gripper", "echo 'Gripper opened'", 5, 0, true),
             // Non-critical: robot can operate without conveyor
-            step("Start conveyor", "echo 'Conveyor running at 0.2 m/s'", 5, 0, false),
+            step(
+                "Start conveyor",
+                "echo 'Conveyor running at 0.2 m/s'",
+                5,
+                0,
+                false,
+            ),
         ],
         ready_check: vec![
-            step("Verify joint limits", "echo 'All joints within limits'", 5, 0, true),
-            step("Verify force sensor zero", "echo 'Force sensor zeroed: [0.01, 0.00, 0.02]'", 5, 0, true),
-            step("Verify workspace clear", "echo 'Workspace clear — no obstacles detected'", 5, 0, true),
+            step(
+                "Verify joint limits",
+                "echo 'All joints within limits'",
+                5,
+                0,
+                true,
+            ),
+            step(
+                "Verify force sensor zero",
+                "echo 'Force sensor zeroed: [0.01, 0.00, 0.02]'",
+                5,
+                0,
+                true,
+            ),
+            step(
+                "Verify workspace clear",
+                "echo 'Workspace clear — no obstacles detected'",
+                5,
+                0,
+                true,
+            ),
         ],
         shutdown: vec![
             // Order matters: park arm BEFORE powering off servos!
-            step("Park arm at home", "echo 'Arm parked at home position'", 15, 1, true),
+            step(
+                "Park arm at home",
+                "echo 'Arm parked at home position'",
+                15,
+                1,
+                true,
+            ),
             step("Open gripper", "echo 'Gripper released'", 5, 0, true),
             step("Stop conveyor", "echo 'Conveyor stopped'", 5, 0, false),
             // Last: power off servos after arm is safely parked
-            step("Power off servo drives", "echo 'Servos powered off'", 10, 0, true),
+            step(
+                "Power off servo drives",
+                "echo 'Servos powered off'",
+                10,
+                0,
+                true,
+            ),
         ],
         emergency_shutdown: vec![
             // 2-second timeout, no retries — this is the e-stop path
-            step("Emergency stop all axes", "echo 'E-STOP: all axes halted'", 2, 0, true),
-            step("Vent gripper pressure", "echo 'Gripper pressure vented'", 2, 0, true),
+            step(
+                "Emergency stop all axes",
+                "echo 'E-STOP: all axes halted'",
+                2,
+                0,
+                true,
+            ),
+            step(
+                "Vent gripper pressure",
+                "echo 'Gripper pressure vented'",
+                2,
+                0,
+                true,
+            ),
         ],
     };
 
@@ -135,14 +213,19 @@ async fn main() {
         let result = LifecycleExecutor::run_phase(name, steps).await;
 
         if result.success {
-            println!("  -> PASSED ({}/{} steps completed)\n", result.steps_completed, result.steps_total);
+            println!(
+                "  -> PASSED ({}/{} steps completed)\n",
+                result.steps_completed, result.steps_total
+            );
         } else {
             // In production, a failed startup means: do NOT hand control to the agent.
             // The robot is not safe to operate.
-            println!("  -> FAILED at step {}/{}: {}",
+            println!(
+                "  -> FAILED at step {}/{}: {}",
                 result.steps_completed + 1,
                 result.steps_total,
-                result.error.as_deref().unwrap_or("unknown error"));
+                result.error.as_deref().unwrap_or("unknown error")
+            );
             println!("  -> Robot NOT safe to operate. Fix the issue and retry.\n");
             return;
         }
@@ -163,7 +246,11 @@ async fn main() {
     let shutdown_result = LifecycleExecutor::run_phase("shutdown", &lifecycle.shutdown).await;
     println!(
         "  -> {} ({}/{} steps completed)\n",
-        if shutdown_result.success { "COMPLETED" } else { "PARTIAL" },
+        if shutdown_result.success {
+            "COMPLETED"
+        } else {
+            "PARTIAL"
+        },
         shutdown_result.steps_completed,
         shutdown_result.steps_total,
     );
@@ -193,7 +280,11 @@ async fn main() {
         LifecycleExecutor::run_phase("emergency_shutdown", &lifecycle.emergency_shutdown).await;
     println!(
         "  -> {} ({}/{} steps completed)",
-        if estop_result.success { "COMPLETED" } else { "PARTIAL" },
+        if estop_result.success {
+            "COMPLETED"
+        } else {
+            "PARTIAL"
+        },
         estop_result.steps_completed,
         estop_result.steps_total,
     );

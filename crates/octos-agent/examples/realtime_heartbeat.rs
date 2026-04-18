@@ -76,11 +76,26 @@ async fn main() {
         check_estop: true,
     };
     println!("RealtimeConfig (timing budgets for failure scenarios):");
-    println!("  iteration_deadline: {}ms  (max time per loop iteration)", config.iteration_deadline_ms);
-    println!("  heartbeat_timeout:  {}ms  (stall detection window)", config.heartbeat_timeout_ms);
-    println!("  llm_timeout:        {}ms  (abort hung LLM calls)", config.llm_timeout_ms);
-    println!("  min_cycle:          {}ms  (prevent CPU thrashing)", config.min_cycle_ms);
-    println!("  check_estop:        {}       (check e-stop each iteration)", config.check_estop);
+    println!(
+        "  iteration_deadline: {}ms  (max time per loop iteration)",
+        config.iteration_deadline_ms
+    );
+    println!(
+        "  heartbeat_timeout:  {}ms  (stall detection window)",
+        config.heartbeat_timeout_ms
+    );
+    println!(
+        "  llm_timeout:        {}ms  (abort hung LLM calls)",
+        config.llm_timeout_ms
+    );
+    println!(
+        "  min_cycle:          {}ms  (prevent CPU thrashing)",
+        config.min_cycle_ms
+    );
+    println!(
+        "  check_estop:        {}       (check e-stop each iteration)",
+        config.check_estop
+    );
 
     // ── Step 2: Heartbeat — detect when the agent loop stops ──
     //
@@ -97,15 +112,21 @@ async fn main() {
     // Normal operation: agent beats every iteration
     println!("\n--- Normal operation (agent loop is healthy) ---");
     for i in 1..=5 {
-        heartbeat.beat();  // Called at the top of each agent loop iteration
+        heartbeat.beat(); // Called at the top of each agent loop iteration
         let state = heartbeat.state();
-        println!("  Iteration {i}: beat #{}, state = {state:?}", heartbeat.count());
+        println!(
+            "  Iteration {i}: beat #{}, state = {state:?}",
+            heartbeat.count()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     // Simulate a stall: the LLM call hangs, no beats for 5+ seconds
     println!("\n--- Stall simulation (LLM provider hangs, no beats) ---");
-    println!("  Waiting {}ms with no heartbeat.beat() calls...", config.heartbeat_timeout_ms + 500);
+    println!(
+        "  Waiting {}ms with no heartbeat.beat() calls...",
+        config.heartbeat_timeout_ms + 500
+    );
     let _ = heartbeat.state(); // Consume current check value
     tokio::time::sleep(Duration::from_millis(config.heartbeat_timeout_ms + 500)).await;
 
@@ -138,15 +159,33 @@ async fn main() {
 
     // Simulate sensor readings arriving from the robot's ROS/dora-rs pipeline
     let sensors = [
-        ("lidar_front", serde_json::json!({"range_m": 3.2, "clear": true})),
-        ("battery", serde_json::json!({"voltage": 24.1, "soc_pct": 78})),
-        ("joint_positions", serde_json::json!([0.0, 0.5, -0.3, 1.2, 0.0, 0.0])),
-        ("imu", serde_json::json!({"roll": 0.01, "pitch": -0.02, "yaw": 1.57})),
-        ("force_torque", serde_json::json!([0.5, 0.1, 9.8, 0.0, 0.0, 0.0])),
+        (
+            "lidar_front",
+            serde_json::json!({"range_m": 3.2, "clear": true}),
+        ),
+        (
+            "battery",
+            serde_json::json!({"voltage": 24.1, "soc_pct": 78}),
+        ),
+        (
+            "joint_positions",
+            serde_json::json!([0.0, 0.5, -0.3, 1.2, 0.0, 0.0]),
+        ),
+        (
+            "imu",
+            serde_json::json!({"roll": 0.01, "pitch": -0.02, "yaw": 1.57}),
+        ),
+        (
+            "force_torque",
+            serde_json::json!([0.5, 0.1, 9.8, 0.0, 0.0, 0.0]),
+        ),
     ];
 
     println!("\n--- Sensor context injection ---");
-    println!("Pushing {} sensor snapshots into ring buffer (capacity=8):", sensors.len());
+    println!(
+        "Pushing {} sensor snapshots into ring buffer (capacity=8):",
+        sensors.len()
+    );
     for (id, value) in sensors {
         let snapshot = SensorSnapshot {
             sensor_id: id.to_string(),
@@ -159,7 +198,11 @@ async fn main() {
 
     // Query a specific sensor (useful for conditional logic in the agent loop)
     if let Some(battery) = injector.latest("battery") {
-        let soc = battery.value.get("soc_pct").and_then(|v| v.as_u64()).unwrap_or(0);
+        let soc = battery
+            .value
+            .get("soc_pct")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         println!("\n  Latest battery reading: {}% SoC", soc);
         if soc < 20 {
             println!("  -> WARNING: Low battery! Agent should return to charging dock.");

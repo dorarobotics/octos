@@ -143,12 +143,7 @@ impl SensorSnapshot {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0)
             .saturating_sub(self.timestamp_ms);
-        format!(
-            "[{}] {} ({}ms ago)",
-            self.sensor_id,
-            self.value,
-            age_ms
-        )
+        format!("[{}] {} ({}ms ago)", self.sensor_id, self.value, age_ms)
     }
 }
 

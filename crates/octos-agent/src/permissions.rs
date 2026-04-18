@@ -190,9 +190,7 @@ mod tests {
         let policy = RobotPermissionPolicy::default();
         assert_eq!(policy.max_tier, SafetyTier::Observe);
         assert!(policy.authorize("sensor", SafetyTier::Observe).is_ok());
-        assert!(policy
-            .authorize("move", SafetyTier::SafeMotion)
-            .is_err());
+        assert!(policy.authorize("move", SafetyTier::SafeMotion).is_err());
     }
 
     #[test]
