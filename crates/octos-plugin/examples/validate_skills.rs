@@ -11,7 +11,7 @@
 //! - Gating requirements against current environment
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use octos_plugin::gating;

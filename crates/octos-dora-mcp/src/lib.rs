@@ -48,7 +48,7 @@ pub enum SafetyTier {
 
 impl SafetyTier {
     /// Parse from the string representation used in config files.
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_config_str(s: &str) -> Self {
         match s {
             "observe" => SafetyTier::Observe,
             "safe_motion" => SafetyTier::SafeMotion,
@@ -121,7 +121,7 @@ impl DoraToolBridge {
 
     /// Parse the safety tier string into the typed enum.
     pub fn required_safety_tier(&self) -> SafetyTier {
-        SafetyTier::from_str(&self.mapping.safety_tier)
+        SafetyTier::from_config_str(&self.mapping.safety_tier)
     }
 
     /// Build the JSON Schema object describing the tool's input parameters.
@@ -291,7 +291,7 @@ mod tests {
             ("full_actuation", SafetyTier::FullActuation),
             ("emergency_override", SafetyTier::EmergencyOverride),
         ] {
-            assert_eq!(SafetyTier::from_str(s), expected, "failed for '{s}'");
+            assert_eq!(SafetyTier::from_config_str(s), expected, "failed for '{s}'");
         }
     }
 
@@ -303,7 +303,7 @@ mod tests {
             SafetyTier::FullActuation,
             SafetyTier::EmergencyOverride,
         ] {
-            assert_eq!(SafetyTier::from_str(tier.as_str()), tier);
+            assert_eq!(SafetyTier::from_config_str(tier.as_str()), tier);
         }
     }
 

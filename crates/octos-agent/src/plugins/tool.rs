@@ -118,14 +118,13 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style" {
-                if let Some(style) = value.as_str()
+            if key == "style"
+                && let Some(style) = value.as_str()
                     && let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir)
                 {
                     rewritten.insert(key.clone(), serde_json::Value::String(resolved));
                     continue;
                 }
-            }
             if key == "slides" {
                 if let Some(slides) = value.as_array() {
                     let rewritten_slides = slides
@@ -229,7 +228,7 @@ impl PluginTool {
         let out_file = effective_args
             .get("out")
             .and_then(|v| v.as_str())
-            .map(|p| {
+            .and_then(|p| {
                 let path = std::path::PathBuf::from(p);
                 if path.is_absolute() && path.exists() {
                     return Some(path);
@@ -247,8 +246,7 @@ impl PluginTool {
                     .or_else(|| self.work_dir.as_ref().map(|d| d.join(&path)))
                     .or_else(|| std::env::current_dir().ok().map(|d| d.join(&path)))
                     .or(Some(path))
-            })
-            .flatten();
+            });
         let from_output = if out_file.is_none() {
             output.lines().find_map(|line| {
                 line.strip_prefix("Generated PPTX: ")
@@ -272,19 +270,17 @@ impl PluginTool {
         } else {
             None
         };
-        let found = out_file.or(from_output).map(|path| {
+        let found = out_file.or(from_output).inspect(|path| {
             if path.exists() {
-                return path;
+                return;
             }
 
             for _ in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if path.exists() {
-                    return path;
+                    return;
                 }
             }
-
-            path
         });
         if let Some(ref abs) = found {
             tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
