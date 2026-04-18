@@ -33,6 +33,9 @@ unparseable = "unparseable"
 iz = "iz"
 # One-Time Passwords (OTPs)
 ot = "ot"
+# Dora nav C struct field abbreviations (brake, request) — wire-protocol identifiers
+bre = "bre"
+reques = "reques"
 
 [files]
 extend-exclude = ["**/*.js", "**/*.css", "**/*.html", "examples/*/static/**/*.*"]
