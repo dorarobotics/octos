@@ -1010,10 +1010,6 @@ fn task_list_has_active_tasks(tasks: &serde_json::Value) -> bool {
     })
 }
 
-fn current_profile_api_session_key(profile_id: Option<&str>, chat_id: &str) -> SessionKey {
-    current_profile_api_session_key_with_topic(profile_id, chat_id, None)
-}
-
 fn current_profile_api_session_key_with_topic(
     profile_id: Option<&str>,
     chat_id: &str,
@@ -1328,24 +1324,18 @@ async fn handle_delete_session(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
     let mut sess = state.sessions.lock().await;
-    let mut cleared = false;
     for candidate in api_session_key_candidates(state.profile_id.as_deref(), &id, None) {
         if sess.clear(&candidate).await.is_ok() {
-            cleared = true;
             // Notify the gateway runtime to stop the session actor so it doesn't
             // serve stale context if new messages arrive for this session ID.
             if let Some(ref cb) = state.on_session_deleted {
                 cb(&id);
             }
-            return StatusCode::NO_CONTENT.into_response();
+            break;
         }
     }
-    if cleared {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        // No session found — still return 204 (idempotent delete)
-        StatusCode::NO_CONTENT.into_response()
-    }
+    // No session found is also fine — DELETE is idempotent.
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// GET /files/*path — download a file produced by write_file/send_file.

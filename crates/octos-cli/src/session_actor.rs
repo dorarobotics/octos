@@ -304,6 +304,7 @@ async fn send_outbound_with_timeout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_terminal_reply_and_fanout(
     session_handle: &Arc<Mutex<SessionHandle>>,
     session_key: &SessionKey,
@@ -540,7 +541,7 @@ async fn persist_child_session_lifecycle(
                 let _ = parent.upsert_child_contract(contract).await?;
             }
             record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
-            return Ok(parent_exists);
+            Ok(parent_exists)
         }
         ChildSessionLifecycleKind::Completed
         | ChildSessionLifecycleKind::RetryableFailed
@@ -603,7 +604,7 @@ async fn persist_child_session_lifecycle(
                     "orphaned"
                 },
             );
-            return Ok(matches!(join_state, ChildSessionJoinState::Joined));
+            Ok(matches!(join_state, ChildSessionJoinState::Joined))
         }
     }
 }
