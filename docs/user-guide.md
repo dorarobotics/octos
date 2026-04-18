@@ -77,13 +77,75 @@ octos serve --host 0.0.0.0 --port 3000
 
 If you're running behind a reverse proxy (e.g., Caddy or Nginx), configure it to forward to the serve port.
 
+Deployment behavior depends on `config.mode`:
+
+- `local` — Standalone machine. `/` redirects to `/admin/`.
+- `tenant` — Default end-user machine setup. Direct installs stay local at `/admin/`; managed registration setup can also configure the machine's public tunnel.
+- `cloud` — Advanced relay-host setup. `/` serves the landing page and `/admin/` remains the admin dashboard.
+
+`~/.octos/config.json` is the file that `octos serve` reads at startup. Tenant and local installs create it through the normal installers; host installs can now bootstrap it with `scripts/cloud-host-deploy.sh`, which writes `mode: "cloud"` plus the relay settings used by the landing page and frps plugin.
+
+### 2.1.1 Cloud Host Bootstrap
+
+For the relay/host VPS itself, use:
+
+```bash
+bash scripts/cloud-host-deploy.sh
+```
+
+That script:
+
+- creates or updates `~/.octos/config.json` for cloud mode
+- installs `octos serve`
+- runs `scripts/frp/setup-frps.sh`
+- runs `scripts/frp/setup-caddy.sh`
+- saves rerun settings to `~/.octos/cloud-bootstrap.env`
+
+For unattended setup, pass `--config <env-file> --non-interactive`.
+
+**Per-tenant frps authentication.** Tenants no longer share a single FRPS auth token. Each tenant gets its own `tunnel_token` (a UUID, generated at registration time) that the frpc client sends in `metadatas.token`; `frps` forwards Login and NewProxy operations to an octos plugin endpoint that validates the token against the tenant store and caches the `run_id → tenant_id` mapping for subsequent proxy requests. Both `frps` and `frpc` are configured with `auth.token = ""` — the built-in token check is a no-op and all tenant identity rides in the metadata field.
+
+### 2.1.2 Tenant Bootstrap
+
+End users register themselves via the cloud host's public signup page (e.g., `https://octos.example.com`) and receive a personalized setup command covering macOS/Linux and Windows. The command embeds the tenant's subdomain, per-tenant tunnel token, SSH port, and dashboard auth token, so no values need to be typed manually.
+
+A typical emitted command (macOS/Linux):
+
+```bash
+curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \
+    --tunnel \
+    --tenant-name alice \
+    --frps-token <per-tenant-uuid> \
+    --ssh-port 6001 \
+    --domain octos.example.com \
+    --frps-server frps.octos.example.com \
+    --auth-token <dashboard-token>
+```
+
+The installer writes `/etc/frp/frpc.toml` with the per-tenant UUID under `metadatas.token`, brings frpc up as a launchd/systemd service, and starts `octos serve` on the configured local port. On reruns (`~/.octos/bin/install.sh --tunnel`), the installer recovers the token from the existing `metadatas.token` entry instead of prompting.
+
+### 2.1.3 Uninstall
+
+To remove an installation:
+
+| Machine | Command |
+|---------|---------|
+| Tenant (macOS/Linux) | `~/.octos/bin/install.sh --uninstall` |
+| Tenant (Windows)     | `& "$HOME\.octos\bin\install.ps1" -Uninstall` |
+| Cloud VPS (services) | `bash scripts/cloud-host-deploy.sh --uninstall` |
+| Cloud VPS (+ data)   | `bash scripts/cloud-host-deploy.sh --uninstall --purge` |
+
+On a tenant, the uninstall flag stops and removes both `octos-serve` and `frpc` services, deletes `/etc/frp` and `/usr/local/bin/frpc`, stops Caddy if present, and (on Linux) removes the firewall rules it added. The data directory (`~/.octos`) is always preserved unless you delete it manually.
+
+On the cloud VPS, `cloud-host-deploy.sh --uninstall` calls `install.sh --uninstall` internally and additionally stops and removes `frps.service` and the Caddy host configuration. Using plain `install.sh --uninstall` on the VPS is not recommended because it removes `/etc/frp` and `/usr/local/bin/frpc` without stopping `frps.service`.
+
 ### 2.2 OTP Email Authentication
 
 The dashboard uses email-based One-Time Password (OTP) authentication. No passwords are stored — a 6-digit code is emailed to the user each time they log in.
 
 #### Configure SMTP for OTP Emails
 
-Add `dashboard_auth` to your serve config (`~/.octos/config.json` or per-profile):
+Add `dashboard_auth` to your serve config (`~/.octos/config.json` or `<cwd>/.octos/config.json`):
 
 ```json
 {
@@ -1908,6 +1970,11 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
   // Email (for email channel)
   "email": null,
 
+  // Deployment role for octos serve
+  "mode": "local",           // local | tenant | cloud
+  "tunnel_domain": null,      // optional for tenant/cloud tunnel setups
+  "frps_server": null,        // optional for tenant/cloud tunnel setups
+
   // Dashboard auth (serve mode only)
   "dashboard_auth": null,
 
@@ -1962,6 +2029,9 @@ Bot: [uses translate tool with text="Hello world", target_lang="JA"]
 | **System** | |
 | `RUST_LOG` | Log level (error/warn/info/debug/trace) |
 | `OCTOS_LOG_JSON` | Enable JSON-formatted logs (set to any value) |
+| `OCTOS_HOME` | Override the global data/config directory (default: `~/.octos`) |
+| `TUNNEL_DOMAIN` | Tunnel base domain for tenant/cloud deployments |
+| `FRPS_SERVER` | frps relay host for tenant/cloud deployments |
 
 ### 15.3 File Layout
 

@@ -1,20 +1,23 @@
 //! Tool registry: stores, filters, and executes registered tools.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 use eyre::Result;
 use octos_llm::ToolSpec;
+
+use crate::task_supervisor::TaskSupervisor;
 
 #[cfg(feature = "ast")]
 use super::CodeStructureTool;
 use super::policy::{self, ToolPolicy};
 use super::{
-    BrowserTool, ConfigureToolTool, DiffEditTool, EditFileTool, GlobTool, GrepTool, ListDirTool,
-    ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle, ToolResult, WebFetchTool,
-    WebSearchTool, WriteFileTool,
+    BrowserTool, CheckWorkspaceContractTool, ConfigureToolTool, DiffEditTool, EditFileTool,
+    GlobTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, Tool, ToolConfigStore, ToolLifecycle,
+    ToolResult, WebFetchTool, WebSearchTool, WorkspaceDiffTool, WorkspaceLogTool,
+    WorkspaceShowTool, WriteFileTool,
 };
 use crate::sandbox::{NoSandbox, Sandbox};
 
@@ -54,6 +57,7 @@ fn estimate_json_size(value: &serde_json::Value) -> usize {
 /// Registry of available tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    workspace_root: Option<PathBuf>,
     /// Provider-specific policy that filters specs() output without removing tools.
     provider_policy: Option<ToolPolicy>,
     /// Context-based tag filter: only tools with matching tags appear in specs().
@@ -74,10 +78,12 @@ pub struct ToolRegistry {
     spawn_only_messages: HashMap<String, String>,
     /// Callback to notify session actor when background (spawn_only) tasks complete or fail.
     background_result_sender: Option<super::spawn::BackgroundResultSender>,
-    /// Number of spawn_only background tasks currently in flight.
-    active_bg_tasks: Arc<AtomicU32>,
+    /// Supervisor for tracking background task lifecycle.
+    supervisor: Arc<TaskSupervisor>,
     /// Set to true when any spawn_only tool is actually invoked in this agent run.
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
+    /// Session key for tagging background tasks (set per-session).
+    session_key: Option<String>,
 }
 
 impl Default for ToolRegistry {
@@ -91,6 +97,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            workspace_root: None,
             provider_policy: None,
             context_filter: None,
             cached_specs: std::sync::Mutex::new(None),
@@ -100,14 +107,20 @@ impl ToolRegistry {
             spawn_only: HashSet::new(),
             spawn_only_messages: HashMap::new(),
             background_result_sender: None,
-            active_bg_tasks: Arc::new(AtomicU32::new(0)),
+            supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_key: None,
         }
     }
 
     /// Mark a tool name as coming from a plugin binary.
     pub fn mark_as_plugin(&mut self, name: &str) {
         self.plugin_tools.insert(name.to_string());
+    }
+
+    /// Set the session key used to tag background tasks.
+    pub fn set_session_key(&mut self, key: String) {
+        self.session_key = Some(key);
     }
 
     /// Mark a tool as spawn_only with an optional custom message.
@@ -123,12 +136,27 @@ impl ToolRegistry {
         self.spawn_only.contains(name)
     }
 
+    /// Clear all spawn_only markers so tools appear as regular tools.
+    /// Used in subagent registries where spawn_only tools should be
+    /// callable directly (the subagent IS the background context).
+    pub fn clear_spawn_only(&mut self) {
+        self.spawn_only.clear();
+        self.spawn_only_messages.clear();
+        self.invalidate_cache();
+    }
+
     /// Get the custom message for a spawn_only tool, or a default.
+    /// Includes the output directory so the LLM knows where files will be written.
     pub fn spawn_only_message(&self, name: &str) -> String {
-        self.spawn_only_messages
+        let base = self.spawn_only_messages
             .get(name)
             .cloned()
-            .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string())
+            .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string());
+        // Include output dir from OCTOS_DATA_DIR so LLM can reference files if needed
+        let output_dir = std::env::var("OCTOS_DATA_DIR")
+            .map(|d| format!("{d}/skill-output/"))
+            .unwrap_or_else(|_| "skill-output/".to_string());
+        format!("{base}\nOutput directory: {output_dir}")
     }
 
     /// Set background result sender for spawn_only task lifecycle notifications.
@@ -141,24 +169,25 @@ impl ToolRegistry {
         self.background_result_sender.clone()
     }
 
-    /// Get a shared handle to the active background task counter.
-    pub fn active_bg_tasks(&self) -> Arc<AtomicU32> {
-        self.active_bg_tasks.clone()
+    /// Get a shared handle to the task supervisor.
+    pub fn supervisor(&self) -> Arc<TaskSupervisor> {
+        self.supervisor.clone()
     }
 
-    /// Increment the active background task counter. Returns the previous value.
-    pub fn inc_bg_tasks(&self) -> u32 {
-        self.active_bg_tasks.fetch_add(1, Ordering::SeqCst)
+    /// Root workspace path associated with this registry, if any.
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
     }
 
-    /// Decrement the active background task counter. Returns the previous value.
-    pub fn dec_bg_tasks(&self) -> u32 {
-        self.active_bg_tasks.fetch_sub(1, Ordering::SeqCst)
+    /// Register a background task and return its ID.
+    pub fn register_task(&self, tool_name: &str, tool_call_id: &str) -> String {
+        self.supervisor
+            .register(tool_name, tool_call_id, self.session_key.as_deref())
     }
 
     /// Return the number of currently active background tasks.
     pub fn bg_task_count(&self) -> u32 {
-        self.active_bg_tasks.load(Ordering::SeqCst)
+        self.supervisor.task_count() as u32
     }
 
     /// Return the set of spawn_only tool names.
@@ -320,6 +349,7 @@ impl ToolRegistry {
 
         Self {
             tools,
+            workspace_root: self.workspace_root.clone(),
             provider_policy: self.provider_policy.clone(),
             context_filter: self.context_filter.clone(),
             cached_specs: std::sync::Mutex::new(None),
@@ -329,8 +359,9 @@ impl ToolRegistry {
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
             background_result_sender: self.background_result_sender.clone(),
-            active_bg_tasks: self.active_bg_tasks.clone(),
+            supervisor: self.supervisor.clone(),
             spawn_only_invoked: self.spawn_only_invoked.clone(),
+            session_key: self.session_key.clone(),
         }
     }
 
@@ -370,12 +401,11 @@ impl ToolRegistry {
 
         if let Some(info) = policy::tool_group_info(group_or_name) {
             for &tool in info.tools {
-                // Never activate spawn_only tools -- they must be used via spawn subagent
-                if !self.spawn_only.contains(tool) && deferred.remove(tool) {
+                if deferred.remove(tool) {
                     activated.push(tool.to_string());
                 }
             }
-        } else if !self.spawn_only.contains(group_or_name) && deferred.remove(group_or_name) {
+        } else if deferred.remove(group_or_name) {
             activated.push(group_or_name.to_string());
         }
 
@@ -585,6 +615,7 @@ impl ToolRegistry {
     pub fn with_builtins_and_sandbox(cwd: impl AsRef<Path>, sandbox: Box<dyn Sandbox>) -> Self {
         let cwd = cwd.as_ref();
         let mut registry = Self::new();
+        registry.workspace_root = Some(cwd.to_path_buf());
         registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
         registry.register(ReadFileTool::new(cwd));
         registry.register(DiffEditTool::new(cwd));
@@ -596,6 +627,10 @@ impl ToolRegistry {
         registry.register(WebSearchTool::new());
         registry.register(WebFetchTool::new());
         registry.register(BrowserTool::new());
+        registry.register(CheckWorkspaceContractTool::new(cwd));
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]
@@ -614,6 +649,10 @@ impl ToolRegistry {
         "glob",
         "grep",
         "list_dir",
+        "check_workspace_contract",
+        "workspace_log",
+        "workspace_show",
+        "workspace_diff",
         #[cfg(feature = "git")]
         "git",
         #[cfg(feature = "ast")]
@@ -627,6 +666,7 @@ impl ToolRegistry {
         let cwd = cwd.as_ref();
         // Clone everything except cwd-bound tools
         let mut registry = self.snapshot_excluding(Self::CWD_BOUND_TOOLS);
+        registry.workspace_root = Some(cwd.to_path_buf());
         // Re-register cwd-bound tools with the new workspace
         registry.register(ShellTool::new(cwd).with_sandbox(sandbox));
         registry.register(ReadFileTool::new(cwd));
@@ -636,6 +676,10 @@ impl ToolRegistry {
         registry.register(GlobTool::new(cwd));
         registry.register(GrepTool::new(cwd));
         registry.register(ListDirTool::new(cwd));
+        registry.register(CheckWorkspaceContractTool::new(cwd));
+        registry.register(WorkspaceLogTool::new(cwd));
+        registry.register(WorkspaceShowTool::new(cwd));
+        registry.register(WorkspaceDiffTool::new(cwd));
         #[cfg(feature = "git")]
         registry.register(super::GitTool::new(cwd));
         #[cfg(feature = "ast")]

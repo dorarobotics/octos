@@ -83,6 +83,7 @@ export interface UserProfile {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -94,6 +95,7 @@ export interface ProfileResponse {
   enabled: boolean
   data_dir: string | null
   parent_id?: string | null
+  public_subdomain?: string | null
   config: ProfileConfig
   created_at: string
   updated_at: string
@@ -111,6 +113,16 @@ export interface OverviewResponse {
 export interface ActionResponse {
   ok: boolean
   message?: string
+}
+
+export interface PurgeReport {
+  profile_id: string
+  user_email: string | null
+  tenant_id: string | null
+  node_name: string | null
+  port_released: number | null
+  files_removed: string[]
+  bytes_freed: number
 }
 
 export interface BulkActionResponse {
@@ -169,6 +181,18 @@ export interface OtpVerifyResponse {
   token?: string
   user?: User
   message?: string
+}
+
+export interface AllowlistEntry {
+  email: string
+  note?: string | null
+  created_at: string
+  claimed_user_id?: string | null
+  claimed_at?: string | null
+  registered: boolean
+  registered_user_id?: string | null
+  registered_name?: string | null
+  last_login_at?: string | null
 }
 
 export interface MeResponse {

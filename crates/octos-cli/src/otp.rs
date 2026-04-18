@@ -46,6 +46,11 @@ pub struct DashboardAuthConfig {
     /// Whether to allow self-registration (unknown emails auto-create users).
     #[serde(default)]
     pub allow_self_registration: bool,
+    /// Static tokens that bypass OTP verification (for E2E testing).
+    /// When a verify request's code matches a static token, authentication
+    /// succeeds immediately without sending or checking an OTP.
+    #[serde(default)]
+    pub static_tokens: Vec<String>,
 }
 
 fn default_session_hours() -> u64 {
@@ -66,6 +71,14 @@ pub struct ActiveSession {
     pub expires_at: DateTime<Utc>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestEmail {
+    pub to: String,
+    pub subject: String,
+    pub html: String,
+}
+
 /// OTP and session manager with optional disk persistence.
 pub struct AuthManager {
     pending_otps: RwLock<HashMap<String, PendingOtp>>,
@@ -76,21 +89,27 @@ pub struct AuthManager {
     smtp_password: Option<String>,
     session_expiry_hours: u64,
     pub allow_self_registration: bool,
+    /// Static tokens that bypass OTP (for E2E testing).
+    pub static_tokens: Vec<String>,
     user_store: Arc<UserStore>,
     /// Path to persist sessions. `None` = in-memory only (tests).
     sessions_path: Option<PathBuf>,
+    #[cfg(test)]
+    sent_emails: RwLock<Vec<TestEmail>>,
 }
 
 impl AuthManager {
     pub fn new(config: Option<DashboardAuthConfig>, user_store: Arc<UserStore>) -> Self {
-        let (smtp_config, session_expiry_hours, allow_self_registration) = match config {
-            Some(c) => (
-                Some(c.smtp),
-                c.session_expiry_hours,
-                c.allow_self_registration,
-            ),
-            None => (None, 24, true), // dev mode: allow self-registration
-        };
+        let (smtp_config, session_expiry_hours, allow_self_registration, static_tokens) =
+            match config {
+                Some(c) => (
+                    Some(c.smtp),
+                    c.session_expiry_hours,
+                    c.allow_self_registration,
+                    c.static_tokens,
+                ),
+                None => (None, 24, false, Vec::new()),
+            };
         Self {
             pending_otps: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
@@ -98,8 +117,11 @@ impl AuthManager {
             smtp_password: None,
             session_expiry_hours,
             allow_self_registration,
+            static_tokens,
             user_store,
             sessions_path: None,
+            #[cfg(test)]
+            sent_emails: RwLock::new(Vec::new()),
         }
     }
 
@@ -128,6 +150,21 @@ impl AuthManager {
         self
     }
 
+    #[cfg(test)]
+    pub async fn test_sent_emails(&self) -> Vec<TestEmail> {
+        self.sent_emails.read().await.clone()
+    }
+
+    #[cfg(test)]
+    pub async fn test_pending_code(&self, email: &str, user_id: Option<&str>) -> Option<String> {
+        let key = Self::otp_key(&email.to_lowercase(), user_id);
+        self.pending_otps
+            .read()
+            .await
+            .get(&key)
+            .map(|otp| otp.code.clone())
+    }
+
     /// Persist current sessions to disk (best-effort).
     fn persist_sessions_blocking(sessions: &HashMap<String, ActiveSession>, path: &PathBuf) {
         if let Ok(data) = serde_json::to_string(sessions) {
@@ -135,53 +172,128 @@ impl AuthManager {
         }
     }
 
+    fn otp_key(email: &str, user_id: Option<&str>) -> String {
+        match user_id {
+            Some(user_id) => format!("{email}::{user_id}"),
+            None => email.to_string(),
+        }
+    }
+
+    async fn store_pending_otp(&self, otp_key: &str) -> Result<bool> {
+        let now = Utc::now();
+        let code = generate_otp_code();
+        let mut otps = self.pending_otps.write().await;
+        if let Some(existing) = otps.get(otp_key) {
+            let elapsed = now.signed_duration_since(existing.created_at);
+            if elapsed < Duration::seconds(60) {
+                return Ok(false);
+            }
+        }
+        otps.insert(
+            otp_key.to_string(),
+            PendingOtp {
+                code,
+                created_at: now,
+                attempts: 0,
+            },
+        );
+        Ok(true)
+    }
+
+    async fn verify_pending_otp(&self, otp_key: &str, code: &str) -> Result<bool> {
+        let now = Utc::now();
+        let valid = {
+            let mut otps = self.pending_otps.write().await;
+            let otp = match otps.get_mut(otp_key) {
+                Some(otp) => otp,
+                None => return Ok(false),
+            };
+
+            if now.signed_duration_since(otp.created_at) > Duration::minutes(5) {
+                otps.remove(otp_key);
+                return Ok(false);
+            }
+
+            otp.attempts += 1;
+            if otp.attempts > 3 {
+                otps.remove(otp_key);
+                return Ok(false);
+            }
+
+            let code_matches = constant_time_eq(code.as_bytes(), otp.code.as_bytes());
+            if code_matches {
+                otps.remove(otp_key);
+            }
+            code_matches
+        };
+
+        Ok(valid)
+    }
+
+    /// Send an arbitrary HTML email through the configured SMTP transport.
+    ///
+    /// Returns `Ok(true)` when an email was sent, `Ok(false)` when SMTP is not
+    /// configured and the email was intentionally skipped.
+    pub async fn send_html_email(&self, email: &str, subject: &str, html: &str) -> Result<bool> {
+        let Some(ref smtp) = self.smtp_config else {
+            tracing::warn!(email = %email, subject = %subject, "email skipped — no SMTP configured");
+            return Ok(false);
+        };
+
+        self.deliver_html_email(smtp, email, subject, html).await?;
+        Ok(true)
+    }
+
     /// Generate and send OTP to email. Returns Ok(true) if sent, Ok(false) if rate-limited.
     pub async fn send_otp(&self, email: &str) -> Result<bool> {
-        let email_lower = email.to_lowercase();
-        let now = Utc::now();
+        self.send_otp_with_registration(email, self.allow_self_registration)
+            .await
+    }
 
-        // When self-registration is off, only send OTP if user exists
-        if !self.allow_self_registration {
+    pub async fn send_otp_with_registration(
+        &self,
+        email: &str,
+        allow_registration: bool,
+    ) -> Result<bool> {
+        let email_lower = email.to_lowercase();
+
+        if !allow_registration {
             let user = self.user_store.get_by_email(&email_lower)?;
             if user.is_none() {
-                // Return Ok(true) to avoid email enumeration — caller shows same message
                 tracing::warn!(email = %email_lower, "OTP skipped — user not found and self-registration is disabled");
                 return Ok(true);
             }
         }
 
-        // Generate 6-digit code
-        let code = generate_otp_code();
-
-        // Atomic rate-limit check + insert under a single write lock
-        {
-            let mut otps = self.pending_otps.write().await;
-            if let Some(existing) = otps.get(&email_lower) {
-                let elapsed = now.signed_duration_since(existing.created_at);
-                if elapsed < Duration::seconds(60) {
-                    return Ok(false);
-                }
-            }
-            // Insert pending OTP only after rate-limit passes
-            otps.insert(
-                email_lower.clone(),
-                PendingOtp {
-                    code: code.clone(),
-                    created_at: now,
-                    attempts: 0,
-                },
-            );
+        let otp_key = Self::otp_key(&email_lower, None);
+        let should_send = self.store_pending_otp(&otp_key).await?;
+        if !should_send {
+            return Ok(false);
         }
 
-        // Send email — if it fails, remove the OTP so user isn't stuck rate-limited
         if let Some(ref smtp) = self.smtp_config {
-            if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key).map(|otp| otp.code.clone())
+            };
+            if let Some(code) = code {
+                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                    let mut otps = self.pending_otps.write().await;
+                    otps.remove(&otp_key);
+                    return Err(e);
+                }
+            } else {
                 let mut otps = self.pending_otps.write().await;
-                otps.remove(&email_lower);
-                return Err(e);
+                otps.remove(&otp_key);
+                bail!("pending OTP missing before email send");
             }
         } else {
-            // Dev mode: log to console — email will NOT be delivered
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key)
+                    .map(|otp| otp.code.clone())
+                    .unwrap_or_default()
+            };
             tracing::debug!(email = %email_lower, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
             tracing::warn!(email = %email_lower, "OTP generated (code redacted, enable debug logging to see) — configure dashboard_auth.smtp to send emails");
         }
@@ -189,54 +301,93 @@ impl AuthManager {
         Ok(true)
     }
 
+    pub async fn send_otp_for_user(&self, email: &str, user_id: &str) -> Result<bool> {
+        let email_lower = email.to_lowercase();
+        let user = self
+            .user_store
+            .get(user_id)?
+            .ok_or_else(|| eyre::eyre!("user '{user_id}' not found"))?;
+        if user.email.to_lowercase() != email_lower {
+            bail!("email '{email_lower}' is not registered to user '{user_id}'");
+        }
+
+        let otp_key = Self::otp_key(&email_lower, Some(user_id));
+        let should_send = self.store_pending_otp(&otp_key).await?;
+        if !should_send {
+            return Ok(false);
+        }
+
+        if let Some(ref smtp) = self.smtp_config {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key).map(|otp| otp.code.clone())
+            };
+            if let Some(code) = code {
+                if let Err(e) = self.send_otp_email(smtp, &email_lower, &code).await {
+                    let mut otps = self.pending_otps.write().await;
+                    otps.remove(&otp_key);
+                    return Err(e);
+                }
+            } else {
+                let mut otps = self.pending_otps.write().await;
+                otps.remove(&otp_key);
+                bail!("pending OTP missing before email send");
+            }
+        } else {
+            let code = {
+                let otps = self.pending_otps.read().await;
+                otps.get(&otp_key)
+                    .map(|otp| otp.code.clone())
+                    .unwrap_or_default()
+            };
+            tracing::debug!(email = %email_lower, user_id = %user_id, code = %code, "OTP code (no SMTP configured) — configure dashboard_auth.smtp to send emails");
+            tracing::warn!(email = %email_lower, user_id = %user_id, "OTP generated (code redacted, enable debug logging to see) — configure dashboard_auth.smtp to send emails");
+        }
+
+        Ok(true)
+    }
+
     /// Verify OTP code. Returns session token on success.
+    /// Check if a code is a static token (bypasses OTP for E2E testing).
+    pub fn is_static_token(&self, code: &str) -> bool {
+        self.static_tokens
+            .iter()
+            .any(|t| !t.is_empty() && t == code)
+    }
+
     pub async fn verify_otp(&self, email: &str, code: &str) -> Result<Option<String>> {
+        self.verify_otp_with_registration(email, code, self.allow_self_registration)
+            .await
+    }
+
+    pub async fn verify_otp_with_registration(
+        &self,
+        email: &str,
+        code: &str,
+        allow_registration: bool,
+    ) -> Result<Option<String>> {
         let email_lower = email.to_lowercase();
         let now = Utc::now();
 
-        let valid = {
-            let mut otps = self.pending_otps.write().await;
-            let otp = match otps.get_mut(&email_lower) {
-                Some(otp) => otp,
-                None => return Ok(None),
-            };
+        // Static tokens bypass OTP verification entirely (E2E testing).
+        let is_static = self.is_static_token(code);
 
-            // Check expiry (5 minutes)
-            if now.signed_duration_since(otp.created_at) > Duration::minutes(5) {
-                otps.remove(&email_lower);
-                return Ok(None);
-            }
-
-            // Check max attempts
-            otp.attempts += 1;
-            if otp.attempts > 3 {
-                otps.remove(&email_lower);
-                return Ok(None);
-            }
-
-            // Verify code (constant-time comparison)
-            let code_matches = constant_time_eq(code.as_bytes(), otp.code.as_bytes());
-            if code_matches {
-                otps.remove(&email_lower);
-            }
-            code_matches
-        };
-
-        if !valid {
+        if !is_static
+            && !self
+                .verify_pending_otp(&Self::otp_key(&email_lower, None), code)
+                .await?
+        {
             return Ok(None);
         }
 
-        // Check if user exists (or create if self-registration enabled)
         let user = self.user_store.get_by_email(&email_lower)?;
         let user = match user {
             Some(u) => u,
             None => {
-                if !self.allow_self_registration {
+                if !allow_registration {
                     bail!("no account found for this email");
                 }
-                // Auto-create user
                 let id = crate::user_store::email_to_user_id(&email_lower);
-                // Ensure unique ID
                 let mut final_id = id.clone();
                 let mut suffix = 1u32;
                 while self.user_store.get(&final_id)?.is_some() {
@@ -256,12 +407,55 @@ impl AuthManager {
             }
         };
 
-        // Update last_login_at
         let mut updated_user = user.clone();
         updated_user.last_login_at = Some(now);
         self.user_store.save(&updated_user)?;
 
-        // Generate session token
+        let token = generate_session_token();
+        let session = ActiveSession {
+            user_id: user.id.clone(),
+            role: user.role.clone(),
+            created_at: now,
+            expires_at: now + Duration::hours(self.session_expiry_hours as i64),
+        };
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(token.clone(), session);
+            if let Some(ref path) = self.sessions_path {
+                Self::persist_sessions_blocking(&sessions, path);
+            }
+        }
+
+        Ok(Some(token))
+    }
+
+    pub async fn verify_otp_for_user(
+        &self,
+        email: &str,
+        code: &str,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        let email_lower = email.to_lowercase();
+        let is_static = self.is_static_token(code);
+        let otp_key = Self::otp_key(&email_lower, Some(user_id));
+        if !is_static && !self.verify_pending_otp(&otp_key, code).await? {
+            return Ok(None);
+        }
+
+        let now = Utc::now();
+        let user = self
+            .user_store
+            .get(user_id)?
+            .ok_or_else(|| eyre::eyre!("user '{user_id}' not found"))?;
+        if user.email.to_lowercase() != email_lower {
+            bail!("email '{email_lower}' is not registered to user '{user_id}'");
+        }
+
+        let mut updated_user = user.clone();
+        updated_user.last_login_at = Some(now);
+        self.user_store.save(&updated_user)?;
+
         let token = generate_session_token();
         let session = ActiveSession {
             user_id: user.id.clone(),
@@ -345,6 +539,44 @@ impl AuthManager {
     /// Send OTP email via SMTP.
     #[cfg(feature = "api")]
     async fn send_otp_email(&self, smtp: &SmtpConfig, email: &str, code: &str) -> Result<()> {
+        let html = format!(
+            r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
+                    <h2 style="color: #1a1a2e; margin-bottom: 8px;">octos Login</h2>
+                    <p style="color: #666; margin-bottom: 24px;">Use this code to sign in. It expires in 5 minutes.</p>
+                    <div style="background: #f5f5f5; border-radius: 8px; padding: 24px; text-align: center; margin-bottom: 24px;">
+                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a1a2e;">{code}</span>
+                    </div>
+                    <p style="color: #999; font-size: 12px;">If you didn't request this code, you can safely ignore this email.</p>
+                </div>"#
+        );
+        self.deliver_html_email(smtp, email, "Your octos login code", &html)
+            .await
+    }
+
+    #[cfg(all(feature = "api", test))]
+    async fn deliver_html_email(
+        &self,
+        _smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<()> {
+        self.sent_emails.write().await.push(TestEmail {
+            to: email.to_string(),
+            subject: subject.to_string(),
+            html: html.to_string(),
+        });
+        Ok(())
+    }
+
+    #[cfg(all(feature = "api", not(test)))]
+    async fn deliver_html_email(
+        &self,
+        smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        html: &str,
+    ) -> Result<()> {
         use lettre::message::header::ContentType;
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -360,20 +592,17 @@ impl AuthManager {
             })?;
 
         let email_msg = Message::builder()
-            .from(smtp.from_address.parse().map_err(|e| eyre::eyre!("invalid from address: {e}"))?)
-            .to(email.parse().map_err(|e| eyre::eyre!("invalid to address: {e}"))?)
-            .subject("Your octos login code")
+            .from(
+                smtp.from_address
+                    .parse()
+                    .map_err(|e| eyre::eyre!("invalid from address: {e}"))?,
+            )
+            .to(email
+                .parse()
+                .map_err(|e| eyre::eyre!("invalid to address: {e}"))?)
+            .subject(subject)
             .header(ContentType::TEXT_HTML)
-            .body(format!(
-                r#"<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 480px; margin: 0 auto; padding: 40px 20px;">
-                    <h2 style="color: #1a1a2e; margin-bottom: 8px;">octos Login</h2>
-                    <p style="color: #666; margin-bottom: 24px;">Use this code to sign in. It expires in 5 minutes.</p>
-                    <div style="background: #f5f5f5; border-radius: 8px; padding: 24px; text-align: center; margin-bottom: 24px;">
-                        <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1a1a2e;">{code}</span>
-                    </div>
-                    <p style="color: #999; font-size: 12px;">If you didn't request this code, you can safely ignore this email.</p>
-                </div>"#
-            ))
+            .body(html.to_string())
             .map_err(|e| eyre::eyre!("failed to build email: {e}"))?;
 
         let creds = Credentials::new(smtp.username.clone(), password);
@@ -393,14 +622,26 @@ impl AuthManager {
         mailer
             .send(email_msg)
             .await
-            .map_err(|e| eyre::eyre!("failed to send OTP email: {e}"))?;
-        tracing::info!(email = %email, "OTP email sent");
+            .map_err(|e| eyre::eyre!("failed to send email: {e}"))?;
+        tracing::info!(email = %email, subject = %subject, "email sent");
         Ok(())
     }
 
     #[cfg(not(feature = "api"))]
     async fn send_otp_email(&self, _smtp: &SmtpConfig, email: &str, _code: &str) -> Result<()> {
         tracing::info!(email = %email, "OTP sent (code redacted, lettre not available)");
+        Ok(())
+    }
+
+    #[cfg(not(feature = "api"))]
+    async fn deliver_html_email(
+        &self,
+        _smtp: &SmtpConfig,
+        email: &str,
+        subject: &str,
+        _html: &str,
+    ) -> Result<()> {
+        tracing::info!(email = %email, subject = %subject, "email sent (content redacted, lettre not available)");
         Ok(())
     }
 }

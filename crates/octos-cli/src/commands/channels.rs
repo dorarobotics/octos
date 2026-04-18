@@ -47,7 +47,8 @@ impl Executable for ChannelsCommand {
 }
 
 fn cmd_status(cwd: &std::path::Path) -> Result<()> {
-    let config = Config::load(cwd)?;
+    let data_dir = super::resolve_data_dir(None)?;
+    let config = Config::load(cwd, &data_dir)?;
 
     let channels = match &config.gateway {
         Some(gw) => &gw.channels,
@@ -124,6 +125,8 @@ fn is_channel_compiled(channel_type: &str) -> bool {
         "wecom-bot" => true,
         #[cfg(feature = "qq-bot")]
         "qq-bot" => true,
+        #[cfg(feature = "matrix")]
+        "matrix" => true,
         _ => false,
     }
 }

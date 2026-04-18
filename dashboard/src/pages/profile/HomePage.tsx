@@ -15,19 +15,23 @@ export default function HomePage() {
   const {
     profileId, parentId, config, setConfig, status, isOwn, loading,
     startGateway, stopGateway, restartGateway,
-    profileName, setProfileName, profileEmail, setProfileEmail, enabled, setEnabled,
-    save, saving, deleteProfile,
+    profileName, setProfileName, profileEmail, setProfileEmail, publicSubdomain, setPublicSubdomain, enabled, setEnabled,
+    save, saving, deleteProfile, purgeProfile,
   } = useProfile()
   const navigate = useNavigate()
   const { toast } = useToast()
   const [actionLoading, setActionLoading] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [purgeOpen, setPurgeOpen] = useState(false)
+  const [purgeConfirmText, setPurgeConfirmText] = useState('')
 
   // Sub-accounts state
   const [subAccounts, setSubAccounts] = useState<ProfileResponse[]>([])
   const [subsLoading, setSubsLoading] = useState(false)
   const [showCreateSub, setShowCreateSub] = useState(false)
+  const [newSubId, setNewSubId] = useState('')
   const [newSubName, setNewSubName] = useState('')
+  const [newSubdomain, setNewSubdomain] = useState('')
   const [newSubEmail, setNewSubEmail] = useState('')
   const [createSubLoading, setCreateSubLoading] = useState(false)
 
@@ -54,12 +58,21 @@ export default function HomePage() {
     if (!profileId || !newSubName.trim()) return
     setCreateSubLoading(true)
     try {
-      await api.createSubAccount(profileId, {
+      const payload = {
+        sub_account_id: newSubId.trim() || undefined,
         name: newSubName.trim(),
+        public_subdomain: newSubdomain.trim() || undefined,
         email: newSubEmail.trim() || undefined,
-      })
+      }
+      if (isAdmin) {
+        await api.createSubAccount(profileId, payload)
+      } else {
+        await myApi.createSubAccount(payload)
+      }
       toast('Sub-account created', 'success')
+      setNewSubId('')
       setNewSubName('')
+      setNewSubdomain('')
       setNewSubEmail('')
       setShowCreateSub(false)
       loadSubAccounts()
@@ -88,6 +101,12 @@ export default function HomePage() {
   const handleDelete = async () => {
     await deleteProfile()
     setDeleteOpen(false)
+    navigate('/')
+  }
+  const handlePurge = async () => {
+    await purgeProfile()
+    setPurgeOpen(false)
+    setPurgeConfirmText('')
     navigate('/')
   }
 
@@ -164,6 +183,7 @@ export default function HomePage() {
           <h3 className="text-sm font-semibold text-white mb-4">Profile Info</h3>
           <dl className="space-y-3 text-xs">
             <InfoRow label="ID" value={profileId} />
+            <InfoRow label="Public URL ID" value={publicSubdomain || profileId} />
             {parentId && (
               <div className="flex justify-between">
                 <dt className="text-gray-500">Parent</dt>
@@ -217,6 +237,22 @@ export default function HomePage() {
             />
           </div>
           <div>
+            <label className="block text-sm font-medium text-gray-300 mb-1.5">Public Subdomain</label>
+            <input
+              value={publicSubdomain}
+              onChange={(e) => setPublicSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+              placeholder={profileId}
+              className="input max-w-md"
+              disabled={!!parentId && isOwn}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Public URL preview: <span className="font-mono text-gray-400">https://{(publicSubdomain || profileId) || 'your-subdomain'}.crew.ominix.io</span>
+            </p>
+            {!!parentId && isOwn && (
+              <p className="text-xs text-gray-500 mt-1">Sub-account users cannot change their own public subdomain. The parent account controls it.</p>
+            )}
+          </div>
+          <div>
             <label className="block text-sm font-medium text-gray-300 mb-1.5">Login Email</label>
             <input
               value={profileEmail}
@@ -260,12 +296,21 @@ export default function HomePage() {
               {saving ? 'Saving...' : 'Save'}
             </button>
             {isAdmin && !isOwn && (
-              <button
-                onClick={() => setDeleteOpen(true)}
-                className="px-4 py-2 text-sm font-medium rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/20 transition"
-              >
-                Delete Profile
-              </button>
+              <>
+                <button
+                  onClick={() => setDeleteOpen(true)}
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 border border-red-500/20 transition"
+                >
+                  Delete Profile
+                </button>
+                <button
+                  onClick={() => setPurgeOpen(true)}
+                  className="px-4 py-2 text-sm font-medium rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-600/40 transition ml-2"
+                  title="Full removal — profile, user, node, and all data"
+                >
+                  Purge (Full Removal)
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -281,7 +326,7 @@ export default function HomePage() {
                 <span className="ml-2 text-gray-500 font-normal">({subAccounts.length})</span>
               )}
             </h3>
-            {isAdmin && (
+            {(
               <button
                 onClick={() => setShowCreateSub(!showCreateSub)}
                 className="px-3 py-1.5 text-xs font-medium rounded-lg bg-accent/10 text-accent hover:bg-accent/20 transition"
@@ -294,6 +339,16 @@ export default function HomePage() {
           {showCreateSub && (
             <div className="mb-4 p-3 rounded-lg bg-white/[0.03] border border-gray-700/50 space-y-3">
               <div>
+                <label className="block text-xs text-gray-400 mb-1">User ID</label>
+                <input
+                  value={newSubId}
+                  onChange={e => setNewSubId(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                  placeholder="newsbot"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-gray-500 mt-1">One-time internal child ID. Final internal profile ID becomes <span className="font-mono">{profileId || 'parent'}--{newSubId || 'child-id'}</span>.</p>
+              </div>
+              <div>
                 <label className="block text-xs text-gray-400 mb-1">Name</label>
                 <input
                   value={newSubName}
@@ -301,6 +356,16 @@ export default function HomePage() {
                   placeholder="e.g. work-bot"
                   className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
                 />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Public Subdomain</label>
+                <input
+                  value={newSubdomain}
+                  onChange={e => setNewSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                  placeholder="newsbot"
+                  className="w-full bg-white/5 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-accent"
+                />
+                <p className="text-[11px] text-gray-500 mt-1">Public URL: <span className="font-mono">https://{newSubdomain || 'newsbot'}.crew.ominix.io</span></p>
               </div>
               <div>
                 <label className="block text-xs text-gray-400 mb-1">Email (for web client login)</label>
@@ -314,7 +379,12 @@ export default function HomePage() {
               </div>
               <button
                 onClick={handleCreateSubAccount}
-                disabled={createSubLoading || !newSubName.trim()}
+                disabled={
+                  createSubLoading
+                    || !newSubName.trim()
+                    || !newSubId.trim()
+                    || !newSubdomain.trim()
+                }
                 className="px-4 py-2 text-sm font-medium rounded-lg bg-accent text-white hover:bg-accent/80 transition disabled:opacity-50"
               >
                 {createSubLoading ? 'Creating...' : 'Create Sub-Account'}
@@ -410,6 +480,50 @@ export default function HomePage() {
         onConfirm={handleDelete}
         onCancel={() => setDeleteOpen(false)}
       />
+
+      {purgeOpen && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setPurgeOpen(false)}>
+          <div className="bg-gray-900 border border-red-500/30 rounded-lg p-6 max-w-md w-full mx-4" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-lg font-semibold text-red-400 mb-3">Purge &quot;{profileName}&quot;?</h2>
+            <div className="text-sm text-gray-300 mb-4 space-y-2">
+              <p>This will <strong>permanently</strong> remove:</p>
+              <ul className="list-disc list-inside text-gray-400 ml-2">
+                <li>The profile and all its data (memories, episodes, sessions)</li>
+                <li>The user account ({profileEmail})</li>
+                <li>The registered node and any sub-accounts</li>
+              </ul>
+              <p className="text-amber-400 text-xs mt-3">
+                The same email and node name can be used to register again after this. <strong>This cannot be undone.</strong>
+              </p>
+            </div>
+            <label className="block text-xs text-gray-400 mb-1">
+              Type the profile name <code className="text-red-300">{profileName}</code> to confirm:
+            </label>
+            <input
+              type="text"
+              value={purgeConfirmText}
+              onChange={(e) => setPurgeConfirmText(e.target.value)}
+              className="input w-full mb-4"
+              autoFocus
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => { setPurgeOpen(false); setPurgeConfirmText('') }}
+                className="px-4 py-2 text-sm rounded-lg bg-gray-700 hover:bg-gray-600 transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handlePurge}
+                disabled={purgeConfirmText !== profileName}
+                className="px-4 py-2 text-sm rounded-lg bg-red-600 hover:bg-red-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition"
+              >
+                Purge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

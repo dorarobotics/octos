@@ -15,18 +15,16 @@ use std::time::Duration;
 
 use colored::Colorize;
 use eyre::{Result, WrapErr};
-use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
+use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{
     ActiveSessionStore, ChannelManager, CronService, HeartbeatService, SessionManager, create_bus,
 };
-#[cfg(feature = "matrix")]
-use octos_core::MAIN_PROFILE_ID;
 use octos_llm::{
     AdaptiveConfig, AdaptiveRouter, BaselineEntry, LlmProvider, ProviderChain, ProviderRouter,
-    RetryProvider, SwappableProvider,
+    QosCatalog, RetryProvider, SwappableProvider,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tracing::{info, warn};
 
 use super::build_system_prompt;
@@ -39,7 +37,12 @@ use crate::commands::{load_prompt, resolve_data_dir};
 use crate::config::{Config, detect_provider};
 use crate::config_watcher::{ConfigChange, ConfigWatcher};
 use crate::persona_service::PersonaService;
-use crate::session_actor::{ActorFactory, ActorRegistry, SnapshotToolRegistryFactory};
+use crate::qos_catalog::{
+    load_seed_qos_catalog, materialize_runtime_qos_catalog, persist_qos_catalog,
+};
+use crate::session_actor::{
+    ActorFactory, ActorRegistry, SessionTaskQueryStore, SnapshotToolRegistryFactory,
+};
 use crate::status_layers::StatusComposer;
 
 #[cfg(feature = "matrix")]
@@ -80,6 +83,7 @@ pub(super) struct GatewayRuntime {
     config_rx: tokio::sync::watch::Receiver<Option<ConfigChange>>,
     tool_config: Arc<octos_agent::ToolConfigStore>,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<Notify>,
 
     // Status
     status_indicators: Arc<HashMap<String, Arc<StatusComposer>>>,
@@ -88,6 +92,9 @@ pub(super) struct GatewayRuntime {
     persona_service: Arc<PersonaService>,
     heartbeat_service: Arc<HeartbeatService>,
     cron_service: Arc<CronService>,
+
+    // Session delete events from API handlers
+    session_delete_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 
     // Matrix (feature-gated)
     #[cfg(feature = "matrix")]
@@ -109,6 +116,8 @@ impl GatewayRuntime {
             Some(p) => p,
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
+        let data_dir = resolve_data_dir(cmd.data_dir.clone())?;
+        let metrics_handle = Some(crate::api::init_metrics());
 
         let mut profile_id: Option<String> = None;
         eprintln!(
@@ -157,7 +166,7 @@ impl GatewayRuntime {
         } else if let Some(config_path) = &cmd.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd)?
+            Config::load(&cwd, &data_dir)?
         };
 
         let model = cmd.model.or(config.model.clone());
@@ -166,7 +175,7 @@ impl GatewayRuntime {
             .provider
             .or(config.provider.clone())
             .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| eyre::eyre!("no LLM provider configured for this profile"))?;
 
         let gw_config = config
             .gateway
@@ -256,9 +265,19 @@ impl GatewayRuntime {
         // Wrap LLM in SwappableProvider for runtime model switching
         let swappable = Arc::new(SwappableProvider::new(llm));
         let llm: Arc<dyn LlmProvider> = swappable.clone();
-
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = resolve_data_dir(cmd.data_dir)?;
+        let catalog_path = data_dir.join("model_catalog.json");
+        let qos_scoring_config = config
+            .adaptive_routing
+            .as_ref()
+            .map(AdaptiveConfig::from)
+            .unwrap_or_default();
+        let qos_ranking_enabled = config
+            .adaptive_routing
+            .as_ref()
+            .map(|cfg| cfg.qos_ranking)
+            .unwrap_or(true);
+        let seed_catalog = load_seed_qos_catalog(&data_dir);
+        let runtime_qos_catalog: Option<QosCatalog>;
 
         // Seed adaptive router with baseline benchmark data (if available)
         if let Some(ref router) = adaptive_router_ref {
@@ -293,41 +312,40 @@ impl GatewayRuntime {
                 info!("no provider_baseline.json found, using cold-start scoring");
             }
 
-            // Seed static catalog fields (type, cost, ds_output) from model_catalog.json
-            // Look in data_dir first, then fall back to ~/.octos/ (shared across profiles)
-            let catalog_candidates = [
-                data_dir.join("model_catalog.json"),
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".octos/model_catalog.json"),
-            ];
-            for catalog_path in &catalog_candidates {
-                if let Ok(json) = std::fs::read_to_string(catalog_path) {
-                    if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
-                        router.seed_catalog(&catalog.models);
-                        // Seed the global runtime catalog for context.rs lookups
-                        let ctx_entries: Vec<(String, u64, u64)> = catalog
-                            .models
-                            .iter()
-                            .map(|m| (m.provider.clone(), m.context_window, m.max_output))
-                            .collect();
-                        octos_llm::context::seed_from_catalog(&ctx_entries);
-                        // Seed pricing catalog
-                        let price_entries: Vec<(String, f64, f64)> = catalog
-                            .models
-                            .iter()
-                            .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
-                            .collect();
-                        octos_llm::pricing::seed_pricing_catalog(&price_entries);
-                        info!(
-                            path = %catalog_path.display(),
-                            models = catalog.models.len(),
-                            "loaded model catalog"
-                        );
-                        break;
-                    }
-                }
+            if let Some(ref catalog) = seed_catalog {
+                router.seed_catalog(&catalog.models);
+                info!(models = catalog.models.len(), "loaded model catalog");
             }
+
+            runtime_qos_catalog = materialize_runtime_qos_catalog(
+                seed_catalog.as_ref(),
+                Some(router.export_model_catalog()),
+                &qos_scoring_config,
+                qos_ranking_enabled,
+            );
+        } else {
+            runtime_qos_catalog = materialize_runtime_qos_catalog(
+                seed_catalog.as_ref(),
+                None,
+                &qos_scoring_config,
+                qos_ranking_enabled,
+            );
+        }
+
+        if let Some(ref catalog) = runtime_qos_catalog {
+            let ctx_entries: Vec<(String, u64, u64)> = catalog
+                .models
+                .iter()
+                .map(|m| (m.provider.clone(), m.context_window, m.max_output))
+                .collect();
+            octos_llm::context::seed_from_catalog(&ctx_entries);
+            let price_entries: Vec<(String, f64, f64)> = catalog
+                .models
+                .iter()
+                .map(|m| (m.provider.clone(), m.cost_in, m.cost_out))
+                .collect();
+            octos_llm::pricing::seed_pricing_catalog(&price_entries);
+            persist_qos_catalog(&catalog_path, catalog);
         }
 
         // Open ProfileStore for /account commands and bot management.
@@ -356,7 +374,7 @@ impl GatewayRuntime {
         // Spawn periodic metrics exporter (writes model_catalog.json every 30s)
         if let Some(ref router) = adaptive_router_ref {
             let metrics_router = router.clone();
-            let catalog_path = data_dir.join("model_catalog.json");
+            let catalog_path = catalog_path.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
@@ -440,52 +458,8 @@ impl GatewayRuntime {
         };
         let asr_language = voice_config.as_ref().and_then(|vc| vc.asr_language.clone());
 
-        // Collect extra skills dirs: parent profile (for sub-accounts) + global
-        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
-        if data_dir != project_dir {
-            // Sub-account: also add parent profile's skills dir
-            if let Some(ref parent_path) = cmd.parent_profile {
-                if let Ok(parent_content) = std::fs::read_to_string(parent_path) {
-                    if let Ok(parent) =
-                        serde_json::from_str::<crate::profiles::UserProfile>(&parent_content)
-                    {
-                        if let Some(ref store) = profile_store {
-                            extra_skills_dirs.push(store.resolve_data_dir(&parent));
-                        }
-                    }
-                }
-            }
-            extra_skills_dirs.push(project_dir.clone());
-        }
-
-        // Skills priority (highest first):
-        //   1. Profile skills (data_dir/skills or sub-account/skills)
-        //   2. Parent profile skills (if sub-account)
-        //   3. Global profile skills (project_dir/skills)
-        //   4. Bundled app-skills (project_dir/bundled-app-skills)
-        // Note: platform skills (voice, etc.) are admin-only — loaded in serve.rs
-        let skills_loader = if data_dir != project_dir {
-            let mut loader = SkillsLoader::new(&data_dir);
-            for dir in &extra_skills_dirs {
-                loader.add_skills_dir(dir);
-            }
-            loader
-        } else {
-            SkillsLoader::new(&project_dir)
-        };
-        // Add shared layered dirs (lower priority than profile skills)
-        let mut skills_loader = skills_loader;
-        skills_loader
-            .add_skills_path(project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR));
-        // Extra skills dirs from OCTOS_SKILLS_PATH env var
-        if let Ok(extra) = std::env::var("OCTOS_SKILLS_PATH") {
-            for p in extra.split(':') {
-                let p = p.trim();
-                if !p.is_empty() {
-                    skills_loader.add_skills_path(p);
-                }
-            }
-        }
+        // Customer-installed skills are strictly account-scoped.
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&data_dir);
 
         // Create message bus (before publisher is consumed by channel manager)
         let (agent_handle, publisher) = create_bus();
@@ -548,12 +522,15 @@ impl GatewayRuntime {
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
+        let shutdown_notify = Arc::new(Notify::new());
+        let shutdown_notify_clone = shutdown_notify.clone();
         #[cfg(feature = "matrix")]
         let mut matrix_channel: Option<Arc<octos_bus::MatrixChannel>> = None;
 
         let mut tools;
         let mut plugin_result;
         let mut sandbox_config = config.sandbox.clone();
+        let plugin_dirs_for_spawn: Vec<std::path::PathBuf>;
         {
             // Full tool registration for all modes.
             // Populate read_allow_paths so the shell sandbox restricts reads to
@@ -587,18 +564,15 @@ impl GatewayRuntime {
 
             // Load plugins with a dedicated work directory for output files
             let plugin_work_dir = data_dir.join("skill-output");
-            let mut plugin_dirs = crate::config::Config::plugin_dirs_from_project(&project_dir);
-            // Prepend per-profile skills dir (highest priority)
-            let profile_skills = data_dir.join("skills");
-            if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
-                plugin_dirs.insert(0, profile_skills);
+            let mut plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&data_dir);
+            // Include bundled app-skills and platform skills (bootstrapped into project_dir)
+            let bundled_dir = project_dir.join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR);
+            if bundled_dir.exists() && !plugin_dirs.contains(&bundled_dir) {
+                plugin_dirs.push(bundled_dir);
             }
-            // Sub-account: also add parent profile's skills dir
-            for dir in &extra_skills_dirs {
-                let parent_skills = dir.join("skills");
-                if parent_skills.exists() && !plugin_dirs.contains(&parent_skills) {
-                    plugin_dirs.push(parent_skills);
-                }
+            let platform_dir = project_dir.join(octos_agent::bootstrap::PLATFORM_SKILLS_DIR);
+            if platform_dir.exists() && !plugin_dirs.contains(&platform_dir) {
+                plugin_dirs.push(platform_dir);
             }
             plugin_result = octos_agent::PluginLoadResult::default();
             if !plugin_dirs.is_empty() {
@@ -770,26 +744,17 @@ impl GatewayRuntime {
 
             // Seed QoS scores on the router for fallback ranking
             if let Some(ref router) = provider_router {
-                let catalog_path = data_dir.join("pipeline_models.json");
-                let system_catalog = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".octos/model_catalog.json");
-                for path in &[catalog_path, system_catalog] {
-                    if let Ok(json) = std::fs::read_to_string(path) {
-                        if let Ok(catalog) = serde_json::from_str::<octos_llm::QosCatalog>(&json) {
-                            let score_entries: Vec<(String, f64)> = catalog
-                                .models
-                                .iter()
-                                .map(|m| (m.provider.clone(), m.score))
-                                .collect();
-                            router.seed_qos_scores(&score_entries);
-                            info!(
-                                models = score_entries.len(),
-                                "seeded scores for fallback ranking"
-                            );
-                            break;
-                        }
-                    }
+                if let Some(ref catalog) = runtime_qos_catalog {
+                    let score_entries: Vec<(String, f64)> = catalog
+                        .models
+                        .iter()
+                        .map(|m| (m.provider.clone(), m.score))
+                        .collect();
+                    router.seed_qos_scores(&score_entries);
+                    info!(
+                        models = score_entries.len(),
+                        "seeded scores for fallback ranking"
+                    );
                 }
             }
 
@@ -866,6 +831,7 @@ impl GatewayRuntime {
                 config.clone(),
                 cmd.profile.clone(),
             ));
+            plugin_dirs_for_spawn = plugin_dirs;
         }
 
         // admin_mode adds admin API tools on top of the full tool set
@@ -984,6 +950,7 @@ impl GatewayRuntime {
                 "group:sessions",
                 "group:web",
                 "group:runtime",
+                "group:media", // mofa_comic, mofa_slides, mofa_infographic, mofa_cards, fm_tts
             ] {
                 tools.defer_group(group);
             }
@@ -1018,6 +985,7 @@ impl GatewayRuntime {
         // Pending message buffer for inactive sessions
         let pending_messages: crate::session_actor::PendingMessages =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let task_query_store = SessionTaskQueryStore::default();
 
         // Build ActorFactory with all shared resources
         let actor_factory = ActorFactory {
@@ -1050,6 +1018,11 @@ impl GatewayRuntime {
             queue_mode: gw_config.queue_mode,
             adaptive_router: adaptive_router_ref,
             memory_store: Some(memory_store.clone()),
+            plugin_dirs: plugin_dirs_for_spawn.clone(),
+            plugin_extra_env: plugin_env.clone(),
+            llm_strong: super::profile_factory::build_strong_chain(&config, &provider_name, false)
+                .unwrap_or_else(|_| llm_for_compaction.clone()),
+            task_query_store: task_query_store.clone(),
         };
         let profile_factory_builder =
             profile_store
@@ -1080,6 +1053,7 @@ impl GatewayRuntime {
                     plugin_prompt_fragments: plugin_result.prompt_fragments.clone(),
                     no_retry: cmd.no_retry,
                     sandbox_config: sandbox_config.clone(),
+                    task_query_store: task_query_store.clone(),
                 });
 
         // Start config watcher for hot-reload
@@ -1094,10 +1068,9 @@ impl GatewayRuntime {
                 if local.exists() {
                     paths.push(local);
                 }
-                if let Some(global) = Config::global_config_path() {
-                    if global.exists() {
-                        paths.push(global);
-                    }
+                let data_dir_config = Config::data_dir_config_path(&data_dir);
+                if data_dir_config.exists() {
+                    paths.push(data_dir_config);
                 }
             }
             paths
@@ -1118,15 +1091,30 @@ impl GatewayRuntime {
             });
         }
 
+        // Channel for session delete events from API → gateway main loop.
+        // The API handler sends the session ID, the main loop removes the actor.
+        let (session_delete_tx, session_delete_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+
         let mut channel_mgr = ChannelManager::new();
         {
+            let delete_tx = session_delete_tx.clone();
             let mut reg_ctx = adapters::ChannelRegistrationCtx {
                 shutdown: &shutdown,
                 media_dir: &media_dir,
                 data_dir: &data_dir,
                 session_mgr: &session_mgr,
+                task_query: Some(Arc::new({
+                    let store = task_query_store.clone();
+                    move |session_key: &str| store.query_json(session_key)
+                })),
+                metrics_handle: metrics_handle.clone(),
+                gateway_profile_id: profile_id.as_deref(),
                 api_port_override: cmd.api_port,
                 wechat_bridge_url: cmd.wechat_bridge_url.as_deref(),
+                on_session_deleted: Some(Arc::new(move |id: &str| {
+                    let _ = delete_tx.send(id.to_string());
+                })),
                 #[cfg(feature = "matrix")]
                 matrix_channel: &mut matrix_channel,
             };
@@ -1180,6 +1168,7 @@ impl GatewayRuntime {
                 println!();
                 println!("{}", "Shutting down gateway...".yellow());
                 shutdown_clone.store(true, Ordering::Release);
+                shutdown_notify_clone.notify_waiters();
             }
         });
 
@@ -1224,7 +1213,6 @@ impl GatewayRuntime {
             let base_prompt = gw_config.system_prompt.clone();
             let data_dir_p = data_dir.clone();
             let project_dir_p = project_dir.clone();
-            let extra_dirs_p = extra_skills_dirs.clone();
             let memory_store_p = memory_store.clone();
             let tool_config_p = tool_config.clone();
             let indicators = status_indicators.clone();
@@ -1234,15 +1222,11 @@ impl GatewayRuntime {
                     let base = base_prompt.clone();
                     let dd = data_dir_p.clone();
                     let pd = project_dir_p.clone();
-                    let eds = extra_dirs_p.clone();
                     let ms = memory_store_p.clone();
                     let tc = tool_config_p.clone();
                     let prompt_lock = system_prompt_for_persona.clone();
                     tokio::spawn(async move {
-                        let mut sl = SkillsLoader::new(&dd);
-                        for dir in &eds {
-                            sl.add_skills_dir(dir);
-                        }
+                        let sl = crate::skills_scope::build_account_skills_loader(&dd);
                         let new_prompt =
                             build_system_prompt(base.as_deref(), &dd, &pd, &ms, &sl, &tc).await;
                         *prompt_lock.write().unwrap_or_else(|e| e.into_inner()) = new_prompt;
@@ -1303,10 +1287,12 @@ impl GatewayRuntime {
             config_rx,
             tool_config,
             shutdown,
+            shutdown_notify,
             status_indicators,
             persona_service,
             heartbeat_service,
             cron_service,
+            session_delete_rx,
             #[cfg(feature = "matrix")]
             matrix_channel,
         };
@@ -1315,9 +1301,32 @@ impl GatewayRuntime {
 
     pub(super) async fn run(mut self) -> Result<()> {
         let mut profile_prompt_cache: HashMap<String, Option<String>> = HashMap::new();
+        let shutdown_notify = self.shutdown_notify.clone();
 
         // Main loop: dispatch inbound messages to concurrent tasks
-        while let Some(mut inbound) = self.agent_handle.recv_inbound().await {
+        loop {
+            let mut inbound = tokio::select! {
+                _ = shutdown_notify.notified() => {
+                    if self.shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    continue;
+                }
+                session_id = self.session_delete_rx.recv() => {
+                    if let Some(id) = session_id {
+                        tracing::debug!(session = %id, "stopping actor for deleted session");
+                        self.actor_registry.remove_session(&id);
+                    }
+                    continue;
+                }
+                inbound = self.agent_handle.recv_inbound() => {
+                    match inbound {
+                        Some(inbound) => inbound,
+                        None => break,
+                    }
+                }
+            };
+
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -1360,6 +1369,8 @@ impl GatewayRuntime {
             )
             .await;
             let image_media = media_result.image_media;
+            let attachment_media = media_result.attachment_media;
+            let attachment_prompt = media_result.attachment_prompt;
 
             // Route cron-triggered messages to their target channel
             let (reply_channel, reply_chat_id) = message_preprocessing::resolve_reply_target(
@@ -1374,11 +1385,16 @@ impl GatewayRuntime {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let mut dispatch_profile_id = resolve_dispatch_profile_id(
+                self.profile_id.as_deref(),
                 target_profile.as_deref(),
                 self.profile_store.as_deref(),
             )?;
             if let Some(ref pid) = dispatch_profile_id {
-                if !self.actor_registry.has_profile_factory(pid) {
+                let is_current_gateway_profile = self
+                    .profile_id
+                    .as_deref()
+                    .is_some_and(|current| current == pid);
+                if !is_current_gateway_profile && !self.actor_registry.has_profile_factory(pid) {
                     if let Some(ref builder) = self.profile_factory_builder {
                         match builder.build(pid).await {
                             Ok(factory) => self
@@ -1398,7 +1414,7 @@ impl GatewayRuntime {
             // Update dispatcher's profile ID for this message.
             self.session_dispatcher.dispatch_profile_id = dispatch_profile_id.clone();
 
-            // Resolve session key with active topic, isolated per effective profile.
+            // Resolve session key with the current profile-scoped base key only.
             let base_session_key = build_profiled_session_key(
                 dispatch_profile_id.as_deref(),
                 &inbound.channel,
@@ -1406,7 +1422,19 @@ impl GatewayRuntime {
                 "",
             );
             let base_key_str = base_session_key.base_key().to_string();
-            let session_key = {
+            let explicit_topic = inbound
+                .metadata
+                .get("topic")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty());
+            let session_key = if let Some(topic) = explicit_topic {
+                build_profiled_session_key(
+                    dispatch_profile_id.as_deref(),
+                    &inbound.channel,
+                    &inbound.chat_id,
+                    topic,
+                )
+            } else {
                 let store = self.active_sessions.read().await;
                 store.resolve_session_key(&base_key_str)
             };
@@ -1467,6 +1495,21 @@ impl GatewayRuntime {
                 )
                 .await
             {
+                // For API channel: send a completion signal so the SSE stream closes
+                // and the web client's assistant message transitions from "streaming" to "complete".
+                if reply_channel == "api" {
+                    let _ = self
+                        .agent_handle
+                        .send_outbound(octos_core::OutboundMessage {
+                            channel: reply_channel.clone(),
+                            chat_id: reply_chat_id.clone(),
+                            content: String::new(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: serde_json::json!({"_completion": true}),
+                        })
+                        .await;
+                }
                 continue;
             }
 
@@ -1586,6 +1629,22 @@ impl GatewayRuntime {
                 (None, None)
             };
 
+            // Check for session-specific prompt override (e.g. /new slides <name>)
+            let prompt_override = if let Some(topic) = session_key.topic() {
+                if let Some(session_prompt) =
+                    crate::project_templates::read_session_prompt(&self.data_dir, topic)
+                {
+                    match prompt_override {
+                        Some(base) => Some(format!("{base}\n\n{session_prompt}")),
+                        None => Some(session_prompt),
+                    }
+                } else {
+                    prompt_override
+                }
+            } else {
+                prompt_override
+            };
+
             // Dispatch to per-session actor (creates one if needed)
             tracing::debug!(
                 dispatch_profile_id = ?dispatch_profile_id,
@@ -1596,6 +1655,8 @@ impl GatewayRuntime {
                 .dispatch(crate::session_actor::DispatchParams {
                     message: inbound,
                     image_media,
+                    attachment_media,
+                    attachment_prompt,
                     session_key,
                     reply_channel: &reply_channel,
                     reply_chat_id: &reply_chat_id,
@@ -1612,7 +1673,9 @@ impl GatewayRuntime {
 
         // ── Shutdown ────────────────────────────────────────────────────
         // Timeout prevents hung actors from blocking the entire sequence.
-        let shutdown_timeout = Duration::from_secs(30);
+        // CLI shutdown should return control to the terminal promptly.
+        // Hung actors will be abandoned and then torn down by runtime shutdown.
+        let shutdown_timeout = Duration::from_secs(1);
         if tokio::time::timeout(shutdown_timeout, self.actor_registry.shutdown_all())
             .await
             .is_err()

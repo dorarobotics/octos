@@ -13,8 +13,10 @@ use tower_http::trace::TraceLayer;
 use super::AppState;
 use super::admin;
 use super::auth_handlers;
+use super::frps_plugin;
 use super::handlers;
 use super::metrics;
+use super::purge;
 use super::static_files;
 use super::user_admin;
 use super::webhook_proxy;
@@ -54,6 +56,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Public auth endpoints (no auth required)
     let auth_api = Router::new()
+        .route("/api/auth/status", get(auth_handlers::auth_status))
         .route("/api/auth/send-code", post(auth_handlers::send_code))
         .route("/api/auth/verify", post(auth_handlers::verify))
         .route("/api/auth/logout", post(auth_handlers::logout));
@@ -67,6 +70,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/upload",
             post(handlers::upload).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
+        .route(
+            "/api/site-files/upload",
+            post(handlers::upload_site_files).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}",
+            get(handlers::serve_site_preview_root),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}/",
+            get(handlers::serve_site_preview_root),
+        )
+        .route(
+            "/api/site-preview/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_site_preview_path),
+        )
+        .route("/api/files/list", get(handlers::list_content_files))
         .route("/api/files/{filename}", get(handlers::serve_file))
         .route("/api/files", get(handlers::serve_file_by_query))
         .route("/api/sessions", get(handlers::list_sessions))
@@ -74,7 +94,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/messages",
             get(handlers::session_messages),
         )
+        .route(
+            "/api/sessions/{id}/events/stream",
+            get(handlers::session_event_stream),
+        )
         .route("/api/sessions/{id}/status", get(handlers::session_status))
+        .route("/api/sessions/{id}/tasks", get(handlers::session_tasks))
+        .route("/api/sessions/{id}/files", get(handlers::session_files))
+        .route(
+            "/api/sessions/{id}/workspace-contract",
+            get(handlers::session_workspace_contract),
+        )
         .route("/api/sessions/{id}", delete(handlers::delete_session))
         .route("/api/status", get(handlers::status));
 
@@ -85,6 +115,23 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/my/soul", get(auth_handlers::my_soul))
         .route("/api/my/soul", put(auth_handlers::update_my_soul))
         .route("/api/my/soul", delete(auth_handlers::delete_my_soul))
+        .route("/api/my/content", get(auth_handlers::my_content))
+        .route(
+            "/api/my/content/{id}/thumbnail",
+            get(auth_handlers::my_content_thumbnail),
+        )
+        .route(
+            "/api/my/content/{id}/body",
+            get(auth_handlers::my_content_body),
+        )
+        .route(
+            "/api/my/content/{id}",
+            delete(auth_handlers::delete_my_content),
+        )
+        .route(
+            "/api/my/content/bulk-delete",
+            post(auth_handlers::bulk_delete_my_content),
+        )
         .route(
             "/api/my/profile/start",
             post(auth_handlers::start_my_gateway),
@@ -125,12 +172,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(auth_handlers::my_sub_accounts),
         )
         .route(
+            "/api/my/profile/accounts",
+            post(auth_handlers::create_my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            get(auth_handlers::my_sub_account),
+        )
+        .route(
+            "/api/my/profile/accounts/{id}",
+            put(auth_handlers::update_my_sub_account),
+        )
+        .route(
             "/api/my/profile/accounts/{id}/start",
             post(auth_handlers::start_my_sub_gateway),
         )
         .route(
             "/api/my/profile/accounts/{id}/stop",
             post(auth_handlers::stop_my_sub_gateway),
+        )
+        // Self-service tenant registration (user-auth level)
+        .route("/api/register", post(admin::register_tenant))
+        .route(
+            "/api/register/setup-script",
+            get(admin::register_setup_script),
         );
 
     // Admin API routes (admin auth only, 1MB body limit)
@@ -142,6 +207,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/profiles/{id}", get(admin::get_profile))
         .route("/api/admin/profiles/{id}", put(admin::update_profile))
         .route("/api/admin/profiles/{id}", delete(admin::delete_profile))
+        .route(
+            "/api/admin/profiles/{id}/purge",
+            post(purge::purge_profile_handler),
+        )
+        .route(
+            "/api/admin/profiles/by-node/{node_name}/purge",
+            post(purge::purge_by_node_handler),
+        )
         .route("/api/admin/profiles/{id}/start", post(admin::start_gateway))
         .route("/api/admin/profiles/{id}/stop", post(admin::stop_gateway))
         .route(
@@ -196,8 +269,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // User management
         .route("/api/admin/users", get(user_admin::list_users))
-        .route("/api/admin/users", post(user_admin::create_user))
         .route("/api/admin/users/{id}", delete(user_admin::delete_user))
+        .route(
+            "/api/admin/allowed-emails",
+            get(user_admin::list_allowed_emails),
+        )
+        .route(
+            "/api/admin/allowed-emails",
+            post(user_admin::add_allowed_email),
+        )
+        .route(
+            "/api/admin/allowed-emails/{email}",
+            delete(user_admin::delete_allowed_email),
+        )
         // Session & cron diagnostics
         .route(
             "/api/admin/profiles/{id}/sessions",
@@ -214,6 +298,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // System metrics
         .route("/api/admin/system/metrics", get(admin::system_metrics))
+        .route("/api/admin/operator/summary", get(admin::operator_summary))
         // Monitor control
         .route("/api/admin/monitor/status", get(admin::monitor_status))
         .route("/api/admin/monitor/watchdog", post(admin::toggle_watchdog))
@@ -353,12 +438,33 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/version", get(handlers::version))
         .route("/health", get(handlers::health));
 
-    // Unauthenticated routes (static files + auth endpoints + webhook proxy)
+    // Internal endpoint for frps server plugin (no auth — called by frps on localhost)
+    let internal_routes =
+        Router::new().route("/api/internal/frps-auth", post(frps_plugin::frps_auth));
+
+    // Unauthenticated routes (static files + auth endpoints + webhook proxy + internal)
     let public = Router::new()
         .merge(metrics_route)
         .merge(auth_api)
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}",
+            get(handlers::serve_public_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/",
+            get(handlers::serve_public_site_preview_root),
+        )
+        .route(
+            "/api/preview/{profile_id}/{session_id}/{site_slug}/{*path}",
+            get(handlers::serve_public_site_preview_path),
+        )
+        .route(
+            "/api/register/setup-script/{id}/{auth_token}",
+            get(admin::register_setup_script_public),
+        )
         .merge(webhook_routes)
-        .merge(version_routes);
+        .merge(version_routes)
+        .merge(internal_routes);
 
     public
         .merge(protected)
@@ -390,11 +496,16 @@ fn extract_token(req: &axum::http::Request<axum::body::Body>) -> String {
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
 
-    // Fall back to ?token= query param (for SSE / EventSource)
+    // Fall back to ?token= or ?_token= query param (for SSE / EventSource / img tags)
     let query_token = req
         .uri()
         .query()
-        .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .and_then(|q| {
+            q.split('&').find_map(|pair| {
+                pair.strip_prefix("token=")
+                    .or_else(|| pair.strip_prefix("_token="))
+            })
+        })
         .unwrap_or("");
 
     if !header_token.is_empty() {
@@ -414,6 +525,16 @@ async fn resolve_identity(state: &AppState, token: &str) -> Option<AuthIdentity>
     if let Some(expected) = &state.auth_token {
         if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             return Some(AuthIdentity::Admin);
+        }
+    }
+
+    // 1b. Check OCTOS_TEST_TOKEN for e2e test auth bypass
+    if let Ok(test_token) = std::env::var("OCTOS_TEST_TOKEN") {
+        if !test_token.is_empty() && constant_time_eq(token.as_bytes(), test_token.as_bytes()) {
+            return Some(AuthIdentity::User {
+                id: "e2e-test".into(),
+                role: UserRole::User,
+            });
         }
     }
 
@@ -548,7 +669,12 @@ async fn admin_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{AppState, SseBroadcaster};
+    use crate::config::DeploymentMode;
+    use crate::tenant::{TenantConfig, TenantStatus, TenantStore};
     use axum::http::Request;
+    use chrono::Utc;
+    use std::sync::Arc;
 
     #[test]
     fn test_constant_time_eq_equal() {
@@ -637,5 +763,78 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(extract_token(&req), "");
+    }
+
+    #[tokio::test]
+    async fn public_register_setup_script_route_bypasses_user_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(TenantStore::open(dir.path()).unwrap());
+        let now = Utc::now();
+        store
+            .save(&TenantConfig {
+                id: "edward".into(),
+                name: "edward".into(),
+                subdomain: "edward".into(),
+                tunnel_token: String::new(),
+                ssh_port: 6001,
+                local_port: 8080,
+                auth_token: "public-auth-token".into(),
+                owner: "edward".into(),
+                status: TenantStatus::Pending,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let state = Arc::new(AppState {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(SseBroadcaster::new(16)),
+            started_at: Utc::now(),
+            auth_token: Some("admin-secret".into()),
+            metrics_handle: None,
+            profile_store: None,
+            process_manager: None,
+            user_store: None,
+            allowlist_store: None,
+            auth_manager: None,
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new()),
+            tenant_store: Some(store),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
+            tunnel_domain: Some("octos-cloud.org".into()),
+            frps_server: Some("127.0.0.1".into()),
+            frps_port: Some(7000),
+            deployment_mode: DeploymentMode::Cloud,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        });
+
+        let app = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/register/setup-script/edward/public-auth-token"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("install.sh"));
+
+        server.abort();
     }
 }

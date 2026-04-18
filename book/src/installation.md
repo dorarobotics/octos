@@ -49,14 +49,25 @@ For a streamlined installation, use the deploy script:
 
 ```bash
 # Minimal install (CLI + chat only)
-./scripts/local-deploy.sh --minimal
+./scripts/local-tenant-deploy.sh --minimal
 
 # Full install (all channels + dashboard + app-skills)
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # Custom channels
-./scripts/local-deploy.sh --channels telegram,discord,api
+./scripts/local-tenant-deploy.sh --channels telegram,discord,api
 ```
+
+<a id="node-name-guidelines"></a>
+### Node Name Guidelines
+
+For cloud signup and managed tenant installs, the node name becomes both the tenant id and the public subdomain, for example `alice.your-cloud.example`.
+
+- Use 1 to 64 characters.
+- Allowed characters are lowercase letters, numbers, and hyphens.
+- Do not start or end the name with a hyphen.
+- Choose something stable and easy to remember, because reinstall, support, and diagnostics may refer to the same node name later.
+- Avoid temporary names tied to a one-off machine state if you expect to reuse the same public address.
 
 ## Platform-Specific Instructions
 
@@ -74,23 +85,26 @@ brew install --cask libreoffice
 # 3. Clone and deploy
 git clone https://github.com/octos-org/octos.git
 cd octos
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # 4. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
 octos chat
 ```
 
-**Background service (launchd):**
+**Background service (launchd system daemon):**
 
-The deploy script creates `~/Library/LaunchAgents/io.octos.octos-serve.plist`.
+The deploy script creates `/Library/LaunchDaemons/io.octos.serve.plist`.
 
 ```bash
-# Start service (survives reboot)
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+# Start service (requires sudo)
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 
 # Stop service
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+
+# Check status
+sudo launchctl print system/io.octos.serve
 
 # View logs
 tail -f ~/.octos/serve.log
@@ -113,30 +127,32 @@ sudo apt install -y nodejs npm ffmpeg poppler-utils
 # 4. Clone and deploy
 git clone https://github.com/octos-org/octos.git
 cd octos
-./scripts/local-deploy.sh --full
+./scripts/local-tenant-deploy.sh --full
 
 # 5. Set API key and run
 export ANTHROPIC_API_KEY=sk-ant-...
 octos chat
 ```
 
-**Background service (systemd user unit):**
+**Background service (systemd system unit):**
 
-The deploy script creates `~/.config/systemd/user/octos-serve.service`.
+The deploy script creates `/etc/systemd/system/octos-serve.service`.
 
 ```bash
 # Start service
-systemctl --user start octos-serve
+sudo systemctl start octos-serve
 
-# Enable on boot (requires lingering)
-loginctl enable-linger $USER
-systemctl --user enable octos-serve
+# Enable on boot
+sudo systemctl enable octos-serve
+
+# Check status
+sudo systemctl status octos-serve
 
 # View logs
-journalctl --user -u octos-serve -f
+sudo journalctl -u octos-serve -f
 
 # Stop service
-systemctl --user stop octos-serve
+sudo systemctl stop octos-serve
 ```
 
 ### Linux (Fedora/RHEL)
@@ -194,7 +210,7 @@ docker compose --profile gateway up -d
 ## Deploy Script Reference
 
 ```
-./scripts/local-deploy.sh [OPTIONS]
+./scripts/local-tenant-deploy.sh [OPTIONS]
 
 Options:
   --minimal          CLI + chat only (no channels, no dashboard)
@@ -205,9 +221,16 @@ Options:
   --uninstall        Remove binaries and service files
   --debug            Build in debug mode (faster compile, larger binary)
   --prefix DIR       Install prefix (default: ~/.cargo/bin)
+  --no-tunnel        Skip frpc tunnel setup even in --full mode
+  --tenant-name NAME Tenant subdomain (e.g. "alice")
+  --frps-token TOKEN shared frps auth token
+  --frps-server ADDR frps server address (recommend a DNS-only host such as frps.example.com)
+  --ssh-port PORT    SSH tunnel remote port (default: 6001)
+  --domain DOMAIN    Tunnel domain (default: octos-cloud.org)
+  --auth-token TOKEN Dashboard auth token (default: auto-generated)
 ```
 
-On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
+For Windows native installs, use `.\scripts\install.ps1` (PowerShell).
 
 **What the script does:**
 
@@ -215,16 +238,23 @@ On Windows, use `.\scripts\local-deploy.ps1` (PowerShell) with the same options.
 2. Builds the `octos` binary with selected features
 3. Builds app-skill binaries (unless `--no-skills`)
 4. Signs binaries on macOS (ad-hoc codesign)
-5. Runs `octos init` if `~/.octos` doesn't exist
-6. Creates background service file (launchd on macOS, systemd on Linux)
+5. Creates the runtime data directory and writes `~/.octos/config.json` with `mode = "local"` or `mode = "tenant"`
+6. Creates a background service when dashboard/API features are enabled
+7. Optionally configures the `frpc` tunnel for tenant deployments
 
-**Uninstall:**
+For hosted deployments behind Cloudflare, keep the public site on the apex/wildcard domain and use a separate DNS-only hostname such as `frps.example.com` for the raw `frps` control port.
+
+**Uninstall / purge:**
 
 ```bash
-./scripts/local-deploy.sh --uninstall
-# Data directory (~/.octos) is NOT removed. Delete manually:
-rm -rf ~/.octos
+./scripts/local-tenant-deploy.sh --uninstall
+./scripts/local-tenant-deploy.sh --purge
+./scripts/local-tenant-deploy.sh --uninstall --purge
 ```
+
+- `--uninstall` removes binaries, `octos serve`, and `frpc` service files.
+- `--purge` removes the local data directory only.
+- `--uninstall --purge` does both.
 
 ## Post-Install Verification
 
@@ -254,14 +284,14 @@ octos chat --message "Hello" # Quick test
 ```bash
 cd octos
 git pull origin main
-./scripts/local-deploy.sh --full   # Rebuilds and reinstalls
+./scripts/local-tenant-deploy.sh --full   # Rebuilds and reinstalls
 
 # If running as a service, restart it:
 # macOS:
-launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist
-launchctl load ~/Library/LaunchAgents/io.octos.octos-serve.plist
+sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist
+sudo launchctl load /Library/LaunchDaemons/io.octos.serve.plist
 # Linux:
-systemctl --user restart octos-serve
+sudo systemctl restart octos-serve
 ```
 
 ## Troubleshooting

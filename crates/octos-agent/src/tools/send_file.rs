@@ -1,6 +1,6 @@
 //! Send file tool for delivering files to chat channels.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -15,6 +15,7 @@ pub struct SendFileTool {
     out_tx: mpsc::Sender<OutboundMessage>,
     default_channel: std::sync::Mutex<String>,
     default_chat_id: std::sync::Mutex<String>,
+    default_topic: std::sync::Mutex<Option<String>>,
     /// Base directory for path resolution and validation. Relative paths are
     /// resolved against this directory. File paths must resolve under this
     /// directory (prevents exfiltrating files from other profiles).
@@ -24,12 +25,31 @@ pub struct SendFileTool {
     extra_allowed_dirs: Vec<PathBuf>,
 }
 
+fn is_stale_slides_backup(path: &Path) -> bool {
+    let mut saw_slides = false;
+    for component in path.components() {
+        let Component::Normal(segment) = component else {
+            continue;
+        };
+        let name = segment.to_string_lossy();
+        if name == "slides" {
+            saw_slides = true;
+            continue;
+        }
+        if saw_slides && name == "output_old" {
+            return true;
+        }
+    }
+    false
+}
+
 impl SendFileTool {
     pub fn new(out_tx: mpsc::Sender<OutboundMessage>) -> Self {
         Self {
             out_tx,
             default_channel: std::sync::Mutex::new(String::new()),
             default_chat_id: std::sync::Mutex::new(String::new()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
@@ -45,9 +65,20 @@ impl SendFileTool {
             out_tx,
             default_channel: std::sync::Mutex::new(channel.into()),
             default_chat_id: std::sync::Mutex::new(chat_id.into()),
+            default_topic: std::sync::Mutex::new(None),
             base_dir: None,
             extra_allowed_dirs: Vec::new(),
         }
+    }
+
+    /// Bind the current session topic so API send_file deliveries are persisted
+    /// into the correct topic-scoped history instead of default.jsonl.
+    pub fn with_topic(mut self, topic: Option<String>) -> Self {
+        *self
+            .default_topic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = topic;
+        self
     }
 
     /// Set the base directory for file path resolution and validation.
@@ -207,18 +238,35 @@ impl Tool for SendFileTool {
             });
         }
 
-        let channel = input.channel.unwrap_or_else(|| {
-            self.default_channel
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
-        let chat_id = input.chat_id.unwrap_or_else(|| {
-            self.default_chat_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        });
+        if is_stale_slides_backup(&path) {
+            return Ok(ToolResult {
+                output: format!(
+                    "Error: Refusing to send stale slides backup artifact: {}",
+                    input.file_path
+                ),
+                success: false,
+                ..Default::default()
+            });
+        }
+
+        let default_channel = self
+            .default_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let default_chat_id = self
+            .default_chat_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let default_topic = self
+            .default_topic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let channel = input.channel.unwrap_or_else(|| default_channel.clone());
+        let chat_id = input.chat_id.unwrap_or_else(|| default_chat_id.clone());
 
         if channel.is_empty() || chat_id.is_empty() {
             return Ok(ToolResult {
@@ -234,6 +282,11 @@ impl Tool for SendFileTool {
                 "tool_call_id".to_string(),
                 serde_json::Value::String(tc_id.clone()),
             );
+        }
+        if channel == default_channel && chat_id == default_chat_id {
+            if let Some(topic) = default_topic.filter(|value| !value.trim().is_empty()) {
+                metadata.insert("topic".to_string(), serde_json::Value::String(topic));
+            }
         }
 
         let msg = OutboundMessage {
@@ -548,6 +601,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_include_topic_metadata_for_default_api_context() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool =
+            SendFileTool::with_context(tx, "api", "sess-1").with_topic(Some("slides demo".into()));
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "deck").unwrap();
+        let path = tmp.path().to_string_lossy().to_string();
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": path,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(
+            msg.metadata.get("topic").and_then(|v| v.as_str()),
+            Some("slides demo"),
+        );
+    }
+
+    #[tokio::test]
     async fn should_omit_tool_call_id_from_metadata_when_absent() {
         let (tx, mut rx) = mpsc::channel(16);
         let tool = SendFileTool::with_context(tx, "api", "sess-1");
@@ -564,5 +642,38 @@ mod tests {
         assert!(result.success);
         let msg = rx.recv().await.unwrap();
         assert!(msg.metadata.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn stale_slides_backup_detection_matches_output_old_paths() {
+        assert!(is_stale_slides_backup(Path::new(
+            "/tmp/workspace/slides/demo/output_old/deck.pptx"
+        )));
+        assert!(!is_stale_slides_backup(Path::new(
+            "/tmp/workspace/slides/demo/output/deck.pptx"
+        )));
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_slides_backup_artifacts() {
+        let base = tempfile::tempdir().unwrap();
+        let backup_dir = base.path().join("slides/demo/output_old");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let backup = backup_dir.join("deck.pptx");
+        std::fs::write(&backup, "pptx data").unwrap();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let tool = SendFileTool::with_context(tx, "telegram", "12345").with_base_dir(base.path());
+
+        let result = tool
+            .execute(&serde_json::json!({
+                "file_path": "slides/demo/output_old/deck.pptx"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("stale slides backup artifact"));
+        assert!(rx.try_recv().is_err());
     }
 }

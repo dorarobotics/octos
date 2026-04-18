@@ -84,11 +84,14 @@ impl ChatCommand {
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
 
+        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
+        let data_dir = super::resolve_data_dir(self.data_dir)?;
+
         // Load config
         let config = if let Some(config_path) = &self.config {
             Config::from_file(config_path)?
         } else {
-            Config::load(&cwd)?
+            Config::load(&cwd, &data_dir)?
         };
 
         let model = self.model.or(config.model.clone());
@@ -102,7 +105,11 @@ impl ChatCommand {
                     .and_then(crate::config::detect_provider)
                     .map(String::from)
             })
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no LLM provider configured. Run `octos init` or set provider in config.json"
+                )
+            })?;
 
         // Create LLM provider (with optional failover chain)
         let base_provider: Arc<dyn LlmProvider> =
@@ -151,8 +158,6 @@ impl ChatCommand {
             }
         };
 
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = super::resolve_data_dir(self.data_dir)?;
         let memory = Arc::new(
             EpisodeStore::open(&data_dir)
                 .await

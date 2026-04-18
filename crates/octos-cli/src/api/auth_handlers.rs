@@ -6,13 +6,14 @@ use std::sync::{LazyLock, Mutex};
 
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::admin::ProfileResponse;
+use super::handlers::response_path_for_profile_file;
 use crate::profiles::mask_secrets;
 use crate::user_store::{User, UserRole};
 
@@ -22,6 +23,244 @@ use super::router::AuthIdentity;
 /// Allows at most 3 requests per 5-minute window per email address.
 static OTP_RATE_LIMIT: LazyLock<Mutex<HashMap<String, (u32, std::time::Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn is_top_level_profile_id(state: &AppState, profile_id: &str) -> bool {
+    state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(profile_id).ok().flatten())
+        .map(|profile| profile.parent_id.is_none())
+        .unwrap_or(false)
+}
+
+pub(crate) fn scoped_host_allows_profile_id(
+    _state: &AppState,
+    scoped_profile_id: &str,
+    candidate_profile_id: &str,
+) -> bool {
+    scoped_profile_id == candidate_profile_id
+}
+
+fn request_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(strip_port_from_host(&raw).to_string())
+}
+
+fn strip_port_from_host(host: &str) -> &str {
+    if let Some(stripped) = host.strip_prefix('[') {
+        return stripped.split(']').next().unwrap_or(host);
+    }
+
+    if host.matches(':').count() == 1 {
+        return host.split(':').next().unwrap_or(host);
+    }
+
+    host
+}
+
+fn is_local_request_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn resolve_routed_profile_id_candidate(
+    state: &AppState,
+    candidate: &str,
+) -> Option<String> {
+    let candidate = candidate.trim();
+    if candidate.is_empty()
+        || matches!(
+            candidate,
+            "www" | "app" | "admin" | "api" | "crew" | "octos"
+        )
+    {
+        return None;
+    }
+
+    state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.resolve_routable_profile_id(candidate).ok().flatten())
+}
+
+fn host_scoped_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let host = request_host(headers)?;
+    if is_local_request_host(&host) {
+        return None;
+    }
+
+    let candidate = host.split('.').next()?;
+    resolve_routed_profile_id_candidate(state, candidate)
+}
+
+fn trusted_auth_scope_profile_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if let Some(profile_id) = host_scoped_profile_id(state, headers) {
+        return Some(profile_id);
+    }
+
+    let host = request_host(headers)?;
+    if !is_local_request_host(&host) {
+        return None;
+    }
+
+    headers
+        .get("x-profile-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|candidate| resolve_routed_profile_id_candidate(state, candidate))
+}
+
+fn resolve_scoped_login_user(
+    state: &AppState,
+    scoped_profile_id: &str,
+    email: &str,
+) -> Option<User> {
+    let normalized = email.trim().to_lowercase();
+    if scoped_profile_id.trim().is_empty() {
+        return None;
+    }
+
+    let user_store = state.user_store.as_ref()?;
+    let matches: Vec<User> = user_store
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|user| user.email.trim().to_lowercase() == normalized)
+        .filter(|user| scoped_host_allows_profile_id(state, scoped_profile_id, &user.id))
+        .collect();
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        if matches.len() > 1 {
+            tracing::warn!(
+                email = %normalized,
+                scoped_profile_id = %scoped_profile_id,
+                count = matches.len(),
+                "multiple scoped profiles share the same login email"
+            );
+        }
+        None
+    }
+}
+
+#[derive(Clone)]
+enum RootLoginTarget {
+    Registered(User),
+    Allowlisted,
+}
+
+fn resolve_root_login_target(state: &AppState, email: &str) -> Option<RootLoginTarget> {
+    let normalized = email.trim().to_lowercase();
+    let user_store = state.user_store.as_ref()?;
+    let matches: Vec<User> = user_store
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|user| user.email.trim().to_lowercase() == normalized)
+        .collect();
+
+    let top_level_matches: Vec<User> = matches
+        .iter()
+        .filter(|user| is_top_level_profile_id(state, &user.id))
+        .cloned()
+        .collect();
+
+    if top_level_matches.len() == 1 {
+        return top_level_matches
+            .into_iter()
+            .next()
+            .map(RootLoginTarget::Registered);
+    }
+
+    if top_level_matches.len() > 1 {
+        tracing::warn!(
+            email = %normalized,
+            count = top_level_matches.len(),
+            "multiple top-level profiles share the same login email"
+        );
+        return None;
+    }
+
+    if !matches.is_empty() {
+        tracing::warn!(
+            email = %normalized,
+            count = matches.len(),
+            "root login rejected because email is only registered to scoped profiles"
+        );
+        return None;
+    }
+
+    match state.allowlist_store.as_ref() {
+        Some(store) => match store.contains(&normalized) {
+            Ok(true) => Some(RootLoginTarget::Allowlisted),
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(email = %normalized, error = %error, "failed to read login allowlist");
+                None
+            }
+        },
+        None => None,
+    }
+}
+
+fn is_login_ready_email(email: &str) -> bool {
+    let normalized = email.trim().to_lowercase();
+    !normalized.is_empty() && normalized != ADMIN_PLACEHOLDER_EMAIL
+}
+
+fn is_bootstrap_mode(state: &AppState) -> bool {
+    let has_ready_user = state
+        .user_store
+        .as_ref()
+        .and_then(|store| store.list().ok())
+        .map(|users| {
+            users.iter().any(|user| {
+                is_login_ready_email(&user.email) && is_top_level_profile_id(state, &user.id)
+            })
+        })
+        .unwrap_or(false);
+    !has_ready_user
+}
+
+fn scoped_auth_target(state: &AppState, profile_id: &str) -> Option<ScopedAuthTarget> {
+    if profile_id.is_empty() {
+        return None;
+    }
+
+    let profile = state
+        .profile_store
+        .as_ref()
+        .and_then(|store| store.get(profile_id).ok().flatten())?;
+    let email_login_enabled = state
+        .user_store
+        .as_ref()
+        .and_then(|store| store.list().ok())
+        .map(|users| {
+            users.iter().any(|user| {
+                is_login_ready_email(&user.email)
+                    && scoped_host_allows_profile_id(state, profile_id, &user.id)
+            })
+        })
+        .unwrap_or(false);
+
+    Some(ScopedAuthTarget {
+        id: profile.id,
+        name: profile.name,
+        email_login_enabled,
+    })
+}
 
 // ── Request / Response types ──────────────────────────────────────────
 
@@ -54,10 +293,76 @@ pub struct VerifyResponse {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortalKind {
+    BootstrapAdmin,
+    Admin,
+    Owner,
+    SubAccount,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileRelationship {
+    SelfProfile,
+    ManagedChild,
+    AdminManaged,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileApiScope {
+    SelfService,
+    SubAccount,
+    Admin,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AccessibleProfileSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub relationship: ProfileRelationship,
+    pub api_scope: ProfileApiScope,
+    pub route_base: String,
+    pub can_manage_sub_accounts: bool,
+}
+
+#[derive(Clone, Serialize)]
+pub struct PortalState {
+    pub kind: PortalKind,
+    pub home_profile_id: String,
+    pub home_route: String,
+    pub can_access_admin_portal: bool,
+    pub can_manage_users: bool,
+    pub sub_account_limit: usize,
+    pub accessible_profiles: Vec<AccessibleProfileSummary>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct ScopedAuthTarget {
+    pub id: String,
+    pub name: String,
+    pub email_login_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct AuthStatusResponse {
+    pub bootstrap_mode: bool,
+    pub email_login_enabled: bool,
+    pub admin_token_login_enabled: bool,
+    pub allow_self_registration: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_profile: Option<ScopedAuthTarget>,
+}
+
 #[derive(Serialize)]
 pub struct MeResponse {
     pub user: User,
     pub profile: Option<ProfileResponse>,
+    pub portal: PortalState,
 }
 
 #[derive(Serialize)]
@@ -72,18 +377,68 @@ pub struct ActionResponse {
 /// POST /api/auth/send-code
 pub async fn send_code(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<SendCodeRequest>,
 ) -> Result<Json<SendCodeResponse>, StatusCode> {
     let auth_mgr = state
         .auth_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let requested_email = req.email.trim().to_lowercase();
+    let scoped_profile_id = trusted_auth_scope_profile_id(&state, &headers);
+    let scoped_login_target = scoped_profile_id
+        .as_deref()
+        .and_then(|profile_id| resolve_scoped_login_user(&state, profile_id, &requested_email));
+    let root_login_target = if scoped_profile_id.is_none() {
+        match resolve_root_login_target(&state, &requested_email) {
+            Some(target) => Some(target),
+            None if auth_mgr.allow_self_registration => Some(RootLoginTarget::Allowlisted),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if scoped_profile_id.is_some() {
+        if scoped_login_target.is_none() {
+            tracing::warn!(
+                email = %requested_email,
+                scoped_profile = ?scoped_profile_id,
+                "OTP skipped — email does not match scoped profile"
+            );
+            return Ok(Json(SendCodeResponse {
+                ok: false,
+                message: Some("This email is not registered for this account".into()),
+            }));
+        }
+    } else if root_login_target.is_none() {
+        if !auth_mgr.allow_self_registration {
+            tracing::warn!(email = %requested_email, "OTP skipped — email is not registered to a profile");
+            return Ok(Json(SendCodeResponse {
+                ok: false,
+                message: Some("This email is not registered for login".into()),
+            }));
+        }
+        tracing::info!(email = %requested_email, "sending OTP for self-registration (no existing profile)");
+    }
 
     // Rate-limit OTP sends: max 3 per email per 5-minute window.
     {
         let mut limits = OTP_RATE_LIMIT.lock().unwrap_or_else(|e| e.into_inner());
+        let rate_limit_key = scoped_login_target
+            .as_ref()
+            .map(|user| format!("{requested_email}::{}", user.id))
+            .or_else(|| {
+                root_login_target.as_ref().and_then(|target| match target {
+                    RootLoginTarget::Registered(user) => {
+                        Some(format!("{requested_email}::{}", user.id))
+                    }
+                    RootLoginTarget::Allowlisted => None,
+                })
+            })
+            .unwrap_or_else(|| requested_email.clone());
         let entry = limits
-            .entry(req.email.to_lowercase())
+            .entry(rate_limit_key)
             .or_insert((0, std::time::Instant::now()));
         if entry.1.elapsed() > std::time::Duration::from_secs(300) {
             *entry = (0, std::time::Instant::now()); // reset after 5 min
@@ -99,8 +454,25 @@ pub async fn send_code(
         entry.0 += 1;
     }
 
-    tracing::info!(email = %req.email, "login OTP requested");
-    match auth_mgr.send_otp(&req.email).await {
+    tracing::info!(email = %requested_email, "login OTP requested");
+    let send_result = if let Some(target) = scoped_login_target.as_ref() {
+        auth_mgr
+            .send_otp_for_user(&requested_email, &target.id)
+            .await
+    } else {
+        match root_login_target.as_ref() {
+            Some(RootLoginTarget::Registered(user)) => {
+                auth_mgr.send_otp_for_user(&requested_email, &user.id).await
+            }
+            Some(RootLoginTarget::Allowlisted) => {
+                auth_mgr
+                    .send_otp_with_registration(&requested_email, true)
+                    .await
+            }
+            None => Ok(true),
+        }
+    };
+    match send_result {
         Ok(true) => Ok(Json(SendCodeResponse {
             ok: true,
             message: Some("Verification code sent to your email".into()),
@@ -120,27 +492,130 @@ pub async fn send_code(
     }
 }
 
+/// GET /api/auth/status
+pub async fn auth_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, StatusCode> {
+    let scoped_profile = trusted_auth_scope_profile_id(&state, &headers)
+        .and_then(|profile_id| scoped_auth_target(&state, &profile_id));
+    let global_email_login_enabled = state
+        .user_store
+        .as_ref()
+        .and_then(|store| store.list().ok())
+        .map(|users| {
+            users.iter().any(|user| {
+                is_login_ready_email(&user.email) && is_top_level_profile_id(&state, &user.id)
+            })
+        })
+        .unwrap_or(false);
+    let email_login_enabled = scoped_profile
+        .as_ref()
+        .map(|profile| profile.email_login_enabled)
+        .unwrap_or(global_email_login_enabled);
+
+    Ok(Json(AuthStatusResponse {
+        bootstrap_mode: is_bootstrap_mode(&state),
+        email_login_enabled,
+        admin_token_login_enabled: state.auth_token.is_some(),
+        allow_self_registration: state
+            .auth_manager
+            .as_ref()
+            .map(|m| m.allow_self_registration)
+            .unwrap_or(false),
+        scoped_profile,
+    }))
+}
+
 /// POST /api/auth/verify
 pub async fn verify(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<VerifyRequest>,
 ) -> Result<Json<VerifyResponse>, StatusCode> {
     let auth_mgr = state
         .auth_manager
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let requested_email = req.email.trim().to_lowercase();
+    let scoped_profile_id = trusted_auth_scope_profile_id(&state, &headers);
+    let scoped_login_target = scoped_profile_id
+        .as_deref()
+        .and_then(|profile_id| resolve_scoped_login_user(&state, profile_id, &requested_email));
+    let root_login_target = if scoped_profile_id.is_none() {
+        resolve_root_login_target(&state, &requested_email)
+    } else {
+        None
+    };
 
-    match auth_mgr.verify_otp(&req.email, &req.code).await {
+    if scoped_profile_id.is_some() {
+        if scoped_login_target.is_none() {
+            return Ok(Json(VerifyResponse {
+                ok: false,
+                token: None,
+                user: None,
+                message: Some("Invalid or expired code".into()),
+            }));
+        }
+    } else if root_login_target.is_none() && !auth_mgr.allow_self_registration {
+        return Ok(Json(VerifyResponse {
+            ok: false,
+            token: None,
+            user: None,
+            message: Some("Invalid or expired code".into()),
+        }));
+    }
+
+    let verify_result = if let Some(target) = scoped_login_target.as_ref() {
+        auth_mgr
+            .verify_otp_for_user(&requested_email, &req.code, &target.id)
+            .await
+    } else {
+        match root_login_target.as_ref() {
+            Some(RootLoginTarget::Registered(user)) => {
+                auth_mgr
+                    .verify_otp_for_user(&requested_email, &req.code, &user.id)
+                    .await
+            }
+            Some(RootLoginTarget::Allowlisted) => {
+                auth_mgr
+                    .verify_otp_with_registration(&requested_email, &req.code, true)
+                    .await
+            }
+            None if auth_mgr.allow_self_registration => {
+                auth_mgr
+                    .verify_otp_with_registration(&requested_email, &req.code, true)
+                    .await
+            }
+            None => Ok(None),
+        }
+    };
+
+    match verify_result {
         Ok(Some(token)) => {
-            tracing::info!(email = %req.email, "user logged in");
-            // Get the user to return
+            tracing::info!(email = %requested_email, "user logged in");
             let user_store = state
                 .user_store
                 .as_ref()
                 .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-            let user = user_store
-                .get_by_email(&req.email)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let user = match (scoped_login_target.as_ref(), root_login_target.as_ref()) {
+                (Some(target), _) => user_store.get(&target.id).ok().flatten(),
+                (None, Some(RootLoginTarget::Registered(user))) => Some(user.clone()),
+                (None, Some(RootLoginTarget::Allowlisted)) => {
+                    user_store.get_by_email(&requested_email).ok().flatten()
+                }
+                (None, None) => None,
+            };
+
+            if matches!(root_login_target, Some(RootLoginTarget::Allowlisted)) {
+                if let (Some(allowlist_store), Some(user)) =
+                    (state.allowlist_store.as_ref(), user.as_ref())
+                {
+                    if let Err(error) = allowlist_store.claim(&requested_email, &user.id) {
+                        tracing::warn!(email = %requested_email, user_id = %user.id, error = %error, "failed to claim allowlist entry");
+                    }
+                }
+            }
 
             // Auto-create profile if user has none
             if let Some(ref user) = user {
@@ -149,6 +624,7 @@ pub async fn verify(
                         let profile = crate::profiles::UserProfile {
                             id: user.id.clone(),
                             name: user.name.clone(),
+                            public_subdomain: None,
                             enabled: false,
                             data_dir: None,
                             parent_id: None,
@@ -214,8 +690,20 @@ pub async fn me(
     State(state): State<Arc<AppState>>,
     axum::Extension(identity): axum::Extension<AuthIdentity>,
 ) -> Result<Json<MeResponse>, StatusCode> {
-    // Handle admin token first — no user_store needed
+    // Handle admin token first — bootstrap admin still needs a real persisted principal.
     if matches!(&identity, AuthIdentity::Admin) {
+        let user = if let Some(ref user_store) = state.user_store {
+            ensure_admin_user(user_store)?
+        } else {
+            User {
+                id: ADMIN_PROFILE_ID.into(),
+                email: ADMIN_PLACEHOLDER_EMAIL.into(),
+                name: "Admin".into(),
+                role: UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            }
+        };
         let profile = if let Some(ref ps) = state.profile_store {
             ensure_admin_profile(ps).ok();
             if let Ok(Some(p)) = ps.get(ADMIN_PROFILE_ID) {
@@ -240,17 +728,12 @@ pub async fn me(
         } else {
             None
         };
+        let portal = build_portal_state(&state, &identity, &user)?;
 
         return Ok(Json(MeResponse {
-            user: User {
-                id: ADMIN_PROFILE_ID.into(),
-                email: "admin@localhost".into(),
-                name: "Admin".into(),
-                role: UserRole::Admin,
-                created_at: chrono::Utc::now(),
-                last_login_at: None,
-            },
+            user,
             profile,
+            portal,
         }));
     }
 
@@ -258,6 +741,38 @@ pub async fn me(
         AuthIdentity::Admin => unreachable!(),
         AuthIdentity::User { id, .. } => id.clone(),
     };
+
+    // E2E test user: return a synthetic user without database lookup
+    if user_id == "e2e-test" {
+        return Ok(Json(MeResponse {
+            user: User {
+                id: "e2e-test".into(),
+                email: "e2e@test.local".into(),
+                name: "E2E Test".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            },
+            profile: None,
+            portal: PortalState {
+                kind: PortalKind::Owner,
+                home_profile_id: "e2e-test".into(),
+                home_route: "/my".into(),
+                can_access_admin_portal: false,
+                can_manage_users: false,
+                sub_account_limit: crate::profiles::MAX_SUB_ACCOUNTS_PER_PARENT,
+                accessible_profiles: vec![AccessibleProfileSummary {
+                    id: "e2e-test".into(),
+                    name: "E2E Test".into(),
+                    parent_id: None,
+                    relationship: ProfileRelationship::SelfProfile,
+                    api_scope: ProfileApiScope::SelfService,
+                    route_base: "/my".into(),
+                    can_manage_sub_accounts: true,
+                }],
+            },
+        }));
+    }
 
     let user_store = state
         .user_store
@@ -292,8 +807,13 @@ pub async fn me(
     } else {
         None
     };
+    let portal = build_portal_state(&state, &identity, &user)?;
 
-    Ok(Json(MeResponse { user, profile }))
+    Ok(Json(MeResponse {
+        user,
+        profile,
+        portal,
+    }))
 }
 
 // ── User self-service endpoints (/api/my/*) ───────────────────────────
@@ -352,6 +872,19 @@ pub async fn update_my_profile(
     // Apply updates (same logic as admin::update_profile but scoped)
     if let Some(name) = req.name {
         profile.name = name;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        if profile.parent_id.is_some() {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "sub-accounts cannot change their own public subdomain".into(),
+            ));
+        }
+        profile.public_subdomain = public_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
     }
     if let Some(enabled) = req.enabled {
         profile.enabled = enabled;
@@ -462,6 +995,220 @@ pub async fn delete_my_soul(
         ok: true,
         content: None,
         message: Some("Soul reset to default.".into()),
+    }))
+}
+
+// ── Content catalog endpoints ────────────────────────────────────────
+
+/// GET /api/my/content
+pub async fn my_content(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    axum::extract::Query(query): axum::extract::Query<crate::content_catalog::ContentQuery>,
+) -> Result<Json<crate::content_catalog::ContentQueryResult>, (StatusCode, String)> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "not configured".into()))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    // Use X-Profile-Id header (from Caddy proxy) if available, otherwise resolve from identity
+    let profile = if let Some(pid) = headers.get("x-profile-id").and_then(|v| v.to_str().ok()) {
+        ps.get(pid)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "profile store error".into(),
+                )
+            })?
+            .ok_or((StatusCode::NOT_FOUND, format!("profile '{pid}' not found")))?
+    } else {
+        resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?
+    };
+    let data_dir = ps.resolve_data_dir(&profile);
+
+    let catalog = mgr
+        .get_catalog_with_scan(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let cat = catalog.read().await;
+    let result = cat.query(&query);
+    let entries = result
+        .entries
+        .into_iter()
+        .filter_map(|mut entry| {
+            let handle =
+                response_path_for_profile_file(&data_dir, std::path::Path::new(&entry.path))?;
+            entry.path = handle;
+            entry.thumbnail_path = entry
+                .thumbnail_path
+                .as_ref()
+                .map(|_| "available".to_string());
+            Some(entry)
+        })
+        .collect();
+    Ok(Json(crate::content_catalog::ContentQueryResult {
+        entries,
+        total: result.total,
+    }))
+}
+
+/// GET /api/my/content/:id/thumbnail
+pub async fn my_content_thumbnail(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mgr = state
+        .content_catalog_mgr
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cat = catalog.read().await;
+    let entry = cat.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let thumb_path = entry.thumbnail_path.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    let data = tokio::fs::read(thumb_path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    Ok(([(header::CONTENT_TYPE, "image/jpeg")], Body::from(data)).into_response())
+}
+
+/// GET /api/my/content/:id/body
+pub async fn my_content_body(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::body::Body;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let mgr = state
+        .content_catalog_mgr
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let profile = resolve_my_profile(&identity, ps)?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cat = catalog.read().await;
+    let entry = cat.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let path = &entry.path;
+
+    let data = tokio::fs::read(path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+
+    // Determine content type from extension.
+    let content_type = match entry.category {
+        crate::content_catalog::ContentCategory::Report => {
+            if entry.filename.ends_with(".md") {
+                "text/markdown; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            }
+        }
+        crate::content_catalog::ContentCategory::Image => "image/png",
+        crate::content_catalog::ContentCategory::Audio => "audio/mpeg",
+        crate::content_catalog::ContentCategory::Video => "video/mp4",
+        _ => "application/octet-stream",
+    };
+
+    Ok(([(header::CONTENT_TYPE, content_type)], Body::from(data)).into_response())
+}
+
+/// DELETE /api/my/content/:id
+pub async fn delete_my_content(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(id): Path<String>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "not configured".into()))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut cat = catalog.write().await;
+    let deleted = cat
+        .delete(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: deleted,
+        message: if deleted {
+            Some("Content deleted.".into())
+        } else {
+            Some("Content not found.".into())
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct BulkDeleteRequest {
+    pub ids: Vec<String>,
+}
+
+/// POST /api/my/content/bulk-delete
+pub async fn bulk_delete_my_content(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<BulkDeleteRequest>,
+) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "not configured".into()))?;
+    let mgr = state.content_catalog_mgr.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "content catalog not configured".into(),
+    ))?;
+    let profile = resolve_my_profile(&identity, ps).map_err(|s| (s, "profile not found".into()))?;
+
+    let catalog = mgr
+        .get_catalog(&profile.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut cat = catalog.write().await;
+    let deleted = cat
+        .bulk_delete(&req.ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ActionResponse {
+        ok: true,
+        message: Some(format!("{deleted} item(s) deleted.")),
     }))
 }
 
@@ -706,6 +1453,221 @@ pub async fn my_sub_accounts(
     Ok(Json(items))
 }
 
+fn resolve_my_managed_parent_profile(
+    identity: &AuthIdentity,
+    ps: &crate::profiles::ProfileStore,
+) -> Result<crate::profiles::UserProfile, StatusCode> {
+    let profile = resolve_my_profile(identity, ps)?;
+    if profile.parent_id.is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(profile)
+}
+
+/// GET /api/my/profile/accounts/:id — Return a sub-account managed by the current user.
+pub async fn my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+) -> Result<Json<crate::api::admin::ProfileResponse>, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let pm = state
+        .process_manager
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let sub = resolve_my_sub_account(&identity, ps, &sub_id)?;
+    let status = pm.status(&sub.id).await;
+    Ok(Json(crate::api::admin::ProfileResponse {
+        email: None,
+        profile: crate::profiles::mask_secrets(&sub),
+        status,
+    }))
+}
+
+/// POST /api/my/profile/accounts — Create a sub-account owned by the current user.
+pub async fn create_my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Json(req): Json<crate::api::admin::CreateSubAccountRequest>,
+) -> Result<(StatusCode, Json<crate::api::admin::ProfileResponse>), (StatusCode, String)> {
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let parent = resolve_my_managed_parent_profile(&identity, ps)
+        .map_err(|status| (status, "sub-accounts cannot create sub-accounts".into()))?;
+
+    if !req.channels.is_empty() {
+        super::admin::validate_channel_credentials(&req.channels)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    }
+
+    let mut sub = ps
+        .create_sub_account(
+            &parent.id,
+            &req.sub_account_id,
+            &req.public_subdomain,
+            &req.name,
+            req.channels,
+            req.gateway.unwrap_or_default(),
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if !req.env_vars.is_empty() {
+        sub.config.env_vars = req.env_vars;
+        sub.updated_at = chrono::Utc::now();
+        ps.save(&sub)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            super::admin::validate_email(&email)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                if let Ok(Some(_existing)) = user_store.get_by_email(&email) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!("Email '{email}' is already registered to another account"),
+                    ));
+                }
+                let user = crate::user_store::User {
+                    id: sub.id.clone(),
+                    email,
+                    name: sub.name.clone(),
+                    role: crate::user_store::UserRole::User,
+                    created_at: chrono::Utc::now(),
+                    last_login_at: None,
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
+    }
+
+    let status = pm.status(&sub.id).await;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::api::admin::ProfileResponse {
+            email: None,
+            profile: crate::profiles::mask_secrets(&sub),
+            status,
+        }),
+    ))
+}
+
+/// PUT /api/my/profile/accounts/:id — Update a managed sub-account.
+pub async fn update_my_sub_account(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(identity): axum::Extension<AuthIdentity>,
+    Path(sub_id): Path<String>,
+    body: String,
+) -> Result<Json<crate::api::admin::ProfileResponse>, (StatusCode, String)> {
+    let req: crate::api::admin::UpdateProfileRequest =
+        serde_json::from_str(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid request body: {e}"),
+            )
+        })?;
+    let ps = state.profile_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+    let pm = state.process_manager.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "admin not configured".into(),
+    ))?;
+
+    let _parent = resolve_my_managed_parent_profile(&identity, ps)
+        .map_err(|status| (status, "sub-accounts cannot manage sub-accounts".into()))?;
+    let mut sub = resolve_my_sub_account(&identity, ps, &sub_id)
+        .map_err(|status| (status, "sub-account not found".into()))?;
+
+    if let Some(name) = req.name {
+        sub.name = name;
+    }
+    if let Some(public_subdomain) = req.public_subdomain {
+        match public_subdomain
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(slug) => sub.public_subdomain = Some(slug.to_string()),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "sub-accounts must keep a public subdomain".into(),
+                ));
+            }
+        }
+    }
+    if let Some(enabled) = req.enabled {
+        sub.enabled = enabled;
+    }
+    if let Some(config) = req.config {
+        sub.config = config;
+    }
+    sub.updated_at = chrono::Utc::now();
+
+    ps.save_with_merge(&mut sub)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if let Some(email) = &req.email {
+        let email = email.trim().to_lowercase();
+        if !email.is_empty() {
+            super::admin::validate_email(&email)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            if let Some(user_store) = state.user_store.as_ref() {
+                if let Ok(Some(existing)) = user_store.get_by_email(&email) {
+                    if existing.id != sub_id {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            format!("Email '{email}' is already registered to another account"),
+                        ));
+                    }
+                }
+                let user = match user_store.get(&sub_id) {
+                    Ok(Some(mut u)) => {
+                        u.email = email;
+                        u.name = sub.name.clone();
+                        u
+                    }
+                    _ => crate::user_store::User {
+                        id: sub.id.clone(),
+                        email,
+                        name: sub.name.clone(),
+                        role: crate::user_store::UserRole::User,
+                        created_at: chrono::Utc::now(),
+                        last_login_at: None,
+                    },
+                };
+                user_store
+                    .save(&user)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            }
+        }
+    }
+
+    let status = pm.status(&sub.id).await;
+    Ok(Json(crate::api::admin::ProfileResponse {
+        email: None,
+        profile: crate::profiles::mask_secrets(&sub),
+        status,
+    }))
+}
+
 /// Helper: resolve a sub-account owned by the current user.
 fn resolve_my_sub_account(
     identity: &AuthIdentity,
@@ -814,6 +1776,7 @@ fn resolve_my_profile(
 /// The fixed profile ID used for token-based admin authentication.
 /// This ensures the admin has its own separate profile, distinct from any user profiles.
 pub const ADMIN_PROFILE_ID: &str = "admin";
+const ADMIN_PLACEHOLDER_EMAIL: &str = "admin@localhost";
 
 fn extract_bearer_token(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
     req.headers()
@@ -831,6 +1794,7 @@ fn ensure_admin_profile(ps: &crate::profiles::ProfileStore) -> Result<(), Status
     let profile = crate::profiles::UserProfile {
         id: ADMIN_PROFILE_ID.into(),
         name: "Admin".into(),
+        public_subdomain: None,
         enabled: false,
         data_dir: None,
         parent_id: None,
@@ -844,10 +1808,224 @@ fn ensure_admin_profile(ps: &crate::profiles::ProfileStore) -> Result<(), Status
     })
 }
 
+fn ensure_admin_user(user_store: &crate::user_store::UserStore) -> Result<User, StatusCode> {
+    let mut created = false;
+    let mut user = match user_store.get(ADMIN_PROFILE_ID) {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            created = true;
+            User {
+                id: ADMIN_PROFILE_ID.into(),
+                email: ADMIN_PLACEHOLDER_EMAIL.into(),
+                name: "Admin".into(),
+                role: UserRole::Admin,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load admin user");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let mut changed = false;
+    if user.role != UserRole::Admin {
+        user.role = UserRole::Admin;
+        changed = true;
+    }
+    if user.name.trim().is_empty() {
+        user.name = "Admin".into();
+        changed = true;
+    }
+    if user.email.trim().is_empty() {
+        user.email = ADMIN_PLACEHOLDER_EMAIL.into();
+        changed = true;
+    }
+
+    if created || changed {
+        user_store.save(&user).map_err(|e| {
+            tracing::error!(error = %e, "failed to persist admin user");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    Ok(user)
+}
+
+fn build_portal_state(
+    state: &AppState,
+    identity: &AuthIdentity,
+    user: &User,
+) -> Result<PortalState, StatusCode> {
+    let ps = state
+        .profile_store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let mut all_profiles = ps.list().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    all_profiles.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+    match identity {
+        AuthIdentity::Admin => {
+            ensure_admin_profile(ps)?;
+            if !all_profiles
+                .iter()
+                .any(|profile| profile.id == ADMIN_PROFILE_ID)
+            {
+                if let Ok(Some(profile)) = ps.get(ADMIN_PROFILE_ID) {
+                    all_profiles.push(profile);
+                }
+            }
+            all_profiles.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+
+            let accessible_profiles = all_profiles
+                .into_iter()
+                .map(|profile| {
+                    let is_self_profile = profile.id == ADMIN_PROFILE_ID;
+                    AccessibleProfileSummary {
+                        id: profile.id.clone(),
+                        name: profile.name,
+                        parent_id: profile.parent_id.clone(),
+                        relationship: if is_self_profile {
+                            ProfileRelationship::SelfProfile
+                        } else {
+                            ProfileRelationship::AdminManaged
+                        },
+                        api_scope: if is_self_profile {
+                            ProfileApiScope::SelfService
+                        } else {
+                            ProfileApiScope::Admin
+                        },
+                        route_base: if is_self_profile {
+                            "/my".into()
+                        } else {
+                            format!("/profile/{}", profile.id)
+                        },
+                        can_manage_sub_accounts: profile.parent_id.is_none(),
+                    }
+                })
+                .collect();
+
+            Ok(PortalState {
+                kind: if is_login_ready_email(&user.email) {
+                    PortalKind::Admin
+                } else {
+                    PortalKind::BootstrapAdmin
+                },
+                home_profile_id: ADMIN_PROFILE_ID.into(),
+                home_route: "/my".into(),
+                can_access_admin_portal: true,
+                can_manage_users: true,
+                sub_account_limit: crate::profiles::MAX_SUB_ACCOUNTS_PER_PARENT,
+                accessible_profiles,
+            })
+        }
+        AuthIdentity::User {
+            id,
+            role: UserRole::Admin,
+        } => {
+            let accessible_profiles = all_profiles
+                .into_iter()
+                .map(|profile| {
+                    let is_self_profile = profile.id == *id;
+                    AccessibleProfileSummary {
+                        id: profile.id.clone(),
+                        name: profile.name,
+                        parent_id: profile.parent_id.clone(),
+                        relationship: if is_self_profile {
+                            ProfileRelationship::SelfProfile
+                        } else {
+                            ProfileRelationship::AdminManaged
+                        },
+                        api_scope: if is_self_profile {
+                            ProfileApiScope::SelfService
+                        } else {
+                            ProfileApiScope::Admin
+                        },
+                        route_base: if is_self_profile {
+                            "/my".into()
+                        } else {
+                            format!("/profile/{}", profile.id)
+                        },
+                        can_manage_sub_accounts: profile.parent_id.is_none(),
+                    }
+                })
+                .collect();
+
+            Ok(PortalState {
+                kind: PortalKind::Admin,
+                home_profile_id: id.clone(),
+                home_route: "/my".into(),
+                can_access_admin_portal: true,
+                can_manage_users: true,
+                sub_account_limit: crate::profiles::MAX_SUB_ACCOUNTS_PER_PARENT,
+                accessible_profiles,
+            })
+        }
+        AuthIdentity::User {
+            id,
+            role: UserRole::User,
+        } => {
+            let own_profile = ps
+                .get(id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                .ok_or(StatusCode::NOT_FOUND)?;
+
+            let is_sub_account = own_profile.parent_id.is_some();
+            let mut accessible_profiles = vec![AccessibleProfileSummary {
+                id: own_profile.id.clone(),
+                name: own_profile.name.clone(),
+                parent_id: own_profile.parent_id.clone(),
+                relationship: ProfileRelationship::SelfProfile,
+                api_scope: ProfileApiScope::SelfService,
+                route_base: "/my".into(),
+                can_manage_sub_accounts: own_profile.parent_id.is_none(),
+            }];
+
+            if own_profile.parent_id.is_none() {
+                let mut children = ps
+                    .list_sub_accounts(id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                children.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+                accessible_profiles.extend(children.into_iter().map(|profile| {
+                    AccessibleProfileSummary {
+                        id: profile.id.clone(),
+                        name: profile.name,
+                        parent_id: profile.parent_id.clone(),
+                        relationship: ProfileRelationship::ManagedChild,
+                        api_scope: ProfileApiScope::SubAccount,
+                        route_base: format!("/accounts/{}", profile.id),
+                        can_manage_sub_accounts: false,
+                    }
+                }));
+            }
+
+            Ok(PortalState {
+                kind: if is_sub_account {
+                    PortalKind::SubAccount
+                } else {
+                    PortalKind::Owner
+                },
+                home_profile_id: id.clone(),
+                home_route: "/my".into(),
+                can_access_admin_portal: false,
+                can_manage_users: false,
+                sub_account_limit: crate::profiles::MAX_SUB_ACCOUNTS_PER_PARENT,
+                accessible_profiles,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::login_allowlist::{AllowedLogin, LoginAllowlistStore};
+    use crate::otp::AuthManager;
     use crate::profiles::ProfileStore;
+    use crate::user_store::UserStore;
+    use axum::http::HeaderMap;
     use axum::http::Request;
 
     fn temp_profile_store() -> (tempfile::TempDir, ProfileStore) {
@@ -863,10 +2041,63 @@ mod tests {
             enabled: true,
             data_dir: None,
             parent_id: None,
+            public_subdomain: None,
             config: crate::profiles::ProfileConfig::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    fn temp_app_state() -> (
+        tempfile::TempDir,
+        AppState,
+        Arc<UserStore>,
+        Arc<ProfileStore>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_store = Arc::new(UserStore::open(dir.path()).unwrap());
+        let profile_store = Arc::new(ProfileStore::open(dir.path()).unwrap());
+        let allowlist_store = Arc::new(LoginAllowlistStore::open(dir.path()).unwrap());
+        let state = AppState {
+            agent: None,
+            sessions: None,
+            broadcaster: Arc::new(crate::api::SseBroadcaster::new(8)),
+            started_at: chrono::Utc::now(),
+            auth_token: Some("bootstrap-token".into()),
+            metrics_handle: None,
+            profile_store: Some(profile_store.clone()),
+            process_manager: None,
+            user_store: Some(user_store.clone()),
+            allowlist_store: Some(allowlist_store),
+            auth_manager: Some(Arc::new(AuthManager::new(None, user_store.clone()))),
+            http_client: reqwest::Client::new(),
+            config_path: None,
+            watchdog_enabled: None,
+            alerts_enabled: None,
+            sysinfo: tokio::sync::Mutex::new(sysinfo::System::new_all()),
+            tenant_store: None,
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
+            tunnel_domain: None,
+            frps_server: None,
+            frps_port: None,
+            deployment_mode: crate::config::DeploymentMode::Local,
+            allow_admin_shell: false,
+            content_catalog_mgr: None,
+        };
+        (dir, state, user_store, profile_store)
+    }
+
+    fn scoped_host_headers(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Host", host.parse().unwrap());
+        headers
+    }
+
+    fn localhost_scoped_headers(profile_id: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("Host", "localhost:3000".parse().unwrap());
+        headers.insert("X-Profile-Id", profile_id.parse().unwrap());
+        headers
     }
 
     #[test]
@@ -940,6 +2171,292 @@ mod tests {
         let profile = resolve_my_profile(&identity, &ps).unwrap();
         assert_eq!(profile.id, ADMIN_PROFILE_ID);
         assert_eq!(profile.name, "Admin");
+    }
+
+    #[test]
+    fn trusted_auth_scope_prefers_host_over_stale_header() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+
+        let mut headers = scoped_host_headers("tenant.example.test");
+        headers.insert("X-Profile-Id", "tenant--assistant".parse().unwrap());
+
+        let scoped = trusted_auth_scope_profile_id(&state, &headers);
+        assert_eq!(scoped.as_deref(), Some("tenant"));
+    }
+
+    #[test]
+    fn trusted_auth_scope_allows_localhost_header_fallback() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+
+        let scoped =
+            trusted_auth_scope_profile_id(&state, &localhost_scoped_headers("tenant--assistant"));
+        assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
+    }
+
+    #[test]
+    fn trusted_auth_scope_resolves_child_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        profile_store.save(&child).unwrap();
+
+        let scoped = trusted_auth_scope_profile_id(&state, &scoped_host_headers("assistant.example.test"));
+        assert_eq!(scoped.as_deref(), Some("tenant--assistant"));
+    }
+
+    #[tokio::test]
+    async fn top_level_user_can_change_own_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+
+        let Json(resp) = update_my_profile(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "public_subdomain": "tenant-host"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resp.profile.public_subdomain.as_deref(),
+            Some("tenant-host")
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_account_cannot_change_own_public_subdomain() {
+        let (_dir, state, _user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        child.public_subdomain = Some("assistant".into());
+        profile_store.save(&child).unwrap();
+
+        let err = update_my_profile(
+            State(Arc::new(state)),
+            axum::Extension(AuthIdentity::User {
+                id: "tenant--assistant".into(),
+                role: UserRole::User,
+            }),
+            serde_json::json!({
+                "public_subdomain": "new-assistant"
+            })
+            .to_string(),
+        )
+        .await;
+
+        let err = match err {
+            Ok(_) => panic!("sub-account self-update unexpectedly succeeded"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "sub-accounts cannot change their own public subdomain");
+    }
+
+    #[tokio::test]
+    async fn scoped_send_code_rejects_wrong_email() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+        user_store
+            .save(&User {
+                id: "tenant--assistant".into(),
+                email: "assistant@example.com".into(),
+                name: "Assistant".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let Json(resp) = send_code(
+            State(Arc::new(state)),
+            scoped_host_headers("tenant--assistant.example.test"),
+            Json(SendCodeRequest {
+                email: "wrong@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.message.as_deref(),
+            Some("This email is not registered for this account")
+        );
+    }
+
+    #[tokio::test]
+    async fn root_auth_status_ignores_sub_account_only_emails() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        profile_store
+            .save(&make_user_profile("tenant", "Tenant Owner"))
+            .unwrap();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+        user_store
+            .save(&User {
+                id: "tenant--assistant".into(),
+                email: "assistant@example.com".into(),
+                name: "Assistant".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+
+        let Json(status) = auth_status(State(Arc::new(state)), HeaderMap::new())
+            .await
+            .unwrap();
+
+        assert!(!status.email_login_enabled);
+    }
+
+    #[tokio::test]
+    async fn root_allowlisted_email_can_complete_login_and_provision_user() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let allowlist_store = state.allowlist_store.as_ref().unwrap().clone();
+        allowlist_store
+            .save(&AllowedLogin {
+                email: "newuser@example.com".into(),
+                note: Some("invited".into()),
+                created_at: chrono::Utc::now(),
+                claimed_user_id: None,
+                claimed_at: None,
+            })
+            .unwrap();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+        let state = Arc::new(state);
+
+        let Json(send_resp) = send_code(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(SendCodeRequest {
+                email: "newuser@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(send_resp.ok);
+
+        let code = auth_mgr
+            .test_pending_code("newuser@example.com", None)
+            .await
+            .expect("allowlisted root login should create a global OTP");
+
+        let Json(verify_resp) = verify(
+            State(state),
+            HeaderMap::new(),
+            Json(VerifyRequest {
+                email: "newuser@example.com".into(),
+                code,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(verify_resp.ok);
+        let user = verify_resp
+            .user
+            .expect("verify should return the provisioned user");
+        assert_eq!(user.id, "newuser");
+
+        let saved_user = user_store
+            .get_by_email("newuser@example.com")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_user.id, "newuser");
+        assert!(profile_store.get("newuser").unwrap().is_some());
+
+        let allowlist_entry = allowlist_store.get("newuser@example.com").unwrap().unwrap();
+        assert_eq!(allowlist_entry.claimed_user_id.as_deref(), Some("newuser"));
+        assert!(allowlist_entry.claimed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn scoped_verify_uses_user_bound_otp() {
+        let (_dir, state, user_store, profile_store) = temp_app_state();
+        let mut child = make_user_profile("tenant--assistant", "Assistant");
+        child.parent_id = Some("tenant".into());
+        profile_store.save(&child).unwrap();
+        user_store
+            .save(&User {
+                id: "tenant--assistant".into(),
+                email: "assistant@example.com".into(),
+                name: "Assistant".into(),
+                role: UserRole::User,
+                created_at: chrono::Utc::now(),
+                last_login_at: None,
+            })
+            .unwrap();
+        let auth_mgr = state.auth_manager.as_ref().unwrap().clone();
+        let state = Arc::new(state);
+
+        let Json(send_resp) = send_code(
+            State(state.clone()),
+            scoped_host_headers("tenant--assistant.example.test"),
+            Json(SendCodeRequest {
+                email: "assistant@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(send_resp.ok);
+        assert!(
+            auth_mgr
+                .test_pending_code("assistant@example.com", None)
+                .await
+                .is_none(),
+            "scoped host login should not use the global email OTP slot"
+        );
+
+        let code = auth_mgr
+            .test_pending_code("assistant@example.com", Some("tenant--assistant"))
+            .await
+            .expect("scoped host login should bind the OTP to the profile user id");
+
+        let Json(verify_resp) = verify(
+            State(state),
+            scoped_host_headers("tenant--assistant.example.test"),
+            Json(VerifyRequest {
+                email: "assistant@example.com".into(),
+                code,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(verify_resp.ok);
+        let user = verify_resp
+            .user
+            .expect("verify should return the scoped user");
+        assert_eq!(user.id, "tenant--assistant");
     }
 
     #[test]

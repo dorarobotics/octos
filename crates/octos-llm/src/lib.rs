@@ -40,7 +40,7 @@ pub mod registry;
 pub use adaptive::{
     AdaptiveConfig, AdaptiveMode, AdaptiveRouter, AdaptiveStatus, BaselineEntry, MetricsSnapshot,
     ModelCatalogEntry, ModelType, QosCatalog, SharedMetrics, SharedPolicy, SharedProviderMetrics,
-    StatusCallback,
+    StatusCallback, derive_cold_start_catalog,
 };
 pub use catalog::{ModelCapabilities, ModelCatalog, ModelCost, ModelInfo};
 pub use config::{ChatConfig, ResponseFormat, ToolChoice};
@@ -62,5 +62,6 @@ pub use router::{ProviderRouter, SubProviderMeta};
 pub use stream_accumulator::StreamAccumulator;
 pub use swappable::SwappableProvider;
 pub use types::{
-    ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec, strip_think_tags,
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+    strip_think_tags,
 };

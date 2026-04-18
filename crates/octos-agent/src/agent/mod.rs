@@ -1,26 +1,30 @@
 //! Agent implementation.
 
+mod activity;
 mod budget;
 mod compaction;
 mod detection;
 mod execution;
 mod llm_call;
+mod loop_compaction;
 mod loop_runner;
 mod memory;
 mod message_repair;
 pub mod realtime;
 mod streaming;
+mod turn_state;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, RwLock};
 
 use octos_core::{AgentId, Message, TokenUsage};
-use octos_llm::{EmbeddingProvider, LlmProvider};
+use octos_llm::{EmbeddingProvider, LlmProvider, ProviderMetadata};
 use octos_memory::EpisodeStore;
 
 use crate::hooks::{HookContext, HookExecutor};
 use crate::progress::{ProgressReporter, SilentReporter};
+use crate::session::{SessionLimits, SessionUsage};
 use crate::tools::ToolRegistry;
 
 tokio::task_local! {
@@ -41,7 +45,9 @@ pub struct AgentConfig {
     pub max_iterations: u32,
     /// Maximum total tokens (input + output) before stopping. None = unlimited.
     pub max_tokens: Option<u32>,
-    /// Wall-clock timeout for the entire agent run. None = unlimited.
+    /// Activity timeout for the entire agent run. None = unlimited.
+    /// This is only enforced when the loop has not reported recent progress,
+    /// so active long-running turns are not killed just because wall time grew.
     pub max_timeout: Option<std::time::Duration>,
     /// Whether to save episodes to memory.
     pub save_episodes: bool,
@@ -53,6 +59,10 @@ pub struct AgentConfig {
     /// Per-call max output tokens override. When set, overrides `ChatConfig::default()`.
     /// Useful for pipeline nodes that produce long outputs (e.g. synthesize).
     pub chat_max_tokens: Option<u32>,
+    /// Suppress the generic auto-send loop for tool `files_to_send`.
+    /// Background spawned workers rely on their outer workflow/session runtime
+    /// to persist terminal results exactly once.
+    pub suppress_auto_send_files: bool,
 }
 
 /// Default tool execution timeout in seconds.
@@ -72,6 +82,7 @@ impl Default for AgentConfig {
             worker_prompt: None,
             tool_timeout_secs: DEFAULT_TOOL_TIMEOUT_SECS,
             chat_max_tokens: None,
+            suppress_auto_send_files: false,
         }
     }
 }
@@ -82,8 +93,11 @@ pub struct ConversationResponse {
     pub content: String,
     /// Reasoning/thinking content from thinking models (o1, DeepSeek, kimi, etc.).
     pub reasoning_content: Option<String>,
+    /// Exact provider instance provenance for the final assistant reply.
+    pub provider_metadata: Option<ProviderMetadata>,
     pub token_usage: TokenUsage,
     pub files_modified: Vec<PathBuf>,
+    pub files_to_send: Vec<PathBuf>,
     pub streamed: bool,
     /// All messages generated during processing (assistant replies, tool calls,
     /// tool results). Includes the user message at the front. Callers should
@@ -136,6 +150,10 @@ pub struct Agent {
     pub(super) hook_context: std::sync::Mutex<Option<HookContext>>,
     /// Shutdown signal.
     pub(super) shutdown: Arc<AtomicBool>,
+    /// Optional per-session runtime limits for tool rounds and per-tool calls.
+    pub(super) session_limits: Option<SessionLimits>,
+    /// Mutable usage tracked against `session_limits`.
+    pub(super) session_usage: std::sync::Mutex<SessionUsage>,
 }
 
 impl Agent {
@@ -160,6 +178,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -185,6 +205,8 @@ impl Agent {
             hooks: None,
             hook_context: std::sync::Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            session_limits: None,
+            session_usage: std::sync::Mutex::new(SessionUsage::default()),
         }
     }
 
@@ -262,6 +284,13 @@ impl Agent {
     /// Set session-level context for hook payloads.
     pub fn with_hook_context(self, ctx: HookContext) -> Self {
         *self.hook_context.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+        self
+    }
+
+    /// Set per-session runtime limits for tool execution.
+    pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
+        self.session_limits = Some(limits);
+        self.session_usage = std::sync::Mutex::new(SessionUsage::default());
         self
     }
 

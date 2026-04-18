@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use octos_bus::{ActiveSessionStore, SessionManager, validate_topic_name};
-use octos_core::{InboundMessage, OutboundMessage, SessionKey};
+use octos_core::{InboundMessage, MAIN_PROFILE_ID, OutboundMessage, SessionKey};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{info, warn};
 
@@ -104,10 +104,14 @@ impl GatewayDispatcher {
         reply_chat_id: &str,
         base_key_str: &str,
     ) -> Option<DispatchResult> {
-        if cmd != "/new" && !cmd.starts_with("/new ") {
+        if cmd != "/new" && cmd != "/clear" && !cmd.starts_with("/new ") {
             return None;
         }
-        let name = cmd.strip_prefix("/new").unwrap_or("").trim();
+        let name = if cmd == "/clear" {
+            ""
+        } else {
+            cmd.strip_prefix("/new").unwrap_or("").trim()
+        };
         if name.is_empty() {
             match self.session_mgr.lock().await.clear(session_key).await {
                 Ok(()) => {
@@ -142,13 +146,76 @@ impl GatewayDispatcher {
                 .await
                 .touch_user_session(base_key_str, name);
 
+            // Check for project templates (e.g. "/new slides <project>")
+            let reply = if name == "slides" || name.starts_with("slides ") {
+                if let Some(data_dir) = &self.data_dir {
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+
+                    match crate::project_templates::try_activate_slides_template(data_dir, name) {
+                        Some(template_reply) => {
+                            let project_name = name.strip_prefix("slides").unwrap_or("").trim();
+                            let project_name = if project_name.is_empty() {
+                                "untitled"
+                            } else {
+                                project_name
+                            };
+                            match crate::project_templates::scaffold_slides_project(
+                                &workspace_root,
+                                project_name,
+                            ) {
+                                Ok(_) => template_reply,
+                                Err(error) => {
+                                    warn!(topic = name, "slides scaffold failed: {error}");
+                                    format!(
+                                        "{template_reply}\n\nSlides git/bootstrap failed: {error}"
+                                    )
+                                }
+                            }
+                        }
+                        None => format!("Switched to session: {name}"),
+                    }
+                } else {
+                    format!("Switched to session: {name}")
+                }
+            } else if name == "site" || name.starts_with("site ") {
+                if let Some(data_dir) = &self.data_dir {
+                    let _ = crate::project_templates::try_activate_site_template(data_dir, name);
+                    let profile_id = self
+                        .dispatch_profile_id
+                        .clone()
+                        .unwrap_or_else(|| MAIN_PROFILE_ID.to_string());
+                    let encoded_base =
+                        octos_bus::session::encode_path_component(session_key.base_key());
+                    let workspace_root =
+                        data_dir.join("users").join(encoded_base).join("workspace");
+                    std::fs::create_dir_all(&workspace_root).ok();
+                    match crate::project_templates::scaffold_site_project(
+                        &workspace_root,
+                        &profile_id,
+                        session_key.chat_id(),
+                        name,
+                        data_dir,
+                    ) {
+                        Ok(metadata) => crate::project_templates::site_creation_reply(&metadata),
+                        Err(error) => {
+                            warn!(topic = name, "site scaffold failed: {error}");
+                            format!("Switched to session: {name}\n\nSite scaffold failed: {error}")
+                        }
+                    }
+                } else {
+                    format!("Switched to session: {name}")
+                }
+            } else {
+                format!("Switched to session: {name}")
+            };
+
             let _ = self
                 .out_tx
-                .send(make_reply(
-                    reply_channel,
-                    reply_chat_id,
-                    format!("Switched to session: {name}"),
-                ))
+                .send(make_reply(reply_channel, reply_chat_id, reply))
                 .await;
         }
         Some(DispatchResult::Handled)
@@ -163,10 +230,18 @@ impl GatewayDispatcher {
         reply_chat_id: &str,
         base_key_str: &str,
     ) -> Option<DispatchResult> {
-        if cmd != "/s" && !cmd.starts_with("/s ") {
+        if cmd != "/s"
+            && cmd != "/switch"
+            && !cmd.starts_with("/s ")
+            && !cmd.starts_with("/switch ")
+        {
             return None;
         }
-        let name = cmd.strip_prefix("/s").unwrap_or("").trim();
+        let name = cmd
+            .strip_prefix("/switch")
+            .or_else(|| cmd.strip_prefix("/s"))
+            .unwrap_or("")
+            .trim();
         if name.is_empty() {
             self.active_sessions
                 .write()
@@ -332,7 +407,11 @@ impl GatewayDispatcher {
         reply_chat_id: &str,
         base_key_str: &str,
     ) -> Option<DispatchResult> {
-        if !cmd.starts_with("/delete ") && !cmd.starts_with("/d ") {
+        if cmd != "/delete"
+            && cmd != "/d"
+            && !cmd.starts_with("/delete ")
+            && !cmd.starts_with("/d ")
+        {
             return None;
         }
         let name = cmd
@@ -341,14 +420,44 @@ impl GatewayDispatcher {
             .unwrap_or("")
             .trim();
         if name.is_empty() {
-            let _ = self
-                .out_tx
-                .send(make_reply(
-                    reply_channel,
-                    reply_chat_id,
-                    "Usage: /delete <session-name>",
-                ))
-                .await;
+            let current_topic = self
+                .active_sessions
+                .read()
+                .await
+                .get_active_topic(base_key_str)
+                .to_string();
+            if current_topic.is_empty() {
+                let _ = self
+                    .out_tx
+                    .send(make_reply(
+                        reply_channel,
+                        reply_chat_id,
+                        "Cannot delete the default session. Use /clear to reset it.",
+                    ))
+                    .await;
+            } else {
+                let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, &current_topic);
+                match self.session_mgr.lock().await.clear(&del_key).await {
+                    Ok(()) => {
+                        self.active_sessions
+                            .write()
+                            .await
+                            .remove_topic(base_key_str, &current_topic)
+                            .unwrap_or_else(|e| warn!("remove_topic failed: {e}"));
+                        let _ = self
+                            .out_tx
+                            .send(make_reply(
+                                reply_channel,
+                                reply_chat_id,
+                                format!("Deleted session: {current_topic}"),
+                            ))
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("session delete failed: {e}");
+                    }
+                }
+            }
         } else {
             let del_key = self.profiled_key(&inbound.channel, &inbound.chat_id, name);
             match self.session_mgr.lock().await.clear(&del_key).await {
@@ -672,6 +781,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_clear_session_when_clear_alias_used() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command("/clear", &session_key, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Session cleared.");
+    }
+
+    #[tokio::test]
     async fn should_reject_invalid_session_name_on_new() {
         let (tx, mut rx) = mpsc::channel(16);
         let (disp, _, _tmp) = setup_dispatcher(tx);
@@ -860,6 +984,27 @@ mod tests {
         assert_eq!(msg.content, "No previous session to switch to.");
     }
 
+    #[tokio::test]
+    async fn should_support_switch_alias_for_s_command() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let inbound = make_test_inbound("telegram", "123", "/switch research");
+
+        let result = disp
+            .handle_s_command(
+                "/switch research",
+                &inbound,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.content.starts_with("Switched to session: research"));
+    }
+
     // ── /delete tests ───────────────────────────────────────────────────
 
     #[tokio::test]
@@ -890,6 +1035,44 @@ mod tests {
         assert!(matches!(result, Some(DispatchResult::Handled)));
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.content, "Deleted session: old");
+    }
+
+    #[tokio::test]
+    async fn should_delete_current_named_session_when_name_omitted() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete");
+        disp.active_sessions
+            .write()
+            .await
+            .switch_to("telegram:123", "research")
+            .unwrap();
+
+        let result = disp
+            .handle_delete_command("/delete", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Deleted session: research");
+    }
+
+    #[tokio::test]
+    async fn should_refuse_delete_default_session_when_name_omitted() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        let inbound = make_test_inbound("telegram", "123", "/delete");
+
+        let result = disp
+            .handle_delete_command("/delete", &inbound, "telegram", "123", "telegram:123")
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(
+            msg.content,
+            "Cannot delete the default session. Use /clear to reset it."
+        );
     }
 
     #[tokio::test]
@@ -1127,5 +1310,99 @@ mod tests {
         assert_eq!(msg1.content, "Switched back to session: (default)");
         let msg2 = rx.try_recv().unwrap();
         assert_eq!(msg2.content, "old pending msg");
+    }
+
+    // ── /new slides tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn should_scaffold_slides_project_on_new_slides() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides my-deck",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        // Should get the slides creation reply, not the generic switch message
+        assert!(msg.content.contains("my-deck"));
+        assert!(msg.content.contains("slides/my-deck/"));
+        assert!(msg.content.contains("Let me help you design your slides"));
+
+        // Project directory should be scaffolded under the per-user workspace.
+        assert!(workspace_root.join("slides/my-deck/script.js").is_file());
+        assert!(workspace_root.join("slides/my-deck/memory.md").is_file());
+        assert!(workspace_root.join("slides/my-deck/history").is_dir());
+
+        // Session prompt should be written
+        let prompt = crate::project_templates::read_session_prompt(tmp.path(), "slides my-deck");
+        assert!(prompt.is_some());
+        assert!(prompt.unwrap().contains("slides designer"));
+    }
+
+    #[tokio::test]
+    async fn should_scaffold_untitled_slides_on_bare_new_slides() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, tmp) = setup_dispatcher(tx);
+        let disp = disp.with_data_dir(tmp.path().to_path_buf());
+        let session_key = SessionKey::new("telegram", "123");
+        let encoded_base = octos_bus::session::encode_path_component(session_key.base_key());
+        let workspace_root = tmp
+            .path()
+            .join("users")
+            .join(encoded_base)
+            .join("workspace");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert!(msg.content.contains("untitled"));
+        assert!(workspace_root.join("slides/untitled/script.js").is_file());
+    }
+
+    #[tokio::test]
+    async fn should_fall_back_to_generic_reply_without_data_dir() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (disp, _, _tmp) = setup_dispatcher(tx);
+        // No data_dir set
+        let session_key = SessionKey::new("telegram", "123");
+
+        let result = disp
+            .handle_new_command(
+                "/new slides demo",
+                &session_key,
+                "telegram",
+                "123",
+                "telegram:123",
+            )
+            .await;
+
+        assert!(matches!(result, Some(DispatchResult::Handled)));
+        let msg = rx.try_recv().unwrap();
+        assert_eq!(msg.content, "Switched to session: slides demo");
     }
 }

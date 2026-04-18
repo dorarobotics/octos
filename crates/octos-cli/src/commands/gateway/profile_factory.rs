@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use eyre::Result;
-use octos_agent::{AgentConfig, HookContext, HookExecutor, SkillsLoader, ToolRegistry};
+use octos_agent::{AgentConfig, HookContext, HookExecutor, ToolRegistry};
 use octos_bus::{ActiveSessionStore, CronService, SessionManager};
 use octos_core::OutboundMessage;
 use octos_llm::{
@@ -24,12 +24,18 @@ use super::build_system_prompt;
 use crate::commands::chat::{create_embedder, resolve_provider_policy};
 use crate::config::{Config, detect_provider};
 use crate::session_actor::{
-    ActorFactory, PendingMessages, PipelineToolFactory, SnapshotToolRegistryFactory,
-    ToolRegistryFactory,
+    ActorFactory, PendingMessages, PipelineToolFactory, SessionTaskQueryStore,
+    SnapshotToolRegistryFactory, ToolRegistryFactory,
 };
 
 /// Provider + model name + optional adaptive router, returned by [`build_llm_stack`].
-pub(crate) type LlmStack = (Arc<dyn LlmProvider>, String, Option<Arc<AdaptiveRouter>>);
+/// (full LLM, provider name, adaptive router, strong-only LLM for slides)
+pub(crate) type LlmStack = (
+    Arc<dyn LlmProvider>,
+    String,
+    Option<Arc<AdaptiveRouter>>,
+    Arc<dyn LlmProvider>,
+);
 
 pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStack> {
     let model = config.model.clone();
@@ -38,7 +44,9 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
         .provider
         .clone()
         .or_else(|| model.as_deref().and_then(detect_provider).map(String::from))
-        .unwrap_or_else(|| "anthropic".to_string());
+        .ok_or_else(|| {
+            eyre::eyre!("no LLM provider configured. Set provider in config or profile JSON")
+        })?;
 
     use crate::commands::chat::create_provider;
     let base_provider = create_provider(&provider_name, config, model, base_url)?;
@@ -105,7 +113,53 @@ pub(crate) fn build_llm_stack(config: &Config, no_retry: bool) -> Result<LlmStac
         }
     };
 
-    Ok((llm, provider_name, adaptive_router_ref))
+    let llm_strong = build_strong_chain(config, &provider_name, no_retry)?;
+
+    Ok((llm, provider_name, adaptive_router_ref, llm_strong))
+}
+
+/// Build a provider chain using only fallback models marked `strong: true`.
+/// Used by slides sessions that need reliable providers for 30+ tool payloads.
+pub(crate) fn build_strong_chain(
+    config: &Config,
+    provider_name: &str,
+    no_retry: bool,
+) -> Result<Arc<dyn LlmProvider>> {
+    use crate::commands::chat::create_provider;
+    let primary = create_provider(
+        provider_name,
+        config,
+        config.model.clone(),
+        config.base_url.clone(),
+    )?;
+    let strong_fallbacks: Vec<_> = config
+        .fallback_models
+        .iter()
+        .filter(|fb| fb.strong)
+        .collect();
+    if strong_fallbacks.is_empty() || no_retry {
+        return Ok(Arc::new(RetryProvider::new(primary)));
+    }
+    let mut providers: Vec<Arc<dyn LlmProvider>> = vec![Arc::new(RetryProvider::new(primary))];
+    for fallback in strong_fallbacks {
+        let fallback_config = if fallback.api_key_env.is_some() {
+            let mut cloned = config.clone();
+            cloned.api_key_env = fallback.api_key_env.clone();
+            cloned
+        } else {
+            config.clone()
+        };
+        if let Ok(provider) = crate::commands::chat::create_provider_with_api_type(
+            &fallback.provider,
+            &fallback_config,
+            fallback.model.clone(),
+            fallback.base_url.clone(),
+            fallback.api_type.as_deref(),
+        ) {
+            providers.push(Arc::new(RetryProvider::new(provider)));
+        }
+    }
+    Ok(Arc::new(ProviderChain::new(providers)))
 }
 
 pub(crate) fn build_plugin_env(
@@ -242,6 +296,7 @@ pub(super) struct ProfileActorFactoryBuilder {
     pub(super) no_retry: bool,
     /// Sandbox config for child bot tool registries.
     pub(super) sandbox_config: octos_agent::SandboxConfig,
+    pub(super) task_query_store: SessionTaskQueryStore,
 }
 
 impl ProfileActorFactoryBuilder {
@@ -253,35 +308,13 @@ impl ProfileActorFactoryBuilder {
         let effective_profile =
             crate::profiles::resolve_effective_profile(&self.profile_store, &profile)?;
         let profile_config = crate::profiles::config_from_profile(&effective_profile, None, None);
-        let (llm, provider_name, adaptive_router) =
+        let (llm, provider_name, adaptive_router, llm_strong) =
             build_llm_stack(&profile_config, self.no_retry)?;
         let llm_for_compaction = llm.clone();
         let model_id = llm.model_id().to_string();
 
         let profile_data_dir = self.profile_store.resolve_data_dir(&effective_profile);
-        let mut extra_skills_dirs: Vec<PathBuf> = Vec::new();
-        if profile_data_dir != self.project_dir {
-            if let Some(parent_id) = effective_profile.parent_id.as_deref() {
-                if let Some(parent) = self.profile_store.get(parent_id)? {
-                    extra_skills_dirs.push(self.profile_store.resolve_data_dir(&parent));
-                }
-            }
-            extra_skills_dirs.push(self.project_dir.clone());
-        }
-
-        let mut skills_loader = if profile_data_dir != self.project_dir {
-            let mut loader = SkillsLoader::new(&profile_data_dir);
-            for dir in &extra_skills_dirs {
-                loader.add_skills_dir(dir);
-            }
-            loader
-        } else {
-            SkillsLoader::new(&self.project_dir)
-        };
-        skills_loader.add_skills_path(
-            self.project_dir
-                .join(octos_agent::bootstrap::BUNDLED_APP_SKILLS_DIR),
-        );
+        let skills_loader = crate::skills_scope::build_account_skills_loader(&profile_data_dir);
 
         let mut child_plugin_prompt_fragments = Vec::new();
         let mut child_plugin_hooks: Vec<octos_agent::HookConfig> = Vec::new();
@@ -303,6 +336,9 @@ impl ProfileActorFactoryBuilder {
         let mut provider_policy = self.provider_policy.clone();
         let mut worker_prompt = self.worker_prompt.clone();
         let mut provider_router = self.provider_router.clone();
+        // Collected for SpawnTool subagents (set inside the else branch below).
+        let mut actor_plugin_dirs: Vec<PathBuf> = Vec::new();
+        let mut actor_plugin_env: Vec<(String, String)> = Vec::new();
 
         // Child bots with admin_mode=true reuse the parent's tool registry snapshot
         // (which already has full tools + admin API). Child bots with admin_mode=false
@@ -350,19 +386,7 @@ impl ProfileActorFactoryBuilder {
                     .to_string_lossy()
                     .to_string(),
             ));
-            let mut plugin_dirs =
-                crate::config::Config::plugin_dirs_from_project(&self.project_dir);
-            let profile_skills = profile_data_dir.join("skills");
-            if profile_skills.exists() && !plugin_dirs.contains(&profile_skills) {
-                plugin_dirs.insert(0, profile_skills);
-            }
-            // Include parent profile skills dir so child bots can use parent's skills
-            for dir in &extra_skills_dirs {
-                let skills = dir.join("skills");
-                if skills.exists() && !plugin_dirs.contains(&skills) {
-                    plugin_dirs.push(skills);
-                }
-            }
+            let plugin_dirs = crate::skills_scope::build_account_plugin_dirs(&profile_data_dir);
             if !plugin_dirs.is_empty() {
                 match octos_agent::PluginLoader::load_into_with_work_dir(
                     &mut tools,
@@ -386,6 +410,8 @@ impl ProfileActorFactoryBuilder {
                     Err(e) => warn!(profile_id, "child bot plugin loading failed: {e}"),
                 }
             }
+            actor_plugin_dirs = plugin_dirs.clone();
+            actor_plugin_env = plugin_env;
 
             tools.register(octos_agent::DeepSearchTool::new(
                 profile_data_dir.join("research"),
@@ -507,6 +533,7 @@ impl ProfileActorFactoryBuilder {
                     "group:sessions",
                     "group:web",
                     "group:runtime",
+                    "group:media",
                 ] {
                     tools.defer_group(group);
                 }
@@ -606,6 +633,10 @@ impl ProfileActorFactoryBuilder {
             queue_mode: self.queue_mode,
             adaptive_router,
             memory_store: Some(self.memory_store.clone()),
+            plugin_dirs: actor_plugin_dirs,
+            plugin_extra_env: actor_plugin_env,
+            llm_strong,
+            task_query_store: self.task_query_store.clone(),
         })
     }
 }

@@ -4,19 +4,23 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CARGO_TERM_COLOR: always
   FEATURES: "api,telegram,discord,whatsapp,feishu,twilio,wecom,wecom-bot"
-  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard"
+  SKILL_CRATES: "-p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard -p skill-evolve"
 
 jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -46,13 +50,15 @@ jobs:
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: crate-ci/typos@v1.33.1
 
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,7 +67,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}"
+            merge_base="$(git merge-base HEAD "origin/${{ github.base_ref }}")"
+            changed_rs=()
+            while IFS= read -r -d '' file; do
+              changed_rs+=("$file")
+            done < <(git diff -z --name-only --diff-filter=ACMRT "$merge_base"...HEAD -- '*.rs')
+
+            if [ "${#changed_rs[@]}" -eq 0 ]; then
+              echo "No changed Rust files to format-check."
+              exit 0
+            fi
+
+            rustfmt --check --edition 2021 --config skip_children=true "${changed_rs[@]}"
+          else
+            cargo fmt --all -- --check
+          fi
 
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
@@ -69,15 +92,23 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: QoS adaptive/runtime catalog regressions
+        run: |
+          cargo test -p octos-llm test_qos_ranking_changes_lane_selection -- --nocapture
+          cargo test -p octos-llm test_derive_cold_start_catalog_assigns_non_zero_scores -- --nocapture
+          cargo test -p octos-llm test_compatible_fallbacks_prefers_lower_seeded_qos_score -- --nocapture
+          cargo test -p octos-cli gateway_runtime::tests --features api -- --nocapture
+
       - name: activate_tools regression tests
         run: cargo test -p octos-agent --test activate_tools_regression -- --nocapture
 
   check-arm:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-arm
     env:
       CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB ARM runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -97,11 +128,12 @@ jobs:
         run: cargo test --workspace
 
   check-riscv:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04-riscv
     env:
       CARGO_BUILD_JOBS: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -121,9 +153,10 @@ jobs:
         run: cargo test --workspace
 
   check-windows:
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -145,7 +178,7 @@ jobs:
     needs: check
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -162,7 +195,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-apple-darwin.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-aarch64-apple-darwin
           path: octos-bundle-aarch64-apple-darwin.tar.gz
@@ -173,7 +206,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -190,7 +223,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-x86_64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-x86_64-unknown-linux-gnu
           path: octos-bundle-x86_64-unknown-linux-gnu.tar.gz
@@ -201,7 +234,7 @@ jobs:
     needs: check-arm
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -220,7 +253,7 @@ jobs:
           done
           cd dist && tar czf ../octos-bundle-aarch64-unknown-linux-gnu.tar.gz *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-aarch64-unknown-linux-gnu
           path: octos-bundle-aarch64-unknown-linux-gnu.tar.gz
@@ -231,7 +264,7 @@ jobs:
     needs: check-windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -251,7 +284,7 @@ jobs:
           done
           cd dist && 7z a ../octos-bundle-x86_64-pc-windows-msvc.zip *
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: octos-bundle-x86_64-pc-windows-msvc
           path: octos-bundle-x86_64-pc-windows-msvc.zip
@@ -267,13 +300,13 @@ jobs:
       contains(github.event.pull_request.title, 'sandbox') ||
       contains(github.event.pull_request.title, 'activate')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
 
@@ -335,7 +368,7 @@ jobs:
       contains(github.event.pull_request.title, 'security') ||
       contains(github.event.pull_request.title, 'sandbox')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 2
 

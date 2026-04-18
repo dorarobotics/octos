@@ -13,8 +13,10 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::vision;
 
 use crate::config::ChatConfig;
-use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, StopReason, StreamEvent, TokenUsage, ToolSpec};
+use crate::provider::{LlmProvider, endpoint_label_from_base_url};
+use crate::types::{
+    ChatResponse, ChatStream, ProviderMetadata, StopReason, StreamEvent, TokenUsage, ToolSpec,
+};
 
 /// Anthropic Claude provider.
 pub struct AnthropicProvider {
@@ -243,6 +245,15 @@ impl LlmProvider for AnthropicProvider {
     fn provider_name(&self) -> &str {
         &self.provider_label
     }
+
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let endpoint = if self.base_url != "https://api.anthropic.com" {
+            endpoint_label_from_base_url(&self.base_url)
+        } else {
+            None
+        };
+        ProviderMetadata::new(self.provider_label.clone(), self.model.clone(), endpoint)
+    }
 }
 
 #[derive(Serialize)]
@@ -297,7 +308,11 @@ fn build_anthropic_content(msg: &Message) -> AnthropicContent {
         }
         let note = format!(
             "[attached files: {}. Use read_file to access them.]",
-            non_image.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", ")
+            non_image
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let text = if msg.content.is_empty() {
             note
@@ -576,7 +591,7 @@ mod tests {
         let messages = vec![msg(MessageRole::User, "hi")];
         let config = ChatConfig::default();
         let request = provider.build_request(&messages, &[], &config);
-        assert_eq!(request.max_tokens, 8192);
+        assert_eq!(request.max_tokens, crate::context::default_max_tokens());
     }
 
     // --- SSE mapping tests ---

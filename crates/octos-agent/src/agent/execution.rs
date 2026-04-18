@@ -10,19 +10,37 @@ use tracing::{debug, info, warn};
 use super::{Agent, MAX_TOOL_TIMEOUT_SECS};
 use crate::hooks::{HookEvent, HookPayload, HookResult};
 use crate::progress::ProgressEvent;
-use crate::tools::{TOOL_CTX, ToolContext};
+use crate::task_supervisor::TaskRuntimeState;
+use crate::tools::spawn::{BackgroundResultKind, BackgroundResultPayload};
+use crate::tools::{TOOL_CTX, TURN_ATTACHMENT_CTX, ToolContext};
+use crate::workspace_contract::{SpawnTaskContractResult, enforce_spawn_task_contract};
+
+fn should_auto_send_tool_files(
+    suppress_auto_send_files: bool,
+    explicit_send_file_requested: bool,
+    tool_name: &str,
+) -> bool {
+    !suppress_auto_send_files && !(explicit_send_file_requested && tool_name != "send_file")
+}
 
 impl Agent {
     pub(super) async fn execute_tools(
         &self,
         response: &ChatResponse,
-    ) -> Result<(Vec<Message>, Vec<std::path::PathBuf>, TokenUsage)> {
+    ) -> Result<(
+        Vec<Message>,
+        Vec<std::path::PathBuf>,
+        Vec<std::path::PathBuf>,
+        TokenUsage,
+    )> {
         // Log parallel tool execution details
         let tool_names: Vec<&str> = response
             .tool_calls
             .iter()
             .map(|tc| tc.name.as_str())
             .collect();
+        let explicit_send_file_requested =
+            response.tool_calls.iter().any(|tc| tc.name == "send_file");
         tracing::info!(
             parallel_tools = response.tool_calls.len(),
             tool_names = %tool_names.join(", "),
@@ -43,6 +61,8 @@ impl Agent {
                 let reporter = self.reporter();
                 let hooks = self.hooks.clone();
                 let hook_ctx = self.hook_ctx();
+                let suppress_auto_send_files = self.config.suppress_auto_send_files;
+                let explicit_send_file_requested = explicit_send_file_requested;
                 let tc_name = tool_call.name.clone();
                 let tc_id = tool_call.id.clone();
                 let tc_args = tool_call.arguments.clone();
@@ -87,7 +107,8 @@ impl Agent {
                                         reasoning_content: None,
                                         timestamp: chrono::Utc::now(),
                                     },
-                                    None,
+                                    Vec::new(),
+                                    Vec::new(),
                                     None,
                                 );
                             }
@@ -115,27 +136,37 @@ impl Agent {
                         let bg_args = effective_args.clone();
                         let bg_sender = tools.background_result_sender();
                         let bg_tc_id = tc_id.clone();
-                        tools.inc_bg_tasks();
+                        let task_id = tools.register_task(&tc_name, &tc_id);
                         tools.mark_spawn_only_invoked();
-                        let bg_counter = tools.active_bg_tasks();
+                        let bg_supervisor = tools.supervisor();
+                        let bg_reporter = reporter.clone();
                         tokio::spawn(async move {
-                            // Ensure counter is decremented on all exit paths.
-                            struct BgGuard(std::sync::Arc<std::sync::atomic::AtomicU32>);
-                            impl Drop for BgGuard {
-                                fn drop(&mut self) {
-                                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                                }
-                            }
-                            let _guard = BgGuard(bg_counter);
+                            bg_supervisor.mark_running(&task_id);
+                            let bg_started_at = std::time::SystemTime::now();
 
-                            let mut result = bg_tools.execute(&bg_name, &bg_args).await;
+                            // Helper to create TOOL_CTX for plugin stderr progress streaming
+                            let attachment_ctx =
+                                TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
+                            let make_ctx = || ToolContext {
+                                tool_id: bg_tc_id.clone(),
+                                reporter: bg_reporter.clone(),
+                                attachment_paths: attachment_ctx.attachment_paths.clone(),
+                                audio_attachment_paths: attachment_ctx
+                                    .audio_attachment_paths
+                                    .clone(),
+                                file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
+                            };
+
+                            let mut result = TOOL_CTX
+                                .scope(make_ctx(), bg_tools.execute(&bg_name, &bg_args))
+                                .await;
 
                             // Retry once on transient failure (e.g. ominix-api restart)
                             if let Ok(ref r) = result {
                                 if !r.success && (r.output.contains("error sending request") || r.output.contains("connection refused")) {
                                     tracing::warn!(tool = %bg_name, "spawn_only tool failed (transient), retrying in 5s");
                                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                    result = bg_tools.execute(&bg_name, &bg_args).await;
+                                    result = TOOL_CTX.scope(make_ctx(), bg_tools.execute(&bg_name, &bg_args)).await;
                                 }
                             }
 
@@ -146,26 +177,234 @@ impl Agent {
                                         success = true,
                                         "spawn_only background tool completed"
                                     );
-                                    // Auto-send files from the background task
-                                    for file_path in &r.files_to_send {
-                                        let path_str = file_path.to_string_lossy().to_string();
-                                        tracing::info!(tool = %bg_name, file = %path_str, "background auto-sending file");
-                                        let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": bg_tc_id});
-                                        match bg_tools.execute("send_file", &send_args).await {
-                                            Ok(sr) if sr.success => {
-                                                tracing::info!(tool = %bg_name, file = %path_str, "background file sent");
-                                            }
-                                            Ok(sr) => {
-                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %sr.output, "background file send failed");
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(tool = %bg_name, file = %path_str, error = %e, "background file send failed");
+                                    match enforce_spawn_task_contract(
+                                        &bg_tools,
+                                        &bg_name,
+                                        &bg_tc_id,
+                                        &r.files_to_send,
+                                        bg_started_at,
+                                        Some((&bg_supervisor, &task_id)),
+                                    )
+                                    .await
+                                    {
+                                        SpawnTaskContractResult::Satisfied { output_files } => {
+                                            let result_persisted = if let Some(ref sender) = bg_sender
+                                            {
+                                                sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content: String::new(),
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: output_files.clone(),
+                                                })
+                                                .await
+                                            } else {
+                                                false
+                                            };
+
+                                            if result_persisted {
+                                                bg_supervisor
+                                                    .mark_completed(&task_id, output_files.clone());
+                                            } else {
+                                                let err_msg = format!(
+                                                    "verified outputs for {} but failed to persist background result",
+                                                    bg_name
+                                                );
+                                                tracing::warn!(
+                                                    tool = %bg_name,
+                                                    files = ?output_files,
+                                                    "background result persistence failed after contract verification"
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg);
                                             }
                                         }
-                                    }
-                                    // Notify session of success (if wired)
-                                    if let Some(ref sender) = bg_sender {
-                                        let _ = sender(bg_name.clone(), format!("✓ {} completed — file delivered", bg_name)).await;
+                                        SpawnTaskContractResult::Failed {
+                                            error,
+                                            notify_user,
+                                        } => {
+                                            tracing::warn!(
+                                                tool = %bg_name,
+                                                error = %error,
+                                                "workspace contract rejected spawn_only result"
+                                            );
+                                            bg_supervisor.mark_failed(&task_id, error.clone());
+                                            if let Some(ref sender) = bg_sender {
+                                                let content = match notify_user {
+                                                    Some(message) => {
+                                                        format!("✗ {}: {}", message, error)
+                                                    }
+                                                    None => {
+                                                        format!("✗ {} failed: {}", bg_name, error)
+                                                    }
+                                                };
+                                                let _ = sender(BackgroundResultPayload {
+                                                    task_label: bg_name.clone(),
+                                                    content,
+                                                    kind: BackgroundResultKind::Notification,
+                                                    media: vec![],
+                                                })
+                                                .await;
+                                            }
+                                        }
+                                        SpawnTaskContractResult::NotConfigured { required, reason } => {
+                                            if required {
+                                                let err_msg = reason.unwrap_or_else(|| {
+                                                    format!(
+                                                        "workspace contract is required for {} but not configured",
+                                                        bg_name
+                                                    )
+                                                });
+                                                bg_supervisor.mark_failed(&task_id, err_msg.clone());
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, err_msg
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                    })
+                                                    .await;
+                                                }
+                                                return;
+                                            }
+
+                                            if r.files_to_send.is_empty() {
+                                                let err_msg = format!(
+                                                    "completed with no output (stdout: {})",
+                                                    r.output.chars().take(200).collect::<String>()
+                                                );
+                                                tracing::warn!(
+                                                    tool = %bg_name,
+                                                    "spawn_only tool produced no files"
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg);
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: no output files produced",
+                                                            bg_name
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                    })
+                                                    .await;
+                                                }
+                                                return;
+                                            }
+
+                                            bg_supervisor.mark_runtime_state(
+                                                &task_id,
+                                                TaskRuntimeState::DeliveringOutputs,
+                                                Some(format!("deliver outputs for {}", bg_name)),
+                                            );
+                                            let mut sent_files = Vec::new();
+                                            let mut delivery_failed = false;
+                                            for file_path in &r.files_to_send {
+                                                let path_str =
+                                                    file_path.to_string_lossy().to_string();
+                                                tracing::info!(
+                                                    tool = %bg_name,
+                                                    file = %path_str,
+                                                    "background auto-sending file"
+                                                );
+                                                let send_args = serde_json::json!({
+                                                    "file_path": path_str,
+                                                    "tool_call_id": bg_tc_id
+                                                });
+                                                let mut delivered = false;
+                                                for attempt in 0..3 {
+                                                    match bg_tools.execute("send_file", &send_args).await {
+                                                        Ok(sr) if sr.success => {
+                                                            tracing::info!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                "background file sent"
+                                                            );
+                                                            sent_files.push(path_str.clone());
+                                                            delivered = true;
+                                                            break;
+                                                        }
+                                                        Ok(sr) => {
+                                                            tracing::warn!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                attempt,
+                                                                error = %sr.output,
+                                                                "background file send failed"
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                tool = %bg_name,
+                                                                file = %path_str,
+                                                                attempt,
+                                                                error = %e,
+                                                                "background file send failed"
+                                                            );
+                                                        }
+                                                    }
+                                                    if attempt < 2 {
+                                                        tokio::time::sleep(
+                                                            std::time::Duration::from_secs(3),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                                if !delivered {
+                                                    delivery_failed = true;
+                                                    tracing::error!(
+                                                        tool = %bg_name,
+                                                        file = %path_str,
+                                                        "file delivery failed after 3 attempts"
+                                                    );
+                                                }
+                                            }
+                                            if delivery_failed || sent_files.len() != r.files_to_send.len() {
+                                                let err_msg = format!(
+                                                    "completed but file delivery failed ({}/{})",
+                                                    sent_files.len(),
+                                                    r.files_to_send.len()
+                                                );
+                                                bg_supervisor.mark_failed(&task_id, err_msg.clone());
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✗ {} failed: {}",
+                                                            bg_name, err_msg
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                    })
+                                                    .await;
+                                                }
+                                            } else {
+                                                bg_supervisor
+                                                    .mark_completed(&task_id, sent_files.clone());
+                                                let file_info = format!(
+                                                    " ({})",
+                                                    sent_files
+                                                        .iter()
+                                                        .map(|f| f.rsplit('/').next().unwrap_or(f))
+                                                        .collect::<Vec<_>>()
+                                                        .join(", ")
+                                                );
+                                                if let Some(ref sender) = bg_sender {
+                                                    let _ = sender(BackgroundResultPayload {
+                                                        task_label: bg_name.clone(),
+                                                        content: format!(
+                                                            "✓ {} completed{}",
+                                                            bg_name, file_info
+                                                        ),
+                                                        kind: BackgroundResultKind::Notification,
+                                                        media: vec![],
+                                                    })
+                                                    .await;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(r) => {
@@ -174,9 +413,16 @@ impl Agent {
                                         error = %r.output,
                                         "spawn_only background tool failed"
                                     );
+                                    bg_supervisor.mark_failed(&task_id, r.output.clone());
                                     // Notify session of failure
                                     if let Some(ref sender) = bg_sender {
-                                        let _ = sender(bg_name.clone(), format!("✗ {} failed: {}", bg_name, r.output)).await;
+                                        let _ = sender(BackgroundResultPayload {
+                                            task_label: bg_name.clone(),
+                                            content: format!("✗ {} failed: {}", bg_name, r.output),
+                                            kind: BackgroundResultKind::Notification,
+                                            media: vec![],
+                                        })
+                                        .await;
                                     }
                                 }
                                 Err(e) => {
@@ -185,8 +431,15 @@ impl Agent {
                                         error = %e,
                                         "spawn_only background tool error"
                                     );
+                                    bg_supervisor.mark_failed(&task_id, e.to_string());
                                     if let Some(ref sender) = bg_sender {
-                                        let _ = sender(bg_name.clone(), format!("✗ {} error: {}", bg_name, e)).await;
+                                        let _ = sender(BackgroundResultPayload {
+                                            task_label: bg_name.clone(),
+                                            content: format!("✗ {} error: {}", bg_name, e),
+                                            kind: BackgroundResultKind::Notification,
+                                            media: vec![],
+                                        })
+                                        .await;
                                     }
                                 }
                             }
@@ -208,14 +461,20 @@ impl Agent {
                                 reasoning_content: None,
                                 timestamp: chrono::Utc::now(),
                             },
-                            None,
+                            Vec::new(),
+                            Vec::new(),
                             None,
                         );
                     }
 
+                    let attachment_ctx =
+                        TURN_ATTACHMENT_CTX.try_with(|c| c.clone()).unwrap_or_default();
                     let ctx = ToolContext {
                         tool_id: tc_id.clone(),
                         reporter: reporter.clone(),
+                        attachment_paths: attachment_ctx.attachment_paths.clone(),
+                        audio_attachment_paths: attachment_ctx.audio_attachment_paths.clone(),
+                        file_attachment_paths: attachment_ctx.file_attachment_paths.clone(),
                     };
                     let result = TOOL_CTX
                         .scope(ctx, tools.execute(&tc_name, &effective_args))
@@ -223,7 +482,13 @@ impl Agent {
 
                     let duration = tool_start.elapsed();
 
-                    let (content, file_modified, tool_tokens, tool_success) = match result {
+                    let (
+                        content,
+                        tool_files_modified,
+                        tool_files_to_send,
+                        tool_tokens,
+                        tool_success,
+                    ) = match result {
                         Ok(tool_result) => {
                             debug!(
                                 tool = %tc_name,
@@ -239,29 +504,49 @@ impl Agent {
                                 });
                             }
 
-                            // Auto-send files explicitly declared by the plugin via files_to_send.
-                            // No heuristic path detection — plugins must opt-in by including
-                            // "files_to_send": ["/path/to/file"] in their JSON output.
-                            let files: Vec<String> = tool_result.files_to_send
-                                .iter()
-                                .map(|p| p.to_string_lossy().to_string())
-                                .collect();
+                            if should_auto_send_tool_files(
+                                suppress_auto_send_files,
+                                explicit_send_file_requested,
+                                &tc_name,
+                            ) {
+                                // Auto-send files explicitly declared by the plugin via files_to_send.
+                                // No heuristic path detection — plugins must opt-in by including
+                                // "files_to_send": ["/path/to/file"] in their JSON output.
+                                let files: Vec<String> = tool_result.files_to_send
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect();
 
-                            for path_str in &files {
-                                info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
-                                let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
-                                match tools.execute("send_file", &send_args).await {
-                                    Ok(r) if r.success => {
-                                        info!(tool = %tc_name, file = %path_str, "file auto-sent");
-                                    }
-                                    Ok(r) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
-                                    }
-                                    Err(e) => {
-                                        warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                for path_str in &files {
+                                    info!(tool = %tc_name, file = %path_str, "auto-sending file to user");
+                                    let send_args = serde_json::json!({"file_path": path_str, "tool_call_id": tc_id});
+                                    match tools.execute("send_file", &send_args).await {
+                                        Ok(r) if r.success => {
+                                            info!(tool = %tc_name, file = %path_str, "file auto-sent");
+                                        }
+                                        Ok(r) => {
+                                            warn!(tool = %tc_name, file = %path_str, error = %r.output, "auto-send failed");
+                                        }
+                                        Err(e) => {
+                                            warn!(tool = %tc_name, file = %path_str, error = %e, "auto-send failed");
+                                        }
                                     }
                                 }
+                            } else if explicit_send_file_requested
+                                && tc_name != "send_file"
+                                && !tool_result.files_to_send.is_empty()
+                            {
+                                debug!(
+                                    tool = %tc_name,
+                                    "skipping auto-send because the same model turn already issued send_file"
+                                );
                             }
+
+                            let mut tool_files_modified = Vec::new();
+                            if let Some(file) = tool_result.file_modified.clone() {
+                                tool_files_modified.push(file);
+                            }
+                            let tool_files_to_send = tool_result.files_to_send.clone();
 
                             let output_preview =
                                 octos_core::truncated_utf8(&tool_result.output, 200, "...");
@@ -277,7 +562,8 @@ impl Agent {
                             let success = tool_result.success;
                             (
                                 tool_result.output,
-                                tool_result.file_modified,
+                                tool_files_modified,
+                                tool_files_to_send,
                                 tool_result.tokens_used,
                                 success,
                             )
@@ -298,7 +584,13 @@ impl Agent {
                                 duration,
                             });
 
-                            (format!("Error: {e}"), None, None, false)
+                            (
+                                format!("Error: {e}"),
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                                false,
+                            )
                         }
                     };
 
@@ -330,7 +622,8 @@ impl Agent {
                             reasoning_content: None,
                             timestamp: chrono::Utc::now(),
                         },
-                        file_modified,
+                        tool_files_modified,
+                        tool_files_to_send,
                         tool_tokens,
                     )
                 })
@@ -374,7 +667,8 @@ impl Agent {
                                         reasoning_content: None,
                                         timestamp: chrono::Utc::now(),
                                     },
-                                    None,
+                                    Vec::new(),
+                                    Vec::new(),
                                     None,
                                 )
                             })
@@ -406,12 +700,12 @@ impl Agent {
                             timestamp: chrono::Utc::now(),
                         });
                     }
-                    return Ok((messages, vec![], TokenUsage::default()));
+                    return Ok((messages, vec![], vec![], TokenUsage::default()));
                 }
             };
 
         // Log completion of all parallel tools
-        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _)| m.content.len()).collect();
+        let result_sizes: Vec<usize> = results.iter().map(|(m, _, _, _)| m.content.len()).collect();
         let total_result_bytes: usize = result_sizes.iter().sum();
         tracing::info!(
             parallel_tools = results.len(),
@@ -423,19 +717,35 @@ impl Agent {
         // Aggregate results -- join_all preserves input order.
         let mut messages = Vec::with_capacity(results.len());
         let mut files_modified = Vec::new();
+        let mut files_to_send = Vec::new();
         let mut tokens_used = TokenUsage::default();
 
-        for (message, file_modified, tool_tokens) in results {
+        for (message, tool_files_modified, tool_files_to_send, tool_tokens) in results {
             messages.push(message);
-            if let Some(file) = file_modified {
-                files_modified.push(file);
-            }
+            files_modified.extend(tool_files_modified);
+            files_to_send.extend(tool_files_to_send);
             if let Some(tokens) = tool_tokens {
                 tokens_used.input_tokens += tokens.input_tokens;
                 tokens_used.output_tokens += tokens.output_tokens;
             }
         }
 
-        Ok((messages, files_modified, tokens_used))
+        Ok((messages, files_modified, files_to_send, tokens_used))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_send_tool_files;
+
+    #[test]
+    fn explicit_send_file_turn_suppresses_plugin_auto_send_for_other_tools() {
+        assert!(!should_auto_send_tool_files(false, true, "mofa_slides"));
+        assert!(should_auto_send_tool_files(false, true, "send_file"));
+    }
+
+    #[test]
+    fn auto_send_respects_global_suppression_flag() {
+        assert!(!should_auto_send_tool_files(true, false, "mofa_slides"));
     }
 }

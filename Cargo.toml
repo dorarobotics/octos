@@ -16,6 +16,7 @@ members = [
     "crates/app-skills/weather",
     "crates/app-skills/wechat-bridge",
     "crates/app-skills/pipeline-guard",
+    "crates/app-skills/skill-evolve",
     "crates/platform-skills/voice",
     "crates/octos-pipeline",
     "crates/octos-plugin",
@@ -24,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["octos team"]
@@ -59,9 +60,11 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yml = "0.0.12"
+toml = "0.8"
 base64 = "0.22"
 
 # Crypto
+md-5 = "0.10"
 sha2 = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }

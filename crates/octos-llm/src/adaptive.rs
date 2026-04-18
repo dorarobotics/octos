@@ -10,13 +10,14 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use eyre::Result;
+use futures::StreamExt;
 use octos_core::Message;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ChatConfig;
 use crate::provider::LlmProvider;
-use crate::types::{ChatResponse, ChatStream, ToolSpec};
+use crate::types::{ChatResponse, ChatStream, ProviderMetadata, StreamEvent, ToolSpec};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -343,6 +344,73 @@ pub struct QosCatalog {
     pub models: Vec<ModelCatalogEntry>,
 }
 
+/// Derive cold-start runtime scores from catalog metadata.
+///
+/// The heuristic model catalog is seed data, not a live score file. This
+/// materializes an initial runtime catalog so downstream fallback code can use
+/// the same score semantics before any live traffic has been observed.
+pub fn derive_cold_start_catalog(
+    entries: &[ModelCatalogEntry],
+    config: &AdaptiveConfig,
+    qos_ranking: bool,
+) -> QosCatalog {
+    let max_quality = entries
+        .iter()
+        .map(|entry| entry.ds_output as f64 * entry.stability.clamp(0.0, 1.0))
+        .fold(0.0_f64, f64::max);
+    let max_cost = if config.weight_cost > 0.0 {
+        entries
+            .iter()
+            .map(|entry| entry.cost_out)
+            .fold(0.0_f64, f64::max)
+    } else {
+        0.0
+    };
+    let max_priority = entries.len().max(1) as f64;
+
+    let models = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let baseline_stab = entry.stability.clamp(0.0, 1.0);
+            let blended_err = 1.0 - baseline_stab;
+
+            let quality = entry.ds_output as f64 * baseline_stab;
+            let norm_quality = if max_quality > 0.0 {
+                1.0 - (quality / max_quality)
+            } else {
+                0.5
+            };
+
+            // No live throughput at cold start, so keep the throughput term neutral.
+            let norm_throughput = 0.5;
+            let norm_priority = idx as f64 / max_priority;
+            let norm_cost = if max_cost > 0.0 && entry.cost_out > 0.0 {
+                entry.cost_out / max_cost
+            } else {
+                0.0
+            };
+            let ranking_component = if qos_ranking {
+                0.6 * norm_quality + 0.4 * norm_throughput
+            } else {
+                norm_throughput
+            };
+
+            let mut model = entry.clone();
+            model.score = config.weight_error_rate * blended_err
+                + config.weight_latency * ranking_component
+                + config.weight_priority * norm_priority
+                + config.weight_cost * norm_cost;
+            model
+        })
+        .collect();
+
+    QosCatalog {
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        models,
+    }
+}
+
 /// Adaptive routing policy parameters for observability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedPolicy {
@@ -393,8 +461,14 @@ struct AdaptiveSlot {
     model_type: AtomicU8,
     /// Input cost in USD per million tokens. Set from catalog seed.
     cost_in: AtomicU64,
+    /// Original seeded cost_in — never overwritten by runtime, preserved across exports.
+    seeded_cost_in: AtomicU64,
+    /// Original seeded cost_out — never overwritten by runtime.
+    seeded_cost_out: AtomicU64,
     /// Deep search output quality (token count). Set from catalog seed.
     ds_output: AtomicU64,
+    /// Original seeded ds_output — never overwritten by runtime.
+    seeded_ds_output: AtomicU64,
     /// Baseline stability from system catalog (used when no live data yet).
     baseline_stability: AtomicU64,
     /// Baseline tool_avg_ms from system catalog.
@@ -504,7 +578,10 @@ impl AdaptiveRouter {
                 cost_per_m: costs.get(i).copied().unwrap_or(0.0),
                 model_type: AtomicU8::new(ModelType::Fast.to_u8()), // default, overridden by catalog seed
                 cost_in: AtomicU64::new(0),
+                seeded_cost_in: AtomicU64::new(0),
+                seeded_cost_out: AtomicU64::new(0),
                 ds_output: AtomicU64::new(0),
+                seeded_ds_output: AtomicU64::new(0),
                 baseline_stability: AtomicU64::new(0),
                 baseline_tool_avg_ms: AtomicU64::new(0),
                 baseline_p95_ms: AtomicU64::new(0),
@@ -645,16 +722,34 @@ impl AdaptiveRouter {
                     .store(entry.model_type.to_u8(), Ordering::Relaxed);
                 slot.cost_in
                     .store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                if entry.cost_in > 0.0 {
+                    slot.seeded_cost_in
+                        .store(entry.cost_in.to_bits(), Ordering::Relaxed);
+                }
+                if entry.cost_out > 0.0 {
+                    slot.seeded_cost_out
+                        .store(entry.cost_out.to_bits(), Ordering::Relaxed);
+                }
                 slot.ds_output.store(entry.ds_output, Ordering::Relaxed);
+                if entry.ds_output > 0 {
+                    slot.seeded_ds_output
+                        .store(entry.ds_output, Ordering::Relaxed);
+                }
                 // Store baseline values for fallback when no live data exists
                 slot.baseline_stability
                     .store(entry.stability.to_bits(), Ordering::Relaxed);
                 slot.baseline_tool_avg_ms
                     .store(entry.tool_avg_ms, Ordering::Relaxed);
                 slot.baseline_p95_ms.store(entry.p95_ms, Ordering::Relaxed);
-                slot.context_window
-                    .store(entry.context_window, Ordering::Relaxed);
-                slot.max_output.store(entry.max_output, Ordering::Relaxed);
+                // Only update context_window and max_output if catalog has non-zero values.
+                // Runtime-saved catalogs may have zeros — preserve existing values.
+                if entry.context_window > 0 {
+                    slot.context_window
+                        .store(entry.context_window, Ordering::Relaxed);
+                }
+                if entry.max_output > 0 {
+                    slot.max_output.store(entry.max_output, Ordering::Relaxed);
+                }
                 info!(
                     provider = slot_key,
                     model_type = %entry.model_type,
@@ -685,13 +780,15 @@ impl AdaptiveRouter {
                 let baseline_avg = s.baseline_tool_avg_ms.load(Ordering::Relaxed) as f64;
                 let baseline_p95 = s.baseline_p95_ms.load(Ordering::Relaxed) as f64;
 
-                // EMA blending weight: 0.0 at cold start, ramps to 1.0 after 10 calls
-                let weight = (total as f64 / 10.0).min(1.0);
+                // Micro-adjustment weight: ramps slowly, capped at 0.5 so the
+                // catalog baseline always retains at least 50% influence.
+                // This prevents runtime metrics from zeroing out seeded baselines.
+                let weight = (total as f64 / 20.0).min(0.5);
 
                 let live_stab = if total > 0 {
                     snap.success_count as f64 / total as f64
                 } else {
-                    baseline_stab
+                    baseline_stab // no observations → preserve baseline unchanged
                 };
                 let live_avg = if snap.latency_ema_ms > 0.0 {
                     snap.latency_ema_ms
@@ -704,7 +801,7 @@ impl AdaptiveRouter {
                     baseline_p95
                 };
 
-                // Blend: baseline * (1 - weight) + live * weight
+                // Blend: baseline anchors the score, runtime nudges it
                 let stability = baseline_stab * (1.0 - weight) + live_stab * weight;
                 let tool_avg_ms = (baseline_avg * (1.0 - weight) + live_avg * weight) as u64;
                 let p95_ms = (baseline_p95 * (1.0 - weight) + live_p95 * weight) as u64;
@@ -716,11 +813,37 @@ impl AdaptiveRouter {
                     tool_avg_ms,
                     p95_ms,
                     score: self.score(s),
-                    cost_in: f64::from_bits(s.cost_in.load(Ordering::Relaxed)),
-                    cost_out: s.cost_per_m,
-                    ds_output: s.ds_output.load(Ordering::Relaxed),
-                    context_window: s.context_window.load(Ordering::Relaxed),
-                    max_output: s.max_output.load(Ordering::Relaxed),
+                    cost_in: {
+                        let runtime = f64::from_bits(s.cost_in.load(Ordering::Relaxed));
+                        let seeded = f64::from_bits(s.seeded_cost_in.load(Ordering::Relaxed));
+                        if runtime > 0.0 { runtime } else { seeded }
+                    },
+                    cost_out: {
+                        let runtime = s.cost_per_m;
+                        let seeded = f64::from_bits(s.seeded_cost_out.load(Ordering::Relaxed));
+                        if runtime > 0.0 { runtime } else { seeded }
+                    },
+                    ds_output: {
+                        let runtime = s.ds_output.load(Ordering::Relaxed);
+                        let seeded = s.seeded_ds_output.load(Ordering::Relaxed);
+                        if runtime > 0 { runtime } else { seeded }
+                    },
+                    context_window: {
+                        let v = s.context_window.load(Ordering::Relaxed);
+                        if v > 0 {
+                            v
+                        } else {
+                            crate::context::context_window_tokens(s.provider.model_id()) as u64
+                        }
+                    },
+                    max_output: {
+                        let v = s.max_output.load(Ordering::Relaxed);
+                        if v > 0 {
+                            v
+                        } else {
+                            crate::context::max_output_tokens(s.provider.model_id()) as u64
+                        }
+                    },
                 }
             })
             .collect();
@@ -802,18 +925,33 @@ impl AdaptiveRouter {
 
     /// Normalized cost for a slot (0..1). Providers with unknown cost (0.0) get 0.
     fn norm_cost(&self, slot: &AdaptiveSlot) -> f64 {
-        if self.config.weight_cost <= 0.0 || slot.cost_per_m <= 0.0 {
+        if self.config.weight_cost <= 0.0 {
             return 0.0;
+        }
+        // Use cost_per_m if set, otherwise fall back to catalog cost_in
+        let slot_cost = if slot.cost_per_m > 0.0 {
+            slot.cost_per_m
+        } else {
+            f64::from_bits(slot.cost_in.load(Ordering::Relaxed))
+        };
+        if slot_cost <= 0.0 {
+            return 0.5; // unknown cost — neutral score
         }
         let max_cost = self
             .slots
             .iter()
-            .map(|s| s.cost_per_m)
+            .map(|s| {
+                if s.cost_per_m > 0.0 {
+                    s.cost_per_m
+                } else {
+                    f64::from_bits(s.cost_in.load(Ordering::Relaxed))
+                }
+            })
             .fold(0.0_f64, f64::max);
         if max_cost > 0.0 {
-            slot.cost_per_m / max_cost
+            slot_cost / max_cost
         } else {
-            0.0
+            0.5
         }
     }
 
@@ -821,7 +959,7 @@ impl AdaptiveRouter {
     ///
     /// Four factors:
     ///   - **Stability** (35%): blended baseline + live error rate. Does it complete reliably?
-    ///   - **Quality** (30%): catalog ds_output × stability. Does it produce good output?
+    ///   - **Quality** (30%, only when QoS ranking is on): catalog ds_output × stability.
     ///   - **Throughput** (20%): output tokens per second. Task-normalized speed.
     ///     Raw latency is NOT used — it depends on task complexity, not provider quality.
     ///   - **Cost** (15%): normalized output cost. Cheaper is better when quality is similar.
@@ -829,35 +967,40 @@ impl AdaptiveRouter {
         let total = slot.metrics.success_count.load(Ordering::Relaxed)
             + slot.metrics.failure_count.load(Ordering::Relaxed);
 
-        // EMA blend weight: 0.0 at cold start → 1.0 after 10 calls
-        let weight = (total as f64 / 10.0).min(1.0);
+        // EMA blend weight: ramps from 0 (cold start) to 0.5 (cap) over 20 calls.
+        // Baseline always retains ≥50% influence.
+        let weight = (total as f64 / 20.0).min(0.5);
 
-        // ── Stability (35%) ──
+        // ── Stability ──
+        // No data = neutral (0.5). Only observed data moves the score.
         let baseline_stab = f64::from_bits(slot.baseline_stability.load(Ordering::Relaxed));
-        let live_err_rate = slot.metrics.error_rate();
-        let baseline_err = 1.0 - baseline_stab;
-        let blended_err = baseline_err * (1.0 - weight) + live_err_rate * weight;
-
-        // ── Quality (30%) ──
-        let ds = slot.ds_output.load(Ordering::Relaxed) as f64;
-        let quality = ds * baseline_stab;
-        let max_quality = self
-            .slots
-            .iter()
-            .map(|s| {
-                let d = s.ds_output.load(Ordering::Relaxed) as f64;
-                let st = f64::from_bits(s.baseline_stability.load(Ordering::Relaxed));
-                d * st
-            })
-            .fold(0.0_f64, f64::max);
-        let norm_quality = if max_quality > 0.0 {
-            1.0 - (quality / max_quality)
+        let baseline_err = if baseline_stab > 0.0 {
+            1.0 - baseline_stab
+        } else {
+            0.5 // no data → neutral
+        };
+        let live_err_rate = if total > 0 {
+            slot.metrics.error_rate()
         } else {
             0.5
         };
+        let blended_err = baseline_err * (1.0 - weight) + live_err_rate * weight;
 
-        // ── Throughput (20%) ──
-        // Tokens per second — higher is better. Invert for lower-is-better score.
+        // ── Quality ──
+        // No data = neutral (0.5). Cost is the differentiator, not unobserved quality.
+        let ds = slot.ds_output.load(Ordering::Relaxed) as f64;
+        let max_ds = self
+            .slots
+            .iter()
+            .map(|s| s.ds_output.load(Ordering::Relaxed) as f64)
+            .fold(0.0_f64, f64::max);
+        let norm_quality = if max_ds > 0.0 && ds > 0.0 {
+            1.0 - (ds / max_ds)
+        } else {
+            0.5 // no data → neutral
+        };
+
+        // ── Throughput ──
         let throughput = slot.metrics.throughput();
         let max_throughput = self
             .slots
@@ -867,28 +1010,27 @@ impl AdaptiveRouter {
         let norm_throughput = if max_throughput > 0.0 && throughput > 0.0 {
             1.0 - (throughput / max_throughput)
         } else {
-            0.5 // No data yet — neutral
+            0.5 // no data → neutral
         };
 
-        // ── Priority (config weight) ──
-        // Lower priority index = better (0 = primary). Normalize to [0, 1].
+        // ── Priority ──
         let max_priority = self.slots.len().max(1) as f64;
         let norm_priority = slot.priority as f64 / max_priority;
 
-        // ── Cost (config weight) ──
+        // ── Cost ──
         let norm_cost = self.norm_cost(slot);
 
-        // Configured weights (default: stability=0.3, quality=0.3, priority=0.2, cost=0.2).
-        // weight_error_rate → stability (blended baseline + live error rate)
-        // weight_latency    → quality (60% ds_output quality + 40% throughput)
-        let we = self.config.weight_error_rate; // stability
-        let wl = self.config.weight_latency; // quality + throughput
+        let ranking_component = if self.qos_ranking.load(Ordering::Relaxed) {
+            0.6 * norm_quality + 0.4 * norm_throughput
+        } else {
+            norm_throughput
+        };
+
+        let we = self.config.weight_error_rate;
+        let wl = self.config.weight_latency;
         let wp = self.config.weight_priority;
         let wc = self.config.weight_cost;
-        we * blended_err
-            + wl * (0.6 * norm_quality + 0.4 * norm_throughput)
-            + wp * norm_priority
-            + wc * norm_cost
+        we * blended_err + wl * ranking_component + wp * norm_priority + wc * norm_cost
     }
 
     /// Select provider index and whether this is a probe request.
@@ -1153,7 +1295,10 @@ impl AdaptiveRouter {
             }
         }
 
-        result
+        result.map(|mut response| {
+            response.provider_index = Some(idx);
+            response
+        })
     }
 
     /// Try a stream request on a specific provider.
@@ -1183,7 +1328,13 @@ impl AdaptiveRouter {
             }
         }
 
-        result
+        result.map(|stream| self.stream_with_provider_index(idx, stream))
+    }
+
+    fn stream_with_provider_index(&self, idx: usize, stream: ChatStream) -> ChatStream {
+        Box::pin(
+            futures::stream::once(async move { StreamEvent::ProviderIndex(idx) }).chain(stream),
+        )
     }
 }
 
@@ -1331,6 +1482,19 @@ impl LlmProvider for AdaptiveRouter {
         self.slots[idx].provider.provider_name()
     }
 
+    fn provider_metadata(&self) -> ProviderMetadata {
+        let (idx, _) = self.select_provider();
+        self.slots[idx].provider.provider_metadata()
+    }
+
+    fn provider_metadata_for_index(&self, provider_index: Option<usize>) -> ProviderMetadata {
+        let idx = provider_index.unwrap_or_else(|| self.select_provider().0);
+        self.slots
+            .get(idx)
+            .map(|slot| slot.provider.provider_metadata())
+            .unwrap_or_else(|| self.provider_metadata())
+    }
+
     fn export_metrics(&self) -> Option<serde_json::Value> {
         serde_json::to_value(self.export_model_catalog()).ok()
     }
@@ -1440,6 +1604,80 @@ mod tests {
 
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.unwrap(), "from-primary");
+    }
+
+    #[tokio::test]
+    async fn test_chat_returns_exact_provider_index_after_failover() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+        assert_eq!(resp.provider_index, Some(1));
+
+        let metadata = router.provider_metadata_for_index(resp.provider_index);
+        assert_eq!(metadata.provider, "fallback");
+        assert_eq!(metadata.model, "m2");
+        assert_eq!(metadata.display_label(), "fallback/m2");
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_emits_exact_provider_index_after_failover() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "primary",
+                    model: "m1",
+                    latency_ms: 0,
+                    fail: true,
+                    error_msg: "Primary",
+                }),
+                Arc::new(MockProvider {
+                    name: "fallback",
+                    model: "m2",
+                    latency_ms: 0,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[],
+            AdaptiveConfig {
+                probe_probability: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let mut stream = router
+            .chat_stream(&[], &[], &ChatConfig::default())
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("provider index event");
+        assert!(matches!(first, StreamEvent::ProviderIndex(1)));
+
+        let second = stream.next().await.expect("text event");
+        assert!(matches!(second, StreamEvent::TextDelta(ref text) if text == "from-fallback"));
     }
 
     #[tokio::test]
@@ -2112,6 +2350,110 @@ mod tests {
         // Next call should skip circuit-broken primary and go to fallback
         let resp = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_qos_ranking_changes_lane_selection() {
+        let router = AdaptiveRouter::new(
+            vec![
+                Arc::new(MockProvider {
+                    name: "priority-primary",
+                    model: "m1",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+                Arc::new(MockProvider {
+                    name: "quality-fallback",
+                    model: "m2",
+                    latency_ms: 10,
+                    fail: false,
+                    error_msg: "",
+                }),
+            ],
+            &[0.0, 0.0],
+            AdaptiveConfig::default(),
+        );
+        router.seed_catalog(&[
+            ModelCatalogEntry {
+                provider: "priority-primary/m1".into(),
+                model_type: ModelType::Strong,
+                stability: 1.0,
+                tool_avg_ms: 200,
+                p95_ms: 300,
+                score: 0.0,
+                cost_in: 0.0,
+                cost_out: 0.0,
+                ds_output: 1000,
+                context_window: 128_000,
+                max_output: 8_192,
+            },
+            ModelCatalogEntry {
+                provider: "quality-fallback/m2".into(),
+                model_type: ModelType::Strong,
+                stability: 1.0,
+                tool_avg_ms: 200,
+                p95_ms: 300,
+                score: 0.0,
+                cost_in: 0.0,
+                cost_out: 0.0,
+                ds_output: 5000,
+                context_window: 128_000,
+                max_output: 8_192,
+            },
+        ]);
+
+        router.set_mode(AdaptiveMode::Lane);
+        router.set_qos_ranking(false);
+        let without_qos = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(
+            without_qos.content.as_deref(),
+            Some("from-priority-primary")
+        );
+
+        router.set_qos_ranking(true);
+        let with_qos = router.chat(&[], &[], &ChatConfig::default()).await.unwrap();
+        assert_eq!(with_qos.content.as_deref(), Some("from-quality-fallback"));
+    }
+
+    #[test]
+    fn test_derive_cold_start_catalog_assigns_non_zero_scores() {
+        let catalog = derive_cold_start_catalog(
+            &[
+                ModelCatalogEntry {
+                    provider: "moonshot/kimi-k2.5".into(),
+                    model_type: ModelType::Strong,
+                    stability: 0.93,
+                    tool_avg_ms: 1200,
+                    p95_ms: 2200,
+                    score: 0.0,
+                    cost_in: 2.0,
+                    cost_out: 10.0,
+                    ds_output: 4200,
+                    context_window: 128_000,
+                    max_output: 8_192,
+                },
+                ModelCatalogEntry {
+                    provider: "deepseek/deepseek-chat".into(),
+                    model_type: ModelType::Fast,
+                    stability: 1.0,
+                    tool_avg_ms: 1400,
+                    p95_ms: 2600,
+                    score: 0.0,
+                    cost_in: 1.0,
+                    cost_out: 4.0,
+                    ds_output: 4300,
+                    context_window: 64_000,
+                    max_output: 8_192,
+                },
+            ],
+            &AdaptiveConfig::default(),
+            true,
+        );
+
+        assert_eq!(catalog.models.len(), 2);
+        assert!(catalog.models.iter().all(|model| model.score > 0.0));
+        assert_ne!(catalog.models[0].score, catalog.models[1].score);
     }
 
     /// Hedge mode should NOT race the same provider against itself.

@@ -184,6 +184,18 @@
             display: block; font-size: 13px; font-weight: 600;
             margin-bottom: 6px; color: var(--text-dim);
         }
+        .label-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .field-help {
+            display: inline-flex; align-items: center; justify-content: center;
+            width: 18px; height: 18px; border-radius: 999px;
+            border: 1px solid var(--border); background: var(--bg-card-hover);
+            color: var(--text-dim); font-size: 11px; font-weight: 700; cursor: help;
+        }
+        .field-help:focus { outline: 1px solid var(--accent); outline-offset: 2px; }
+        .doc-link {
+            font-size: 12px; color: var(--accent-light); text-decoration: none;
+        }
+        .doc-link:hover { text-decoration: underline; }
         .form-row { display: flex; gap: 8px; }
         .form-input {
             width: 100%; padding: 10px 14px; border-radius: 8px;
@@ -442,14 +454,14 @@
             <div class="step">
                 <h3 data-lang="en">Name Your Node</h3>
                 <h3 data-lang="zh">命名节点</h3>
-                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.octos-cloud.org). We generate your auth token and tunnel credentials.</p>
-                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.octos-cloud.org），系统自动生成认证令牌和隧道凭证。</p>
+                <p data-lang="en">Choose a subdomain for your Octos node (e.g. <b>alice</b>.<span data-configured-domain>your-cloud.example</span>). We generate the auth token, SSH tunnel port, public address, and one-line setup command for this registered machine.</p>
+                <p data-lang="zh">为你的 Octos 节点选择子域名（如 <b>alice</b>.<span data-configured-domain>your-cloud.example</span>），系统会为这台已注册机器生成认证令牌、SSH 隧道端口、公网地址和一行安装命令。</p>
             </div>
             <div class="step">
-                <h3 data-lang="en">Setup Mac Mini</h3>
-                <h3 data-lang="zh">配置 Mac Mini</h3>
-                <p data-lang="en">Run the one-line setup command on your Mac Mini. It installs octos, configures the tunnel, and starts all services.</p>
-                <p data-lang="zh">在你的 Mac Mini 上运行一行安装命令，自动安装 octos、配置隧道并启动所有服务。</p>
+                <h3 data-lang="en">Setup Your Machine</h3>
+                <h3 data-lang="zh">配置你的机器</h3>
+                <p data-lang="en">Run the one-line setup command on your Mac, Linux server, or Windows PC. It installs octos, configures the tunnel, and brings your public node online.</p>
+                <p data-lang="zh">在你的 Mac、Linux 服务器或 Windows 电脑上运行一行安装命令，自动安装 octos、配置隧道，并让你的公网节点上线。</p>
             </div>
             <div class="step">
                 <h3 data-lang="en">Go Live</h3>
@@ -481,6 +493,23 @@
                                 <span data-lang="zh">发送验证码</span>
                             </button>
                         </div>
+                        <p class="form-hint" data-lang="en">You can resend after 60 seconds. Each code stays valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">60 秒后可重新发送。每个验证码有效期为 5 分钟。</p>
+                    </div>
+                    <div class="form-group">
+                        <label class="label-row">
+                            <span data-lang="en">Node Name</span>
+                            <span data-lang="zh">节点名称</span>
+                            <span class="field-help" tabindex="0" data-lang="en" title="Node Name becomes your public subdomain and tenant id. Use 1 to 64 lowercase letters, numbers, or hyphens. Choose something stable and easy to remember, because reinstall and support flows may refer to the same name.">?</span>
+                            <span class="field-help" tabindex="0" data-lang="zh" title="节点名称会成为你的公网子域名和租户标识。请使用 1 到 64 位小写字母、数字或连字符。建议选择稳定、容易记住的名字，因为重装和排障时都会引用它。">?</span>
+                            <a class="doc-link" data-lang="en" href="https://octos-org.github.io/octos/installation.html#node-name-guidelines" target="_blank" rel="noreferrer">Naming guide</a>
+                            <a class="doc-link" data-lang="zh" href="https://octos-org.github.io/octos/zh/installation.html#node-name-guidelines" target="_blank" rel="noreferrer">命名说明</a>
+                        </label>
+                        <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
+                        <p class="form-hint">
+                            <span data-lang="en">Lowercase letters, numbers, hyphens. You can decide this while waiting for the email. It becomes <b>{name}.<span data-configured-domain>your-cloud.example</span></b></span>
+                            <span data-lang="zh">小写字母、数字、连字符。可以在等待邮件时先想好这个名字。将成为 <b>{name}.<span data-configured-domain>your-cloud.example</span></b></span>
+                        </p>
                     </div>
                     <div class="form-group">
                         <label>
@@ -488,24 +517,17 @@
                             <span data-lang="zh">验证码</span>
                         </label>
                         <input type="text" class="form-input" id="regCode" placeholder="123456" maxlength="6" pattern="[0-9]{6}" required>
-                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email.</p>
-                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。</p>
-                    </div>
-                    <div class="form-group">
-                        <label>
-                            <span data-lang="en">Node Name</span>
-                            <span data-lang="zh">节点名称</span>
-                        </label>
-                        <input type="text" class="form-input" id="regNode" placeholder="alice" pattern="[a-z0-9\-]+" required>
-                        <p class="form-hint">
-                            <span data-lang="en">Lowercase letters, numbers, hyphens. This becomes <b>{name}.octos-cloud.org</b></span>
-                            <span data-lang="zh">小写字母、数字、连字符。将成为 <b>{name}.octos-cloud.org</b></span>
-                        </p>
+                        <p class="form-hint" data-lang="en">Enter the 6-digit code sent to your email. The code remains valid for 5 minutes.</p>
+                        <p class="form-hint" data-lang="zh">输入发送到你邮箱的 6 位验证码。验证码在 5 分钟内有效。</p>
                     </div>
                     <button type="submit" class="btn btn-primary form-submit">
                         <span data-lang="en">Register &amp; Get Token</span>
                         <span data-lang="zh">注册并获取令牌</span>
                     </button>
+                    <p class="form-hint" id="registerStatus" style="display: none; margin-top: 10px;">
+                        <span data-lang="en">Creating your account...</span>
+                        <span data-lang="zh">正在创建你的账号...</span>
+                    </p>
                 </div>
             </form>
 
@@ -516,7 +538,7 @@
                     <span data-lang="zh">你的 Octos Cloud 账号已创建！</span>
                 </p>
                 <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
-                    <span data-lang="en">Dashboard URL</span><span data-lang="zh">面板地址</span>
+                    <span data-lang="en">Reserved Public URL</span><span data-lang="zh">预留公网地址</span>
                 </p>
                 <p style="margin-bottom: 12px;"><b id="resultUrl"></b></p>
                 <p style="margin-bottom: 4px; font-size: 13px; color: var(--text-dim);">
@@ -528,24 +550,37 @@
                 </p>
                 <p class="token" id="resultSshPort"></p>
                 <p style="margin-top: 16px; font-size: 13px; color: var(--text-dim);">
-                    <span data-lang="en">Run this on your Mac Mini to install octos + tunnel:</span>
-                    <span data-lang="zh">在你的 Mac Mini 上运行以下命令安装 octos + 隧道：</span>
+                    <span data-lang="en">Run this on your machine to install octos and activate the tunnel:</span>
+                    <span data-lang="zh">在你的机器上运行以下命令安装 octos 并启用隧道：</span>
                 </p>
-                <div style="background: var(--bg); border-radius: 8px; padding: 12px; margin-top: 8px; overflow-x: auto;">
-                    <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
+                <div style="margin-top: 8px;">
+                    <div style="display: flex; gap: 8px; margin-bottom: 4px; align-items: center;">
+                        <button onclick="showCmd('unix')" id="tabUnix" style="background: var(--green); color: var(--bg); border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">macOS / Linux</button>
+                        <button onclick="showCmd('win')" id="tabWin" style="background: var(--card); color: var(--text-dim); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">Windows</button>
+                        <button onclick="copySetupCommand()" id="copyCmdBtn" style="margin-left: auto; background: var(--card); color: var(--text); border: 1px solid var(--border); padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">
+                            <span data-lang="en">Copy</span>
+                            <span data-lang="zh">复制</span>
+                        </button>
+                    </div>
+                    <div style="background: var(--bg); border-radius: 8px; padding: 12px; overflow-x: auto;">
+                        <code id="resultCmd" style="font-size: 12px; color: var(--green); white-space: pre;"></code>
+                    </div>
+                    <p id="copyCmdStatus" style="display: none; margin-top: 8px; font-size: 12px; color: var(--text-dim);">
+                        <span data-lang="en">Copied to clipboard.</span>
+                        <span data-lang="zh">已复制到剪贴板。</span>
+                    </p>
                 </div>
-                <p style="margin-top: 12px; font-size: 12px; color: var(--text-dim);">
-                    <span data-lang="en">Note: You'll need the frps token from your admin to complete tunnel setup.</span>
-                    <span data-lang="zh">注意：你需要管理员提供的 frps 令牌来完成隧道配置。</span>
+                <p id="emailNote" style="margin-top: 12px; font-size: 12px; color: var(--text-dim); display: none;">
+                    <span data-lang="en">We also emailed the same setup command to you for reinstall and backup.</span>
+                    <span data-lang="zh">我们也将相同的安装命令通过邮件发送给了你，用于重装和备份。</span>
                 </p>
             </div>
         </div>
         <!-- Installation code block -->
         <div class="code-block">
-            <pre><span class="comment" data-lang="en"># After registration, run the install command on your Mac Mini:</span><span class="comment" data-lang="zh"># 注册完成后，在你的 Mac Mini 上运行安装命令：</span>
+            <pre><span class="comment" data-lang="en"># After registration, run the tenant setup script on your machine:</span><span class="comment" data-lang="zh"># 注册完成后，在你的机器上运行租户安装脚本：</span>
 
-<span class="cmd">curl -fsSL</span> https://github.com/octos-org/octos/releases/latest/download/install.sh <span class="cmd">| bash -s --</span> \
-  <span class="flag">--tenant-name</span> alice <span class="flag">--ssh-port</span> 6001 <span class="flag">--frps-token</span> &lt;token&gt;
+<span class="cmd">curl -fsSL</span> https://octos.bot/api/register/setup-script/&lt;tenant&gt;/&lt;auth-token&gt; <span class="cmd">| bash</span>
 
 <span class="output">  ==> Detecting platform
       OK: Darwin arm64 (aarch64-apple-darwin)
@@ -563,7 +598,7 @@
   ==> Installation complete!</span>
 
 <span class="comment" data-lang="en"># Your dashboard is live!</span><span class="comment" data-lang="zh"># 你的面板已上线！</span>
-<span class="cmd">open</span> https://alice.octos-cloud.org
+<span class="cmd">open</span> https://alice.<span data-configured-domain>your-cloud.example</span>
 
 <span class="comment" data-lang="en"># Troubleshoot anytime:</span><span class="comment" data-lang="zh"># 随时诊断问题：</span>
 <span class="cmd">curl</span> -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | <span class="cmd">bash</span> -s -- <span class="flag">--doctor</span></pre>
@@ -591,7 +626,7 @@
   <span class="gr">Internet</span>
      |
      v
-  <span class="hl">Caddy</span>  (octos-cloud.org, SSL)
+  <span class="hl">Caddy</span>  (<span data-configured-domain>your-cloud.example</span>, SSL)
      |
      v
   <span class="hl">frps</span>   (<span data-lang="en">tunnel relay</span><span data-lang="zh">隧道中继</span>)
@@ -652,6 +687,27 @@
 </footer>
 
 <script>
+const DEFAULT_CONFIGURED_DOMAIN = 'your-cloud.example';
+
+function applyConfiguredDomain(domain) {
+    const resolved = (domain || '').trim() || DEFAULT_CONFIGURED_DOMAIN;
+    document.querySelectorAll('[data-configured-domain]').forEach((el) => {
+        el.textContent = resolved;
+    });
+}
+
+async function loadConfiguredDomain() {
+    applyConfiguredDomain(DEFAULT_CONFIGURED_DOMAIN);
+    try {
+        const res = await fetch('/api/version');
+        if (!res.ok) return;
+        const data = await res.json();
+        applyConfiguredDomain(data.tunnel_domain || DEFAULT_CONFIGURED_DOMAIN);
+    } catch (e) {
+        console.log('load-configured-domain:', e.message);
+    }
+}
+
 // --- Theme toggle ---
 function toggleTheme() {
     const html = document.documentElement;
@@ -688,8 +744,70 @@ function toggleLang() {
     }
 })();
 
+loadConfiguredDomain();
+
+// --- Platform tab switching ---
+function showCmd(platform) {
+    const cmdEl = document.getElementById('resultCmd');
+    const tabUnix = document.getElementById('tabUnix');
+    const tabWin = document.getElementById('tabWin');
+    if (platform === 'win') {
+        cmdEl.textContent = window._setupCmdWin || '';
+        tabWin.style.background = 'var(--green)';
+        tabWin.style.color = 'var(--bg)';
+        tabWin.style.border = 'none';
+        tabUnix.style.background = 'var(--card)';
+        tabUnix.style.color = 'var(--text-dim)';
+        tabUnix.style.border = '1px solid var(--border)';
+    } else {
+        cmdEl.textContent = window._setupCmdUnix || '';
+        tabUnix.style.background = 'var(--green)';
+        tabUnix.style.color = 'var(--bg)';
+        tabUnix.style.border = 'none';
+        tabWin.style.background = 'var(--card)';
+        tabWin.style.color = 'var(--text-dim)';
+        tabWin.style.border = '1px solid var(--border)';
+    }
+}
+
+async function copySetupCommand() {
+    const cmd = document.getElementById('resultCmd').textContent.trim();
+    if (!cmd) return;
+
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(cmd);
+        } else {
+            const temp = document.createElement('textarea');
+            temp.value = cmd;
+            temp.setAttribute('readonly', '');
+            temp.style.position = 'absolute';
+            temp.style.left = '-9999px';
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand('copy');
+            document.body.removeChild(temp);
+        }
+
+        const status = document.getElementById('copyCmdStatus');
+        status.style.display = 'block';
+        window.clearTimeout(window._copyCmdStatusTimer);
+        window._copyCmdStatusTimer = window.setTimeout(() => {
+            status.style.display = 'none';
+        }, 1800);
+    } catch (e) {
+        console.log('copy command:', e.message);
+    }
+}
+
 // --- Send verification code ---
 let codeTimer = null;
+function sendCodeCooldownLabel(sec) {
+    return document.body.getAttribute('data-active-lang') === 'zh'
+        ? `${sec}s后重发`
+        : `Resend in ${sec}s`;
+}
+
 async function sendCode() {
     const email = document.getElementById('regEmail').value.trim();
     if (!email || !email.includes('@')) {
@@ -700,10 +818,10 @@ async function sendCode() {
     const btn = document.getElementById('sendCodeBtn');
     btn.disabled = true;
     let sec = 60;
-    btn.textContent = sec + 's';
+    btn.textContent = sendCodeCooldownLabel(sec);
     codeTimer = setInterval(() => {
         sec--;
-        btn.textContent = sec + 's';
+        btn.textContent = sendCodeCooldownLabel(sec);
         if (sec <= 0) {
             clearInterval(codeTimer);
             btn.disabled = false;
@@ -731,11 +849,22 @@ async function sendCode() {
 // --- Register ---
 async function handleRegister(e) {
     e.preventDefault();
+    const form = document.getElementById('registerForm');
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const status = document.getElementById('registerStatus');
     const email = document.getElementById('regEmail').value.trim();
     const code = document.getElementById('regCode').value.trim();
     const node = document.getElementById('regNode').value.trim().toLowerCase();
 
     if (!email || !code || !node) return false;
+    if (submitBtn.disabled) return false;
+
+    const isZh = document.body.getAttribute('data-active-lang') === 'zh';
+    submitBtn.disabled = true;
+    submitBtn.style.opacity = '0.7';
+    submitBtn.style.cursor = 'wait';
+    submitBtn.innerHTML = isZh ? '正在创建...' : 'Creating account...';
+    status.style.display = 'block';
 
     try {
         // Step 1: Verify OTP
@@ -747,8 +876,7 @@ async function handleRegister(e) {
 
         if (!verifyRes.ok) {
             const msg = await verifyRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '验证失败: ' + msg : 'Verification failed: ' + msg);
+            alert(isZh ? '验证失败: ' + msg : 'Verification failed: ' + msg);
             return false;
         }
 
@@ -756,7 +884,7 @@ async function handleRegister(e) {
         const token = session.token || session.session_token || '';
 
         // Step 2: Create tenant
-        const tenantRes = await fetch('/api/admin/tenants', {
+        const tenantRes = await fetch('/api/register', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -767,32 +895,57 @@ async function handleRegister(e) {
 
         if (!tenantRes.ok) {
             const msg = await tenantRes.text();
-            alert(document.body.getAttribute('data-active-lang') === 'zh'
-                ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
+            alert(isZh ? '创建节点失败: ' + msg : 'Failed to create node: ' + msg);
             return false;
         }
 
         const tenant = await tenantRes.json();
 
+        // Always show the short hosted Unix bootstrap in the portal UI.
+        // This avoids regressing back to the older raw-flag install command.
+        const setupPath = tenant.id && tenant.auth_token
+            ? `/api/register/setup-script/${encodeURIComponent(tenant.id)}/${encodeURIComponent(tenant.auth_token)}`
+            : '';
+        window._setupCmdUnix = setupPath
+            ? `curl -fsSL "${window.location.origin}${setupPath}" | bash`
+            : (tenant.setup_command_unix || '');
+        window._setupCmdWin = tenant.setup_command_windows || '';
+
+        // Use dashboard URL from API response (includes correct tunnel domain)
+        const dashboardUrl = tenant.dashboard_url ||
+            ('https://' + tenant.subdomain + '.' + window.location.hostname);
+
         // Show result
         document.getElementById('formStep1').style.display = 'none';
         const result = document.getElementById('registerResult');
         result.style.display = 'block';
-        document.getElementById('resultUrl').textContent = 'https://' + tenant.subdomain + '.octos-cloud.org';
+        document.getElementById('resultUrl').textContent = dashboardUrl;
         document.getElementById('resultToken').textContent = tenant.auth_token;
         document.getElementById('resultSshPort').textContent = tenant.ssh_port;
-        document.getElementById('resultCmd').textContent =
-            'curl -fsSL https://github.com/octos-org/octos/releases/latest/download/install.sh | bash -s -- \\\n' +
-            '  --tenant-name ' + tenant.subdomain + ' \\\n' +
-            '  --auth-token ' + tenant.auth_token + ' \\\n' +
-            '  --ssh-port ' + tenant.ssh_port + ' \\\n' +
-            '  --frps-token <YOUR_FRPS_TOKEN>';
+
+        // Show email note only if server actually sent it
+        if (tenant.email_sent) {
+            document.getElementById('emailNote').style.display = 'block';
+        }
+
+        // Auto-detect OS and show appropriate command
+        const isWindows = navigator.platform.indexOf('Win') > -1;
+        showCmd(isWindows ? 'win' : 'unix');
 
     } catch (e) {
-        const isZh = document.body.getAttribute('data-active-lang') === 'zh';
         alert(isZh
             ? '注册服务暂不可用，请稍后重试。'
             : 'Registration service unavailable. Please try again later.');
+    } finally {
+        if (document.getElementById('formStep1').style.display !== 'none') {
+            submitBtn.disabled = false;
+            submitBtn.style.opacity = '';
+            submitBtn.style.cursor = '';
+            submitBtn.innerHTML = isZh
+                ? '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>'
+                : '<span data-lang="en">Register &amp; Get Token</span><span data-lang="zh">注册并获取令牌</span>';
+            status.style.display = 'none';
+        }
     }
     return false;
 }

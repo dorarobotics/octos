@@ -21,8 +21,10 @@ use crate::config::Config;
 /// Start the REST API server.
 #[derive(Debug, Args)]
 pub struct ServeCommand {
-    /// Port to listen on.
-    #[arg(short, long, default_value = "8080")]
+    /// Port to listen on. Default lives in IANA's Dynamic/Private range
+    /// (49152–65535) to avoid collisions with `http-alt` services like
+    /// Tomcat/Jenkins/ominix-api. See issue #417.
+    #[arg(short, long, default_value = "50080")]
     pub port: u16,
 
     /// Host address to bind to. Defaults to localhost for security.
@@ -75,27 +77,16 @@ impl ServeCommand {
             Some(p) => p.clone(),
             None => std::env::current_dir().wrap_err("failed to get current directory")?,
         };
+        // Resolve data directory once and treat it as the canonical home for
+        // runtime state and config unless an explicit --config path is given.
+        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
 
         let (config, resolved_config_path) = if let Some(config_path) = &self.config {
+            tracing::info!(path = %config_path.display(), "loading config (--config)");
             (Config::from_file(config_path)?, Some(config_path.clone()))
         } else {
-            // Resolve config path the same way Config::load does
-            let local_config = cwd.join(".octos").join("config.json");
-            if local_config.exists() {
-                (Config::from_file(&local_config)?, Some(local_config))
-            } else if let Some(global_config) = Config::global_config_path() {
-                if global_config.exists() {
-                    (Config::from_file(&global_config)?, Some(global_config))
-                } else {
-                    (Config::default(), None)
-                }
-            } else {
-                (Config::default(), None)
-            }
+            Config::load_with_path(&cwd, &data_dir)?
         };
-
-        // Resolve data directory (--data-dir > $OCTOS_HOME > ~/.octos)
-        let data_dir = super::resolve_data_dir(self.data_dir.clone())?;
         tracing::info!(data_dir = %data_dir.display(), "data directory resolved");
 
         let broadcaster = Arc::new(SseBroadcaster::new(256));
@@ -167,6 +158,10 @@ impl ServeCommand {
         // Initialize user store and auth manager for multi-user support
         let user_store = Arc::new(
             crate::user_store::UserStore::open(&data_dir).wrap_err("failed to open user store")?,
+        );
+        let allowlist_store = Arc::new(
+            crate::login_allowlist::LoginAllowlistStore::open(&data_dir)
+                .wrap_err("failed to open login allowlist store")?,
         );
         let auth_manager = {
             let auth_config = config.dashboard_auth.clone();
@@ -249,6 +244,7 @@ impl ServeCommand {
             profile_store: Some(profile_store.clone()),
             process_manager: Some(process_manager.clone()),
             user_store: Some(user_store),
+            allowlist_store: Some(allowlist_store),
             auth_manager,
             http_client: reqwest::Client::new(),
             config_path: resolved_config_path,
@@ -258,10 +254,21 @@ impl ServeCommand {
             tenant_store: crate::tenant::TenantStore::open(&data_dir)
                 .ok()
                 .map(Arc::new),
-            tunnel_domain: std::env::var("TUNNEL_DOMAIN").ok(),
-            frps_server: std::env::var("FRPS_SERVER").ok(),
+            run_id_cache: Arc::new(crate::api::RunIdCache::new()),
+            tunnel_domain: config
+                .tunnel_domain
+                .clone()
+                .or_else(|| std::env::var("TUNNEL_DOMAIN").ok()),
+            frps_server: config
+                .frps_server
+                .clone()
+                .or_else(|| std::env::var("FRPS_SERVER").ok()),
             frps_port: std::env::var("FRPS_PORT").ok().and_then(|p| p.parse().ok()),
+            deployment_mode: config.mode.clone(),
             allow_admin_shell: config.allow_admin_shell,
+            content_catalog_mgr: Some(Arc::new(
+                crate::content_catalog::ContentCatalogManager::new(profile_store.clone()),
+            )),
         });
 
         // Auto-start enabled profiles
@@ -275,6 +282,13 @@ impl ServeCommand {
         if enabled_count > 0 {
             for p in &profiles {
                 if p.enabled {
+                    if p.config.provider.is_none() && p.config.model.is_none() {
+                        tracing::warn!(
+                            profile = %p.id,
+                            "skipping auto-start: no LLM provider configured"
+                        );
+                        continue;
+                    }
                     tracing::info!(profile = %p.id, "auto-starting gateway");
                     if let Err(e) = process_manager.start(p).await {
                         tracing::warn!(profile = %p.id, error = %e, "failed to auto-start gateway");
@@ -551,7 +565,11 @@ impl ServeCommand {
                     .and_then(crate::config::detect_provider)
                     .map(String::from)
             })
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no LLM provider configured. Run `octos init` or set provider in config.json"
+                )
+            })?;
 
         let base_provider: Arc<dyn LlmProvider> =
             create_provider(&provider_name, config, model, base_url)?;
@@ -666,5 +684,34 @@ impl ServeCommand {
         ));
 
         Ok((agent, sessions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_mode_is_explicit_and_ignores_tunnel_settings() {
+        let config = Config {
+            mode: crate::config::DeploymentMode::Local,
+            tunnel_domain: Some("octos-cloud.org".to_string()),
+            frps_server: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(config.mode, crate::config::DeploymentMode::Local);
+    }
+
+    #[test]
+    fn deployment_mode_preserves_explicit_cloud_mode() {
+        let config = Config {
+            mode: crate::config::DeploymentMode::Cloud,
+            tunnel_domain: None,
+            frps_server: None,
+            ..Default::default()
+        };
+
+        assert_eq!(config.mode, crate::config::DeploymentMode::Cloud);
     }
 }

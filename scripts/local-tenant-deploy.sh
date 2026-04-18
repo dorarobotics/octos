@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local deployment for octos on macOS and Linux.
-# Usage: ./scripts/local-deploy.sh [OPTIONS]
+# Usage: ./scripts/local-tenant-deploy.sh [OPTIONS]
 #
 # Options:
 #   --minimal          CLI + chat only (no channels, no dashboard)
@@ -9,13 +9,14 @@
 #   --no-skills        Skip building app-skills
 #   --no-service       Skip launchd/systemd service setup
 #   --uninstall        Remove binaries and service files
+#   --purge            Delete the data dir
 #   --debug            Build in debug mode (faster, larger binary)
 #   --prefix DIR       Install prefix (default: ~/.cargo/bin)
 #
 # Tunnel options (auto-enabled with --full, set up frpc to connect to VPS relay):
 #   --no-tunnel              Skip frpc tunnel setup even in --full mode
 #   --tenant-name NAME       Tenant subdomain (e.g. "alice")
-#   --frps-token TOKEN       frps auth token
+#   --frps-token TOKEN       shared frps auth token
 #   --frps-server ADDR       frps server address (default: 163.192.33.32)
 #   --ssh-port PORT          SSH tunnel remote port (default: 6001)
 #   --domain DOMAIN          Tunnel domain (default: octos-cloud.org)
@@ -31,6 +32,7 @@ CHANNELS=""
 BUILD_SKILLS=true
 SETUP_SERVICE=true
 UNINSTALL=false
+PURGE=false
 PROFILE="release"
 PREFIX="${CARGO_HOME:-$HOME/.cargo}/bin"
 DATA_DIR="${OCTOS_HOME:-$HOME/.octos}"
@@ -52,6 +54,7 @@ while [ $# -gt 0 ]; do
         --no-skills)     BUILD_SKILLS=false; shift ;;
         --no-service)    SETUP_SERVICE=false; shift ;;
         --uninstall)     UNINSTALL=true; shift ;;
+        --purge)         PURGE=true; shift ;;
         --debug)         PROFILE="dev"; shift ;;
         --prefix)        PREFIX="${2:-$PREFIX}"; shift 2 ;;
         --no-tunnel)     SKIP_TUNNEL=true; shift ;;
@@ -78,41 +81,158 @@ ok()      { echo "    OK: $1"; }
 warn()    { echo "    WARN: $1"; }
 err()     { echo "    ERROR: $1"; exit 1; }
 
+detect_provider_defaults() {
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="anthropic"; DETECTED_MODEL="claude-sonnet-4-20250514"; DETECTED_ENV="ANTHROPIC_API_KEY"
+    elif [ -n "${GEMINI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="gemini"; DETECTED_MODEL="gemini-2.5-flash"; DETECTED_ENV="GEMINI_API_KEY"
+    elif [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="deepseek"; DETECTED_MODEL="deepseek-chat"; DETECTED_ENV="DEEPSEEK_API_KEY"
+    elif [ -n "${KIMI_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="moonshot"; DETECTED_MODEL="kimi-k2.5"; DETECTED_ENV="KIMI_API_KEY"
+    elif [ -n "${DASHSCOPE_API_KEY:-}" ]; then
+        DETECTED_PROVIDER="dashscope"; DETECTED_MODEL="qwen3.5-plus"; DETECTED_ENV="DASHSCOPE_API_KEY"
+    else
+        DETECTED_PROVIDER="openai"; DETECTED_MODEL="gpt-4.1-mini"; DETECTED_ENV="OPENAI_API_KEY"
+    fi
+}
+
+write_runtime_config() {
+    local config_path="$DATA_DIR/config.json"
+    local mode="local"
+    detect_provider_defaults
+
+    if { [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; } || [ -n "$TENANT_NAME" ] || [ -n "$FRPS_TOKEN" ]; then
+        mode="tenant"
+    fi
+
+    if [ -f "$config_path" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$config_path" "$mode" "$TUNNEL_DOMAIN" "$FRPS_SERVER" \
+            "$DETECTED_PROVIDER" "$DETECTED_MODEL" "$DETECTED_ENV" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+tunnel_domain = sys.argv[3]
+frps_server = sys.argv[4]
+provider = sys.argv[5]
+model = sys.argv[6]
+api_key_env = sys.argv[7]
+
+data = {}
+if config_path.exists():
+    with config_path.open() as fh:
+        data = json.load(fh)
+
+data.setdefault("provider", provider)
+data.setdefault("model", model)
+data.setdefault("api_key_env", api_key_env)
+data["mode"] = mode
+if mode == "tenant":
+    data["tunnel_domain"] = tunnel_domain
+    data["frps_server"] = frps_server
+else:
+    data.pop("tunnel_domain", None)
+    data.pop("frps_server", None)
+
+config_path.write_text(json.dumps(data, indent=2) + "\n")
+PYEOF
+    elif [ ! -f "$config_path" ]; then
+        local extra_config=""
+        if [ "$mode" = "tenant" ]; then
+            extra_config=$(cat <<EOF
+,
+  "tunnel_domain": "$TUNNEL_DOMAIN",
+  "frps_server": "$FRPS_SERVER"
+EOF
+)
+        fi
+        cat > "$config_path" <<EOF
+{
+  "provider": "$DETECTED_PROVIDER",
+  "model": "$DETECTED_MODEL",
+  "api_key_env": "$DETECTED_ENV",
+  "mode": "$mode"$extra_config
+}
+EOF
+    else
+        warn "python3 not found; leaving existing $config_path unchanged"
+        return 0
+    fi
+
+    chmod 600 "$config_path"
+    ok "runtime config: $config_path"
+}
+
+run_purge_data() {
+    section "Purging local data"
+    echo "    (sudo may be needed if previous runs created root-owned files)"
+    sudo rm -rf "$DATA_DIR"
+    ok "data directory removed"
+}
+
 # ── Uninstall ─────────────────────────────────────────────────────────
 if [ "$UNINSTALL" = true ]; then
     section "Uninstalling octos"
 
-    # Stop and remove service
-    echo "    (sudo is needed to remove the system service)"
+    # Stop and remove octos serve + frpc system services
+    echo "    (sudo is needed to remove the system services)"
     case "$OS" in
         Darwin)
             sudo launchctl unload /Library/LaunchDaemons/io.octos.serve.plist 2>/dev/null || true
             sudo rm -f /Library/LaunchDaemons/io.octos.serve.plist
+            sudo launchctl unload /Library/LaunchDaemons/io.octos.frpc.plist 2>/dev/null || true
+            sudo rm -f /Library/LaunchDaemons/io.octos.frpc.plist
             # Also clean up legacy LaunchAgent if present
             launchctl unload ~/Library/LaunchAgents/io.octos.octos-serve.plist 2>/dev/null || true
             rm -f ~/Library/LaunchAgents/io.octos.octos-serve.plist
-            ok "launchd service removed"
+            launchctl unload ~/Library/LaunchAgents/io.octos.frpc.plist 2>/dev/null || true
+            rm -f ~/Library/LaunchAgents/io.octos.frpc.plist
+            ok "launchd services removed"
             ;;
         Linux)
             sudo systemctl stop octos-serve.service 2>/dev/null || true
             sudo systemctl disable octos-serve.service 2>/dev/null || true
             sudo rm -f /etc/systemd/system/octos-serve.service
+            sudo systemctl stop frpc.service 2>/dev/null || true
+            sudo systemctl disable frpc.service 2>/dev/null || true
+            sudo rm -f /etc/systemd/system/frpc.service
             sudo systemctl daemon-reload 2>/dev/null || true
-            ok "systemd service removed"
+            ok "systemd services removed"
             ;;
     esac
 
     # Remove binaries
-    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather)
+    BINS=(octos news_fetch deep-search deep_crawl send_email account_manager clock weather frpc)
     for bin in "${BINS[@]}"; do
         rm -f "$PREFIX/$bin"
     done
+    sudo rm -f /usr/local/bin/frpc
+    sudo rm -f /etc/frp/frpc.toml
+    sudo rm -f /var/log/frpc.log
     ok "binaries removed from $PREFIX"
 
     echo ""
-    echo "Binaries and service files removed."
-    echo "Data directory ($DATA_DIR) was NOT removed. Delete manually if desired:"
-    echo "  rm -rf $DATA_DIR"
+    echo "Binaries, frpc config, and service files removed."
+    if [ "$PURGE" = true ]; then
+        run_purge_data
+    else
+        echo "Data directory ($DATA_DIR) was NOT removed."
+        echo "To remove it too, re-run with:"
+        echo "  bash scripts/local-tenant-deploy.sh --uninstall --purge"
+    fi
+    exit 0
+fi
+
+if [ "$PURGE" = true ]; then
+    run_purge_data
+    echo ""
+    echo "Local data removed."
+    echo "Installed binaries and services were preserved."
     exit 0
 fi
 
@@ -257,12 +377,18 @@ fi
 # ── Initialize ────────────────────────────────────────────────────────
 section "Initializing octos workspace"
 
-if [ ! -d "$DATA_DIR" ]; then
-    "$PREFIX/octos" init --defaults 2>/dev/null || "$PREFIX/octos" init 2>/dev/null || true
-    ok "created $DATA_DIR"
-else
-    ok "$DATA_DIR already exists (skipping init)"
-fi
+mkdir -p "$DATA_DIR"/{profiles,memory,sessions,skills,logs,research,history}
+write_runtime_config
+[ ! -f "$DATA_DIR/.gitignore" ] && cat > "$DATA_DIR/.gitignore" << 'EOF'
+# Ignore task state and database files
+tasks/
+sessions/
+*.redb
+EOF
+[ ! -f "$DATA_DIR/AGENTS.md" ] && printf '# Agent Instructions\n\nCustomize agent behavior and guidelines here.\n' > "$DATA_DIR/AGENTS.md"
+[ ! -f "$DATA_DIR/SOUL.md" ]   && printf '# Soul — Who You Are\n\n## Core Principles\n\n- Help, don'\''t perform. Skip filler phrases — just do the thing.\n- Be resourceful. Come back with answers, not questions.\n- Have a voice. You can disagree and suggest alternatives.\n- Match the medium. Telegram gets concise replies. CLI gets detail.\n\n## Trust & Safety\n\n- Private things stay private.\n- External actions need care. Internal actions are yours.\n- Never send half-finished replies to messaging channels.\n' > "$DATA_DIR/SOUL.md"
+[ ! -f "$DATA_DIR/USER.md" ]   && printf '# User Info\n\nAdd your information and preferences here.\n' > "$DATA_DIR/USER.md"
+ok "data dir ready: $DATA_DIR"
 
 # ── Service setup ─────────────────────────────────────────────────────
 if [ "$SETUP_SERVICE" = true ] && [ -n "$CLI_FEATURES" ]; then
@@ -426,17 +552,11 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     fi
 
     if [ -z "$FRPS_TOKEN" ]; then
-        TOKEN_FILE="$HOME/home/orcl-vps/frps-token.txt"
-        if [ -f "$TOKEN_FILE" ]; then
-            FRPS_TOKEN=$(cat "$TOKEN_FILE")
-            echo "    frps token loaded from $TOKEN_FILE"
-        else
-            echo ""
-            echo "    Enter the frps auth token (shared secret from VPS setup):"
-            printf "    > "
-            read -r FRPS_TOKEN < /dev/tty
-            [ -z "$FRPS_TOKEN" ] && err "frps token is required for tunnel setup"
-        fi
+        echo ""
+        echo "    Enter the shared frps auth token from your operator or cloud host:"
+        printf "    > "
+        read -r FRPS_TOKEN < /dev/tty
+        [ -z "$FRPS_TOKEN" ] && err "shared frps token is required for tunnel setup"
     fi
 
     # ── Show summary before proceeding ────────────────────────────────
@@ -444,7 +564,7 @@ if [ -n "$CLI_FEATURES" ] && [ "$SKIP_TUNNEL" = false ]; then
     echo ""
     echo "    Tenant:       ${TENANT_NAME}.${TUNNEL_DOMAIN}"
     echo "    frps server:  ${FRPS_SERVER}:7000"
-    echo "    frps token:   ${FRPS_TOKEN:0:8}..."
+    echo "    shared frps token: ${FRPS_TOKEN:0:8}..."
     echo "    SSH port:     ${SSH_PORT}"
     echo "    Local port:   8080"
     echo ""

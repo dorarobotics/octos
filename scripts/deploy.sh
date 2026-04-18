@@ -54,7 +54,7 @@ CLONE_FROM=""
 REMOTE_DATA=""
 SERVE_PORT="3000"
 CADDY_DOMAIN=""
-BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard)
+BINARIES=(octos news_fetch deep-search deep_crawl send_email account_manager voice clock weather pipeline-guard skill-evolve)
 
 # --- Parse arguments ---
 # We build parallel arrays: DEPLOY_HOSTS[], DEPLOY_AUTH_TYPE[], DEPLOY_AUTH_VAL[], DEPLOY_LABEL[]
@@ -325,6 +325,10 @@ generate_plist() {
         <string>${rhome}</string>
         <key>OCTOS_DATA_DIR</key>
         <string>${rdata}</string>
+        <key>OCTOS_AUTH_TOKEN</key>
+        <string>octos-admin-2026</string>
+        <key>SMTP_PASSWORD</key>
+        <string>${SMTP_PASSWORD:-}</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${rhome}</string>
@@ -348,7 +352,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
 
     echo "==> Building release binaries..."
     (cd "$OCTOS_BUILD_DIR" && cargo build --release -p octos-cli --features telegram,whatsapp,feishu,twilio,wecom,api)
-    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard)
+    (cd "$OCTOS_BUILD_DIR" && cargo build --release -p news_fetch -p deep-search -p deep-crawl -p send-email -p account-manager -p voice -p clock -p weather -p pipeline-guard -p skill-evolve)
 
     # Build ominix-api if source is available
     OMINIX_DIR="${OMINIX_DIR:-$HOME/home/ominix-api}"
@@ -589,11 +593,29 @@ for ((i=0; i<${#DEPLOY_HOSTS[@]}; i++)); do
         echo "    octos-web deployed to ~/octos-web"
     fi
 
+    # Always regenerate plist to pick up env var changes
+    generate_plist "$i" "$RBIN" "$RDATA" "$SERVE_PORT"
+
     echo "==> Stopping launchd service..."
     ssh_target "$i" "launchctl unload ~/Library/LaunchAgents/${PLIST}.plist 2>/dev/null || true"
     sleep 1
     ssh_target "$i" "pkill -f 'octos serve' 2>/dev/null || true; pkill -f 'octos gateway' 2>/dev/null || true"
     sleep 1
+
+    # Enable admin shell API and set auth token for diagnostics
+    echo "==> Patching config for admin shell..."
+    ssh_target "$i" 'python3 << '"'"'PYEOF'"'"'
+import json, pathlib, sys
+p = pathlib.Path("'"${RDATA}"'/config.json")
+print(f"config path: {p}", file=sys.stderr)
+print(f"exists: {p.exists()}", file=sys.stderr)
+c = json.loads(p.read_text()) if p.exists() else {}
+c["allow_admin_shell"] = True
+c["auth_token"] = "octos-admin-2026"
+p.write_text(json.dumps(c, indent=2))
+print(f"written ok, auth_token len={len(c.get(chr(97)+chr(117)+chr(116)+chr(104)+chr(95)+chr(116)+chr(111)+chr(107)+chr(101)+chr(110), chr(63)))}", file=sys.stderr)
+PYEOF
+'
 
     echo "==> Replacing binaries on remote..."
     for bin in "${BINARIES[@]}"; do

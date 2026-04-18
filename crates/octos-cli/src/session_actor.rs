@@ -5,13 +5,32 @@
 //! to the wrong chat.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
-use octos_agent::tools::{MessageTool, SendFileTool, SpawnTool, ToolPolicy, ToolRegistry};
-use octos_agent::{Agent, AgentConfig, HookContext, HookExecutor, TokenTracker};
-use octos_bus::{ActiveSessionStore, SessionHandle, SessionManager};
+use metrics::counter;
+use octos_agent::tools::spawn::{
+    ChildSessionFailureAction, ChildSessionLifecycleKind, ChildSessionLifecyclePayload,
+};
+use octos_agent::tools::{
+    BackgroundResultKind, BackgroundResultPayload, CheckBackgroundTasksTool, MessageTool,
+    SendFileTool, SpawnTool, ToolPolicy, ToolRegistry,
+};
+use octos_agent::{
+    Agent, AgentConfig, HookContext, HookExecutor, TaskSupervisor, TokenTracker,
+    TurnAttachmentContext, WorkspacePolicy, read_workspace_policy, workspace_policy_path,
+    write_workspace_policy,
+};
+use octos_bus::{
+    ActiveSessionStore, SessionHandle, SessionManager,
+    session::{
+        ChildSessionContract, ChildSessionFailureAction as PersistedChildSessionFailureAction,
+        ChildSessionJoinState, ChildSessionTerminalState,
+    },
+};
 use octos_core::AgentId;
 use octos_core::{
     InboundMessage, MAIN_PROFILE_ID, METADATA_SENDER_USER_ID, Message, MessageRole,
@@ -22,18 +41,21 @@ use octos_llm::{
     ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::config::QueueMode;
 use crate::cron_tool::CronTool;
 use crate::status_layers::{StatusComposer, UserStatusConfig};
+use crate::workflow_runtime::{WorkflowInstance, WorkflowKind};
 
 /// Parameters for dispatching an inbound message to a session actor.
 pub struct DispatchParams<'a> {
     pub message: InboundMessage,
     pub image_media: Vec<String>,
+    pub attachment_media: Vec<String>,
+    pub attachment_prompt: Option<String>,
     pub session_key: SessionKey,
     pub reply_channel: &'a str,
     pub reply_chat_id: &'a str,
@@ -78,14 +100,906 @@ const MAX_OVERFLOW_TASKS: u32 = 5;
 /// Maximum number of pending messages buffered per inactive session.
 const MAX_PENDING_PER_SESSION: usize = 50;
 
+/// Bound actor inbox send/ack waits for background terminal delivery.
+const BACKGROUND_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound live outbound fanout so persistence never waits indefinitely on a slow channel.
+const BACKGROUND_RESULT_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PersistedSessionMessage {
+    seq: usize,
+    timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+async fn persist_assistant_message(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    session_key: &SessionKey,
+    content: String,
+    media: Vec<String>,
+) -> Option<PersistedSessionMessage> {
+    let mut assistant_msg = Message::assistant(content);
+    assistant_msg.media = media;
+    let timestamp = assistant_msg.timestamp;
+
+    let mut handle = session_handle.lock().await;
+    match handle.add_message_with_seq(assistant_msg).await {
+        Ok(seq) => Some(PersistedSessionMessage { seq, timestamp }),
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to persist assistant message"
+            );
+            None
+        }
+    }
+}
+
+fn persisted_session_result_metadata(
+    session_key: &SessionKey,
+    persisted: &PersistedSessionMessage,
+    content: &str,
+    media: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "topic": session_key.topic(),
+        "_history_persisted": true,
+        "_session_result": {
+            "seq": persisted.seq,
+            "role": "assistant",
+            "content": content,
+            "timestamp": persisted.timestamp.to_rfc3339(),
+            "media": media,
+        }
+    })
+}
+
+fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
+    let topic = session_key.topic()?;
+    let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
+    let expected = crate::project_templates::build_site_project_metadata(
+        profile_id,
+        session_key.chat_id(),
+        topic,
+        user_workspace,
+    )?;
+    let project_dir = user_workspace.join(&expected.project_dir);
+    crate::project_templates::read_site_project_metadata(&project_dir)
+        .map(|metadata| metadata.preview_url)
+        .or(Some(expected.preview_url))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn normalize_session_result_media_path(
+    user_workspace: &Path,
+    data_dir: &Path,
+    path: &Path,
+) -> String {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        user_workspace.join(path)
+    };
+
+    std::fs::canonicalize(&resolved)
+        .or_else(|_| {
+            if path.is_relative() {
+                std::fs::canonicalize(data_dir.join(path))
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "absolute path not found",
+                ))
+            }
+        })
+        .unwrap_or(resolved)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn fallback_session_result_media_paths(
+    session_key: &SessionKey,
+    user_workspace: &Path,
+    data_dir: &Path,
+    files_modified: &[PathBuf],
+) -> Vec<String> {
+    let is_slides = session_key
+        .topic()
+        .is_some_and(|topic| topic == "slides" || topic.starts_with("slides "));
+    if !is_slides {
+        return Vec::new();
+    }
+
+    files_modified
+        .iter()
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pptx"))
+        .map(|path| normalize_session_result_media_path(user_workspace, data_dir, path))
+        .collect()
+}
+
+fn fallback_session_result_media_from_messages(
+    session_key: &SessionKey,
+    user_workspace: &Path,
+    data_dir: &Path,
+    messages: &[Message],
+) -> Vec<String> {
+    let is_slides = session_key
+        .topic()
+        .is_some_and(|topic| topic == "slides" || topic.starts_with("slides "));
+    if !is_slides {
+        return Vec::new();
+    }
+
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::Tool)
+        .flat_map(|message| message.content.lines().rev())
+        .find_map(|line| {
+            line.strip_prefix("Generated PPTX: ")
+                .or_else(|| line.strip_prefix("Generated: "))
+                .map(|raw| {
+                    normalize_session_result_media_path(
+                        user_workspace,
+                        data_dir,
+                        Path::new(raw.trim()),
+                    )
+                })
+        })
+        .into_iter()
+        .collect()
+}
+
+fn finalize_assistant_content(
+    session_key: &SessionKey,
+    user_workspace: &Path,
+    content: &str,
+) -> String {
+    let is_site = session_key
+        .topic()
+        .is_some_and(|topic| topic == "site" || topic.starts_with("site "));
+    if !is_site || content.trim().is_empty() || content.contains("/api/preview/") {
+        return content.to_string();
+    }
+
+    let Some(preview_url) = site_preview_url_for_session(session_key, user_workspace) else {
+        return content.to_string();
+    };
+
+    format!("{content}\n\nPreview URL: {preview_url}")
+}
+
+async fn send_outbound_with_timeout(
+    session_key: &SessionKey,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    message: OutboundMessage,
+    fanout_kind: &'static str,
+) -> bool {
+    match tokio::time::timeout(BACKGROUND_RESULT_FANOUT_TIMEOUT, out_tx.send(message)).await {
+        Ok(Ok(())) => {
+            record_result_delivery(fanout_kind, "sent", "assistant");
+            true
+        }
+        Ok(Err(error)) => {
+            record_result_delivery(fanout_kind, "channel_closed", "assistant");
+            warn!(
+                session = %session_key,
+                error = %error,
+                fanout_kind,
+                "failed to fan out outbound message"
+            );
+            false
+        }
+        Err(_) => {
+            record_result_delivery(fanout_kind, "timeout", "assistant");
+            warn!(
+                session = %session_key,
+                timeout_ms = BACKGROUND_RESULT_FANOUT_TIMEOUT.as_millis(),
+                fanout_kind,
+                "timed out while fanning out outbound message"
+            );
+            false
+        }
+    }
+}
+
+async fn persist_terminal_reply_and_fanout(
+    session_handle: &Arc<Mutex<SessionHandle>>,
+    session_key: &SessionKey,
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    channel: &str,
+    chat_id: &str,
+    reply_to: Option<String>,
+    content: String,
+    media: Vec<String>,
+) -> bool {
+    let Some(_persisted) =
+        persist_assistant_message(session_handle, session_key, content.clone(), media.clone())
+            .await
+    else {
+        record_result_delivery("terminal_reply", "history_not_persisted", "assistant");
+        warn!(
+            session = %session_key,
+            "skipping live fanout because terminal reply was not persisted"
+        );
+        return false;
+    };
+
+    send_outbound_with_timeout(
+        session_key,
+        out_tx,
+        OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content,
+            reply_to,
+            media,
+            metadata: serde_json::json!({}),
+        },
+        "terminal_reply",
+    )
+    .await
+}
+
+const CHILD_SESSION_HISTORY_COPY: usize = 6;
+
+fn child_session_lifecycle_kind_label(kind: ChildSessionLifecycleKind) -> &'static str {
+    match kind {
+        ChildSessionLifecycleKind::Spawned => "spawned",
+        ChildSessionLifecycleKind::Completed => "completed",
+        ChildSessionLifecycleKind::RetryableFailed => "retryable_failed",
+        ChildSessionLifecycleKind::TerminalFailed => "terminal_failed",
+    }
+}
+
+fn record_child_session_lifecycle(kind: ChildSessionLifecycleKind, outcome: &'static str) {
+    counter!(
+        "octos_child_session_lifecycle_total",
+        "kind" => child_session_lifecycle_kind_label(kind).to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+fn record_timeout(reason: &'static str) {
+    counter!("octos_timeout_total", "reason" => reason.to_string()).increment(1);
+}
+
+fn record_retry(reason: &'static str) {
+    counter!("octos_retry_total", "reason" => reason.to_string()).increment(1);
+}
+
+fn record_result_delivery(path: &'static str, outcome: &'static str, kind: &'static str) {
+    counter!(
+        "octos_result_delivery_total",
+        "path" => path.to_string(),
+        "outcome" => outcome.to_string(),
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+fn child_session_spawn_note(payload: &ChildSessionLifecyclePayload) -> String {
+    let mut lines = vec![
+        format!(
+            "[Background child session created for \"{}\"]",
+            payload.task_label
+        ),
+        format!("Parent session: {}", payload.parent_session_key),
+        format!("Child session: {}", payload.child_session_key),
+    ];
+    if let Some(ref workflow_kind) = payload.workflow_kind {
+        lines.push(format!("Workflow: {workflow_kind}"));
+    }
+    if let Some(ref phase) = payload.current_phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    lines.push(format!("Instruction: {}", payload.instruction));
+    lines.join("\n")
+}
+
+fn child_session_terminal_state(
+    kind: ChildSessionLifecycleKind,
+) -> Option<ChildSessionTerminalState> {
+    match kind {
+        ChildSessionLifecycleKind::Completed => Some(ChildSessionTerminalState::Completed),
+        ChildSessionLifecycleKind::RetryableFailed => {
+            Some(ChildSessionTerminalState::RetryableFailure)
+        }
+        ChildSessionLifecycleKind::TerminalFailed => {
+            Some(ChildSessionTerminalState::TerminalFailure)
+        }
+        ChildSessionLifecycleKind::Spawned => None,
+    }
+}
+
+fn child_session_failure_action_label(action: ChildSessionFailureAction) -> &'static str {
+    match action {
+        ChildSessionFailureAction::Retry => "retry",
+        ChildSessionFailureAction::Escalate => "escalate",
+    }
+}
+
+fn persisted_child_session_failure_action(
+    action: ChildSessionFailureAction,
+) -> PersistedChildSessionFailureAction {
+    match action {
+        ChildSessionFailureAction::Retry => PersistedChildSessionFailureAction::Retry,
+        ChildSessionFailureAction::Escalate => PersistedChildSessionFailureAction::Escalate,
+    }
+}
+
+fn child_session_terminal_note(
+    payload: &ChildSessionLifecyclePayload,
+    join_state: ChildSessionJoinState,
+) -> String {
+    let mut lines = vec![match payload.kind {
+        ChildSessionLifecycleKind::Completed => {
+            format!("Background task \"{}\" completed.", payload.task_label)
+        }
+        ChildSessionLifecycleKind::RetryableFailed => {
+            format!(
+                "Background task \"{}\" failed and may be retried.",
+                payload.task_label
+            )
+        }
+        ChildSessionLifecycleKind::TerminalFailed => {
+            format!("Background task \"{}\" failed.", payload.task_label)
+        }
+        ChildSessionLifecycleKind::Spawned => {
+            format!("Background task \"{}\" spawned.", payload.task_label)
+        }
+    }];
+    if let Some(ref workflow_kind) = payload.workflow_kind {
+        lines.push(format!("Workflow: {workflow_kind}"));
+    }
+    if let Some(ref phase) = payload.current_phase {
+        lines.push(format!("Phase: {phase}"));
+    }
+    lines.push(format!(
+        "Join state: {}",
+        match join_state {
+            ChildSessionJoinState::Joined => "joined",
+            ChildSessionJoinState::Orphaned => "orphaned",
+        }
+    ));
+    if let Some(action) = payload.failure_action {
+        lines.push(format!(
+            "Failure action: {}",
+            child_session_failure_action_label(action)
+        ));
+        lines.push(
+            match action {
+                ChildSessionFailureAction::Retry => {
+                    "Next step: retry from the parent session when prerequisites recover."
+                }
+                ChildSessionFailureAction::Escalate => {
+                    "Next step: escalate to the parent session or user; do not blindly retry."
+                }
+            }
+            .to_string(),
+        );
+    }
+    if !payload.output_files.is_empty() {
+        lines.push("Output files:".to_string());
+        lines.extend(payload.output_files.iter().map(|path| format!("- {path}")));
+    }
+    if let Some(ref error) = payload.error {
+        lines.push(format!("Error: {error}"));
+    }
+    lines.join("\n")
+}
+
+async fn persist_child_session_lifecycle(
+    data_dir: &Path,
+    payload: &ChildSessionLifecyclePayload,
+) -> eyre::Result<bool> {
+    let parent_key = SessionKey(payload.parent_session_key.clone());
+    let child_key = SessionKey(payload.child_session_key.clone());
+    let parent_exists = SessionHandle::session_exists(data_dir, &parent_key);
+
+    match payload.kind {
+        ChildSessionLifecycleKind::Spawned => {
+            SessionHandle::fork_from_parent_if_missing(
+                data_dir,
+                &parent_key,
+                &child_key,
+                CHILD_SESSION_HISTORY_COPY,
+            )
+            .await?;
+
+            let note = child_session_spawn_note(payload);
+            let mut child = SessionHandle::open(data_dir, &child_key);
+            let exists = child
+                .session()
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::System && message.content == note);
+            if !exists {
+                child.add_message(Message::system(note)).await?;
+            }
+
+            let contract = ChildSessionContract {
+                task_id: payload.task_id.clone(),
+                task_label: payload.task_label.clone(),
+                parent_session_key: payload.parent_session_key.clone(),
+                child_session_key: payload.child_session_key.clone(),
+                workflow_kind: payload.workflow_kind.clone(),
+                current_phase: payload.current_phase.clone(),
+                terminal_state: None,
+                join_state: None,
+                joined_at: None,
+                failure_action: None,
+                error: None,
+                output_files: Vec::new(),
+            };
+            let _ = child.upsert_child_contract(contract.clone()).await?;
+            if parent_exists {
+                let mut parent = SessionHandle::open(data_dir, &parent_key);
+                let _ = parent.upsert_child_contract(contract).await?;
+            }
+            record_child_session_lifecycle(ChildSessionLifecycleKind::Spawned, "persisted");
+            return Ok(parent_exists);
+        }
+        ChildSessionLifecycleKind::Completed
+        | ChildSessionLifecycleKind::RetryableFailed
+        | ChildSessionLifecycleKind::TerminalFailed => {
+            if parent_exists {
+                SessionHandle::fork_from_parent_if_missing(
+                    data_dir,
+                    &parent_key,
+                    &child_key,
+                    CHILD_SESSION_HISTORY_COPY,
+                )
+                .await?;
+            }
+            let terminal_state = child_session_terminal_state(payload.kind)
+                .expect("terminal child lifecycle should have a state");
+            let join_state = if parent_exists {
+                ChildSessionJoinState::Joined
+            } else {
+                ChildSessionJoinState::Orphaned
+            };
+            let note = child_session_terminal_note(payload, join_state.clone());
+            let mut child = SessionHandle::open(data_dir, &child_key);
+            let exists =
+                child.session().messages.iter().any(|message| {
+                    message.role == MessageRole::Assistant && message.content == note
+                });
+            if !exists {
+                child.add_message(Message::assistant(note)).await?;
+            }
+            let contract = ChildSessionContract {
+                task_id: payload.task_id.clone(),
+                task_label: payload.task_label.clone(),
+                parent_session_key: payload.parent_session_key.clone(),
+                child_session_key: payload.child_session_key.clone(),
+                workflow_kind: payload.workflow_kind.clone(),
+                current_phase: payload.current_phase.clone(),
+                terminal_state: Some(terminal_state),
+                join_state: Some(join_state.clone()),
+                joined_at: if matches!(join_state, ChildSessionJoinState::Joined) {
+                    Some(chrono::Utc::now())
+                } else {
+                    None
+                },
+                failure_action: payload
+                    .failure_action
+                    .map(persisted_child_session_failure_action),
+                error: payload.error.clone(),
+                output_files: payload.output_files.clone(),
+            };
+            let _ = child.upsert_child_contract(contract.clone()).await?;
+            if parent_exists {
+                let mut parent = SessionHandle::open(data_dir, &parent_key);
+                let _ = parent.upsert_child_contract(contract).await?;
+            }
+            record_child_session_lifecycle(
+                payload.kind,
+                if matches!(join_state, ChildSessionJoinState::Joined) {
+                    "joined"
+                } else {
+                    "orphaned"
+                },
+            );
+            return Ok(matches!(join_state, ChildSessionJoinState::Joined));
+        }
+    }
+}
+
+fn resolve_builtin_slides_styles_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let current_profile_id = data_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let family_root_profile = current_profile_id
+        .as_deref()
+        .and_then(|value| value.split("--").next())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let octos_home = data_dir
+        .ancestors()
+        .nth(3)
+        .map(std::path::Path::to_path_buf);
+
+    let mut candidates = Vec::new();
+    candidates.push(data_dir.join("skills").join("mofa-slides").join("styles"));
+
+    if let Some(ref home) = octos_home {
+        candidates.push(home.join("skills").join("mofa-slides").join("styles"));
+
+        if let Some(ref root_profile) = family_root_profile {
+            candidates.push(
+                home.join("profiles")
+                    .join(root_profile)
+                    .join("data")
+                    .join("skills")
+                    .join("mofa-slides")
+                    .join("styles"),
+            );
+        }
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_dir())
+}
+
 /// Shared buffer of outbound messages from inactive sessions, keyed by session key string.
 /// Flushed when the user switches to that session via `/s`.
 pub type PendingMessages = Arc<Mutex<HashMap<String, Vec<OutboundMessage>>>>;
+
+/// Shared lookup table for session-scoped background task supervisors.
+#[derive(Default, Clone)]
+pub struct SessionTaskQueryStore {
+    supervisors: Arc<StdMutex<HashMap<String, SessionTaskQueryEntry>>>,
+}
+
+struct SessionTaskQueryEntry {
+    supervisor: Weak<TaskSupervisor>,
+    data_dir: PathBuf,
+}
+
+fn task_response_path(data_dir: &Path, path: &str) -> String {
+    octos_bus::file_handle::encode_profile_file_handle(data_dir, Path::new(path))
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn task_runtime_detail_for_response(
+    detail: Option<&str>,
+) -> (serde_json::Value, Option<String>, Option<String>) {
+    let runtime_detail = match detail {
+        Some(detail) => serde_json::from_str(detail)
+            .unwrap_or_else(|_| serde_json::Value::String(detail.to_string())),
+        None => serde_json::Value::Null,
+    };
+    let workflow_kind = runtime_detail
+        .get("workflow_kind")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let current_phase = runtime_detail
+        .get("current_phase")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    (runtime_detail, workflow_kind, current_phase)
+}
+
+fn sanitize_task_for_response(
+    data_dir: &Path,
+    task: &octos_agent::BackgroundTask,
+) -> serde_json::Value {
+    let (runtime_detail, workflow_kind, current_phase) =
+        task_runtime_detail_for_response(task.runtime_detail.as_deref());
+    serde_json::json!({
+        "id": task.id,
+        "tool_name": task.tool_name,
+        "tool_call_id": task.tool_call_id,
+        "parent_session_key": task.parent_session_key,
+        "child_session_key": task.child_session_key,
+        "status": task.status,
+        "started_at": task.started_at,
+        "updated_at": task.updated_at,
+        "completed_at": task.completed_at,
+        "runtime_state": task.runtime_state,
+        "runtime_detail": runtime_detail,
+        "workflow_kind": workflow_kind,
+        "current_phase": current_phase,
+        "child_terminal_state": task.child_terminal_state,
+        "child_join_state": task.child_join_state,
+        "child_joined_at": task.child_joined_at,
+        "child_failure_action": task.child_failure_action,
+        "output_files": task.output_files.iter().map(|path| task_response_path(data_dir, path)).collect::<Vec<_>>(),
+        "error": task.error,
+        "session_key": task.session_key,
+    })
+}
+
+impl SessionTaskQueryStore {
+    pub fn register(
+        &self,
+        session_key: &SessionKey,
+        supervisor: &Arc<TaskSupervisor>,
+        data_dir: &Path,
+    ) {
+        let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+        guard.insert(
+            session_key.to_string(),
+            SessionTaskQueryEntry {
+                supervisor: Arc::downgrade(supervisor),
+                data_dir: data_dir.to_path_buf(),
+            },
+        );
+    }
+
+    pub fn query_json(&self, session_key: &str) -> serde_json::Value {
+        let upgraded = {
+            let mut guard = self.supervisors.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get(session_key).and_then(|entry| {
+                entry
+                    .supervisor
+                    .upgrade()
+                    .map(|supervisor| (supervisor, entry.data_dir.clone()))
+            }) {
+                Some(entry) => Some(entry),
+                None => {
+                    guard.remove(session_key);
+                    None
+                }
+            }
+        };
+
+        match upgraded {
+            Some((supervisor, data_dir)) => serde_json::Value::Array(
+                supervisor
+                    .get_tasks_for_session(session_key)
+                    .iter()
+                    .map(|task| sanitize_task_for_response(&data_dir, task))
+                    .collect(),
+            ),
+            None => serde_json::json!([]),
+        }
+    }
+}
 
 fn system_notice_metadata(sender_user_id: Option<&str>) -> serde_json::Value {
     sender_user_id
         .map(|uid| serde_json::json!({ METADATA_SENDER_USER_ID: uid }))
         .unwrap_or_else(|| serde_json::json!({}))
+}
+
+async fn dispatch_background_result_to_actor(
+    tx: mpsc::Sender<ActorMessage>,
+    payload: BackgroundResultPayload,
+) -> bool {
+    let task_label = payload.task_label.clone();
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let send_result = tokio::time::timeout(
+        BACKGROUND_RESULT_ACK_TIMEOUT,
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: payload.task_label,
+            content: payload.content,
+            kind: payload.kind,
+            media: payload.media,
+            ack: Some(ack_tx),
+        }),
+    )
+    .await;
+
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            record_retry("background_result_actor_closed");
+            warn!(
+                task_label,
+                error = %error,
+                "failed to enqueue background result into session actor"
+            );
+            return false;
+        }
+        Err(_) => {
+            record_retry("background_result_enqueue_timeout");
+            warn!(
+                task_label,
+                timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
+                "timed out enqueuing background result into session actor"
+            );
+            return false;
+        }
+    }
+
+    match tokio::time::timeout(BACKGROUND_RESULT_ACK_TIMEOUT, ack_rx).await {
+        Ok(Ok(persisted)) => persisted,
+        Ok(Err(_)) => {
+            record_retry("background_result_ack_channel_closed");
+            warn!(
+                task_label,
+                "background result actor acknowledgment channel closed"
+            );
+            false
+        }
+        Err(_) => {
+            record_retry("background_result_ack_timeout");
+            warn!(
+                task_label,
+                timeout_ms = BACKGROUND_RESULT_ACK_TIMEOUT.as_millis(),
+                "timed out waiting for background result actor acknowledgment"
+            );
+            false
+        }
+    }
+}
+
+fn git_turn_summary(content: &str) -> String {
+    let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "agent turn update".to_string()
+    } else {
+        compact
+    }
+}
+
+fn merge_attachment_prompt_summaries(
+    existing: Option<String>,
+    incoming: Option<String>,
+) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
+fn merge_optional_text(existing: Option<String>, incoming: Option<String>) -> Option<String> {
+    match (existing, incoming) {
+        (Some(mut existing), Some(incoming)) => {
+            if !incoming.is_empty() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&incoming);
+            }
+            Some(existing)
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
+async fn snapshot_workspace_turn_for_path(
+    session_key: &SessionKey,
+    workspace_root: std::path::PathBuf,
+    turn_summary: &str,
+) -> Option<String> {
+    let turn_summary = git_turn_summary(turn_summary);
+
+    match tokio::task::spawn_blocking(move || {
+        octos_agent::snapshot_workspace_turn(&workspace_root, &turn_summary)
+    })
+    .await
+    {
+        Ok(Ok(report)) => {
+            if !report.committed.is_empty() {
+                info!(
+                    session = %session_key,
+                    repos = ?report.committed,
+                    "workspace turn snapshot committed"
+                );
+            }
+            if report.enforced_failures.is_empty() && report.validation_failures.is_empty() {
+                return None;
+            }
+
+            if !report.validation_failures.is_empty() {
+                warn!(
+                    session = %session_key,
+                    failures = ?report.validation_failures,
+                    "workspace contract validation failed"
+                );
+            }
+
+            let enforcement_notice = if report.enforced_failures.is_empty() {
+                None
+            } else {
+                let repo_labels = report
+                    .enforced_failures
+                    .iter()
+                    .map(|failure| failure.repo_label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let first_error = report
+                    .enforced_failures
+                    .first()
+                    .map(|failure| failure.error.as_str())
+                    .unwrap_or("unknown error");
+                warn!(
+                    session = %session_key,
+                    failures = ?report.enforced_failures,
+                    "workspace turn snapshot enforcement failed"
+                );
+                Some(format!(
+                    "Workspace versioning failed for {repo_labels}. Turn snapshot was not recorded.\nError: {first_error}"
+                ))
+            };
+
+            let validation_notice = if report.validation_failures.is_empty() {
+                None
+            } else {
+                let failures = report
+                    .validation_failures
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "{} [{}] {}: {}",
+                            failure.repo_label,
+                            match failure.phase {
+                                octos_agent::WorkspaceValidationPhase::TurnEnd => "turn_end",
+                                octos_agent::WorkspaceValidationPhase::Completion => "completion",
+                            },
+                            failure.check,
+                            failure.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!("Workspace contract validation failed:\n{failures}"))
+            };
+
+            merge_optional_text(enforcement_notice, validation_notice)
+        }
+        Ok(Err(error)) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace turn snapshot failed"
+            );
+            Some(format!(
+                "Workspace versioning failed. Turn snapshot was not recorded.\nError: {error}"
+            ))
+        }
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "workspace turn snapshot task failed"
+            );
+            Some(format!(
+                "Workspace versioning task failed. Turn snapshot was not recorded.\nError: {error}"
+            ))
+        }
+    }
+}
+
+async fn emit_workspace_snapshot_notice(
+    out_tx: &mpsc::Sender<OutboundMessage>,
+    channel: &str,
+    chat_id: &str,
+    reply_to: Option<String>,
+    sender_user_id: Option<&str>,
+    content: String,
+) {
+    let _ = out_tx
+        .send(OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content,
+            reply_to,
+            media: vec![],
+            metadata: system_notice_metadata(sender_user_id),
+        })
+        .await;
 }
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -96,6 +1010,8 @@ pub enum ActorMessage {
     Inbound {
         message: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     },
     /// Result from a background subagent task — injected as a system message
     /// into the conversation without triggering an extra LLM call.
@@ -104,6 +1020,17 @@ pub enum ActorMessage {
         task_label: String,
         /// The subagent's final output.
         content: String,
+        /// Delivery semantics for this result.
+        kind: BackgroundResultKind,
+        /// Media files attached to this terminal background result.
+        media: Vec<String>,
+        /// Completion acknowledgment for durable persistence.
+        ack: Option<oneshot::Sender<bool>>,
+    },
+    /// Background task status changed — push to SSE.
+    TaskStatusChanged {
+        /// Serialized JSON of the BackgroundTask.
+        task_json: String,
     },
     /// Cancel the current operation.
     Cancel,
@@ -195,6 +1122,8 @@ impl ActorRegistry {
         let DispatchParams {
             message,
             image_media,
+            attachment_media,
+            attachment_prompt,
             session_key,
             reply_channel,
             reply_chat_id,
@@ -241,6 +1170,8 @@ impl ActorRegistry {
         let actor_msg = ActorMessage::Inbound {
             message,
             image_media,
+            attachment_media,
+            attachment_prompt,
         };
 
         match handle.tx.try_send(actor_msg) {
@@ -322,6 +1253,25 @@ impl ActorRegistry {
         });
     }
 
+    /// Stop and remove a session actor. Drops the sender so the actor's run
+    /// loop exits on the next recv(). Used when a session is deleted — the
+    /// actor must not survive and serve stale context to new messages.
+    pub fn remove_session(&mut self, session_key: &str) {
+        let scoped_suffix = format!(":{session_key}");
+        let keys_to_remove: Vec<String> = self
+            .actors
+            .keys()
+            .filter(|key| key.as_str() == session_key || key.ends_with(&scoped_suffix))
+            .cloned()
+            .collect();
+        for key in keys_to_remove {
+            if let Some(handle) = self.actors.remove(&key) {
+                debug!(session = %key, "removing session actor on delete");
+                drop(handle.tx); // actor's recv() returns None → run loop exits
+            }
+        }
+    }
+
     /// Cancel a specific session actor.
     pub async fn cancel(&self, session_key: &str) {
         let scoped_suffix = format!(":{session_key}");
@@ -387,6 +1337,8 @@ pub struct ActorFactory {
     pub agent_config: AgentConfig,
     pub llm: Arc<dyn LlmProvider>,
     pub llm_for_compaction: Arc<dyn LlmProvider>,
+    /// Strong-only provider chain for slides sessions (kimi + deepseek + minimax).
+    pub llm_strong: Arc<dyn LlmProvider>,
     pub memory: Arc<EpisodeStore>,
     pub system_prompt: Arc<std::sync::RwLock<String>>,
     pub hooks: Option<Arc<HookExecutor>>,
@@ -429,6 +1381,12 @@ pub struct ActorFactory {
     /// Memory store for saving long-form outputs (research reports) to the
     /// memory bank so only a summary is injected into session context.
     pub memory_store: Option<Arc<MemoryStore>>,
+    /// Plugin directories for SpawnTool subagents to load plugin tools.
+    pub plugin_dirs: Vec<std::path::PathBuf>,
+    /// Extra environment variables for plugin processes in subagents.
+    pub plugin_extra_env: Vec<(String, String)>,
+    /// Session-scoped background task lookup for API inspection.
+    pub task_query_store: SessionTaskQueryStore,
 }
 
 /// Trait for creating per-session ToolRegistry instances.
@@ -522,11 +1480,67 @@ impl ActorFactory {
                 "failed to create per-user workspace: {e}, falling back to shared cwd"
             );
         }
+        // Create the per-actor session handle early so we can derive the
+        // background task ledger path before any worker can mutate state.
+        let session_handle = SessionHandle::open(&self.data_dir, &session_key);
+        let task_state_path = session_handle.task_state_path();
+        let session_handle = Arc::new(Mutex::new(session_handle));
+        let session_policy_path = workspace_policy_path(&user_workspace);
+        let desired_session_policy = WorkspacePolicy::for_session();
+        match read_workspace_policy(&user_workspace) {
+            Ok(Some(mut existing_policy)) => {
+                let mut updated = false;
+                for (name, pattern) in &desired_session_policy.artifacts.entries {
+                    if !existing_policy.artifacts.entries.contains_key(name) {
+                        existing_policy
+                            .artifacts
+                            .entries
+                            .insert(name.clone(), pattern.clone());
+                        updated = true;
+                    }
+                }
+                for (name, task) in &desired_session_policy.spawn_tasks {
+                    if !existing_policy.spawn_tasks.contains_key(name) {
+                        existing_policy
+                            .spawn_tasks
+                            .insert(name.clone(), task.clone());
+                        updated = true;
+                    }
+                }
+                if updated {
+                    if let Err(error) = write_workspace_policy(&user_workspace, &existing_policy) {
+                        warn!(
+                            session = %session_key,
+                            path = %session_policy_path.display(),
+                            "failed to upgrade session workspace policy: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = write_workspace_policy(&user_workspace, &desired_session_policy)
+                {
+                    warn!(
+                        session = %session_key,
+                        path = %session_policy_path.display(),
+                        "failed to write session workspace policy: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    session = %session_key,
+                    path = %session_policy_path.display(),
+                    "failed to read session workspace policy: {error}"
+                );
+            }
+        }
 
         // send_file resolves relative paths against user_workspace (same as
         // write_file/read_file) so the LLM can write+send in one flow.
         // data_dir is an extra allowed directory for pipeline-generated files.
         let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
+            .with_topic(session_key.topic().map(|value| value.to_string()))
             .with_base_dir(&user_workspace)
             .with_extra_allowed_dir(&self.data_dir);
 
@@ -537,10 +1551,22 @@ impl ActorFactory {
         let mut tools = self
             .tool_registry_factory
             .create_registry_for_workspace(&user_workspace, user_sandbox);
-        // Re-bind plugin tools so OCTOS_WORK_DIR points to the user workspace.
-        // This lets plugins (e.g. voice skill) store per-user data (voice profiles)
-        // inside the sandbox where the agent's tools can see them.
+        let supervisor = tools.supervisor();
+        if let Err(error) = supervisor.enable_persistence(&task_state_path) {
+            warn!(
+                session = %session_key,
+                error = %error,
+                "failed to enable task supervisor persistence"
+            );
+        }
+        self.task_query_store
+            .register(&session_key, &supervisor, &self.data_dir);
         tools.rebind_plugin_work_dirs(&user_workspace);
+        tools.set_session_key(session_key.to_string());
+        tools.register(CheckBackgroundTasksTool::new(
+            supervisor.clone(),
+            session_key.to_string(),
+        ));
         tools.register(message_tool);
         tools.register(send_file_tool);
 
@@ -553,26 +1579,51 @@ impl ActorFactory {
             channel,
             chat_id,
         )
-        .with_provider_policy(self.provider_policy.clone());
+        .with_provider_policy(self.provider_policy.clone())
+        .with_agent_config(self.agent_config.clone())
+        .with_task_supervisor(
+            supervisor.clone(),
+            session_key.to_string(),
+            task_state_path.clone(),
+        );
         if let Some(ref prompt) = self.worker_prompt {
             spawn_tool = spawn_tool.with_worker_prompt(prompt.clone());
         }
         if let Some(ref router) = self.provider_router {
             spawn_tool = spawn_tool.with_provider_router(router.clone());
         }
+        if !self.plugin_dirs.is_empty() {
+            spawn_tool = spawn_tool
+                .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone());
+        }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
         let bg_tx = tx.clone();
         spawn_tool = spawn_tool.with_background_result_sender(Arc::new(
-            move |task_label: String, content: String| {
+            move |payload: BackgroundResultPayload| {
                 let tx = bg_tx.clone();
+                Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
+            },
+        ));
+
+        let child_data_dir = self.data_dir.clone();
+        spawn_tool = spawn_tool.with_child_session_sender(Arc::new(
+            move |payload: ChildSessionLifecyclePayload| {
+                let child_data_dir = child_data_dir.clone();
                 Box::pin(async move {
-                    tx.send(ActorMessage::BackgroundResult {
-                        task_label,
-                        content,
-                    })
-                    .await
-                    .is_ok()
+                    match persist_child_session_lifecycle(&child_data_dir, &payload).await {
+                        Ok(joined) => joined,
+                        Err(error) => {
+                            record_child_session_lifecycle(payload.kind, "persist_failed");
+                            warn!(
+                                parent_session = %payload.parent_session_key,
+                                child_session = %payload.child_session_key,
+                                error = %error,
+                                "failed to persist child-session lifecycle event"
+                            );
+                            false
+                        }
+                    }
                 })
             },
         ));
@@ -581,17 +1632,21 @@ impl ActorFactory {
 
         // Wire background result sender for spawn_only tool lifecycle notifications
         let bg_tx2 = tx.clone();
-        tools.set_background_result_sender(Arc::new(move |task_label: String, content: String| {
+        tools.set_background_result_sender(Arc::new(move |payload: BackgroundResultPayload| {
             let tx = bg_tx2.clone();
-            Box::pin(async move {
-                tx.send(ActorMessage::BackgroundResult {
-                    task_label,
-                    content,
-                })
-                .await
-                .is_ok()
-            })
+            Box::pin(async move { dispatch_background_result_to_actor(tx, payload).await })
         }));
+
+        // Wire supervisor on_change callback to push task status via SSE.
+        // Uses try_send to avoid blocking the sync Mutex context.
+        let status_tx = tx.clone();
+        let task_data_dir = self.data_dir.clone();
+        supervisor.set_on_change(move |task| {
+            let task_json = sanitize_task_for_response(&task_data_dir, task);
+            if let Ok(json) = serde_json::to_string(&task_json) {
+                let _ = status_tx.try_send(ActorMessage::TaskStatusChanged { task_json: json });
+            }
+        });
 
         let cron_tool_ref = if let Some(ref cron_service) = self.cron_service {
             let cron_tool = Arc::new(CronTool::with_context(
@@ -615,7 +1670,87 @@ impl ActorFactory {
         // Keep run_pipeline active — it's a core research tool.
         tools.defer(["spawn".to_string(), "cron".to_string()]);
 
-        // Build per-session Agent
+        // For slides sessions, auto-activate media tools and use primary model
+        // (bypasses adaptive router which may pick a weak model).
+        let is_slides = session_key.topic().is_some_and(|t| t.starts_with("slides"));
+        let is_site = session_key
+            .topic()
+            .is_some_and(|t| t == "site" || t.starts_with("site "));
+        if is_slides {
+            tools.activate("group:media");
+
+            // Scaffold slides project INTO the workspace so file tools
+            // (read_file, write_file, mofa_slides) all resolve the same paths.
+            // The earlier scaffold in gateway_dispatcher writes to data_dir
+            // which is unreachable from the sandboxed workspace.
+            let topic = session_key.topic().unwrap_or("slides");
+            let project_name = topic.strip_prefix("slides").unwrap_or("").trim();
+            let project_name = if project_name.is_empty() {
+                "untitled"
+            } else {
+                project_name
+            };
+            if let Err(error) =
+                crate::project_templates::scaffold_slides_project(&user_workspace, project_name)
+            {
+                warn!(session = %session_key, "slides scaffold failed in workspace: {error}");
+            }
+
+            // Copy built-in style templates into workspace/styles/ so the
+            // agent's glob("styles/*.toml") can discover them.
+            let builtin_styles = resolve_builtin_slides_styles_dir(&self.data_dir);
+            let ws_styles = user_workspace.join("styles");
+            if let Some(builtin_styles) = builtin_styles {
+                std::fs::create_dir_all(&ws_styles).ok();
+                if let Ok(entries) = std::fs::read_dir(&builtin_styles) {
+                    for entry in entries.flatten() {
+                        let src = entry.path();
+                        if src.extension().is_some_and(|e| e == "toml") {
+                            let dst = ws_styles.join(entry.file_name());
+                            // Don't overwrite custom styles the user created
+                            if !dst.exists() {
+                                std::fs::copy(&src, &dst).ok();
+                            }
+                        }
+                    }
+                }
+                let cyberpunk_alias = ws_styles.join("cyberpunk-neon.toml");
+                let blade_runner = ws_styles.join("nb-br.toml");
+                if !cyberpunk_alias.exists() && blade_runner.is_file() {
+                    std::fs::copy(&blade_runner, &cyberpunk_alias).ok();
+                }
+            } else {
+                warn!(
+                    session = %session_key,
+                    data_dir = %self.data_dir.display(),
+                    "builtin mofa-slides styles directory not found"
+                );
+            }
+        }
+        let slides_generation_available = !is_slides || tools.get("mofa_slides").is_some();
+
+        if is_site {
+            let topic = session_key.topic().unwrap_or("site");
+            let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
+            if let Err(error) = crate::project_templates::scaffold_site_project(
+                &user_workspace,
+                profile_id,
+                session_key.chat_id(),
+                topic,
+                &self.data_dir,
+            ) {
+                warn!(session = %session_key, "site scaffold failed in workspace: {error}");
+            }
+        }
+
+        // Slides sessions use the strong-only provider chain — failover
+        // between kimi/deepseek/minimax only, excluding weak providers that
+        // hang on 30+ tools. Normal sessions use the full adaptive router.
+        let session_llm = if is_slides {
+            self.llm_strong.clone()
+        } else {
+            self.llm.clone()
+        };
         let agent_id = AgentId::new(format!("session-{}", session_key));
         let has_deferred = tools.has_deferred();
         let mut system_prompt = system_prompt_override.unwrap_or_else(|| {
@@ -624,6 +1759,14 @@ impl ActorFactory {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone()
         });
+        if is_slides && !slides_generation_available {
+            system_prompt.push_str(
+                "\n\n## Slides Generation Availability\n\n\
+                 `mofa_slides` is not available on this host. You may still design and edit slide projects, \
+                 but you must tell the user that PPTX/image generation is unavailable here. \
+                 Do NOT retry generation via shell, run_pipeline, or alternative binaries.",
+            );
+        }
         if has_deferred {
             let groups = tools.deferred_groups();
             let mut tool_names = Vec::new();
@@ -642,7 +1785,7 @@ impl ActorFactory {
         // Per-session cancellation flag: shared with the agent so that
         // interrupt mode can stop a running agent loop mid-iteration.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut agent = Agent::new(agent_id, self.llm.clone(), tools, self.memory.clone())
+        let mut agent = Agent::new(agent_id, session_llm, tools, self.memory.clone())
             .with_config(self.agent_config.clone())
             .with_reporter(Arc::new(octos_agent::SilentReporter))
             .with_shutdown(cancelled.clone())
@@ -663,13 +1806,6 @@ impl ActorFactory {
 
         // Wire the activate_tools back-reference now that tools are in Arc
         agent.wire_activate_tools();
-
-        // Create a per-actor SessionHandle — each actor owns its session data.
-        // No shared mutex, no cross-session contention.
-        let session_handle = Arc::new(Mutex::new(SessionHandle::open(
-            &self.data_dir,
-            &session_key,
-        )));
 
         // Load per-user status configuration
         let user_status_config = UserStatusConfig::load(&self.data_dir, session_key.base_key());
@@ -867,6 +2003,30 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn snapshot_workspace_turn_if_needed(
+        &self,
+        turn_summary: &str,
+        reply_to: Option<String>,
+    ) {
+        if let Some(notice) = snapshot_workspace_turn_for_path(
+            &self.session_key,
+            self.user_workspace.clone(),
+            turn_summary,
+        )
+        .await
+        {
+            emit_workspace_snapshot_notice(
+                &self.out_tx,
+                &self.channel,
+                &self.chat_id,
+                reply_to,
+                self.sender_user_id.as_deref(),
+                notice,
+            )
+            .await;
+        }
+    }
+
     /// Check if this session is currently the active session for its chat.
     /// When inactive, streaming edits bypass the pending buffer, so we must
     /// skip streaming and let the reply go through the proxy path.
@@ -887,7 +2047,12 @@ impl SessionActor {
             tokio::select! {
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media,
+                            attachment_media,
+                            attachment_prompt,
+                        }) => {
                             // Update cron tool context with current channel/chat_id
                             // so new cron jobs inherit the correct delivery target.
                             if let Some(ref cron) = self.cron_tool {
@@ -918,61 +2083,89 @@ impl SessionActor {
                                 // Cancel any in-flight overflow tasks so their
                                 // responses don't preempt the command reply (#21).
                                 self.overflow_cancelled.store(true, Ordering::Release);
+                                // Send completion signal so the web client's SSE stream closes
+                                if self.channel == "api" {
+                                    let _ = self.out_tx.send(OutboundMessage {
+                                        channel: self.channel.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        content: String::new(),
+                                        reply_to: None,
+                                        media: vec![],
+                                        metadata: serde_json::json!({"_completion": true}),
+                                    }).await;
+                                }
                                 continue;
                             }
 
                             // Drain any queued messages according to queue mode
-                            let (final_message, final_media) =
-                                self.drain_queue(message, image_media).await;
+                            let (
+                                final_message,
+                                final_media,
+                                final_attachment_media,
+                                final_attachment_prompt,
+                            ) = self
+                                .drain_queue(
+                                    message,
+                                    image_media,
+                                    attachment_media,
+                                    attachment_prompt,
+                                )
+                                .await;
 
-                            // Copy uploaded media files into the agent's sandboxed
-                            // working directory so read_file can access them.
-                            let final_media = self.copy_media_to_workspace(final_media);
+                            // Copy non-image attachments into the agent workspace so
+                            // tools can resolve them by filename without path hints.
+                            let final_attachment_media =
+                                self.copy_media_to_workspace(final_attachment_media);
 
                             // Use speculative path for API channel (web client) and
                             // Speculative queue mode. The speculative path spawns the
                             // agent call and handles overflow messages concurrently,
                             // so users aren't blocked during long tool calls (pipelines).
                             if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
-                                self.process_inbound_speculative(final_message, final_media).await;
+                                self.process_inbound_speculative(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                    final_attachment_prompt,
+                                )
+                                .await;
                             } else {
-                                self.process_inbound(final_message, final_media).await;
+                                self.process_inbound(
+                                    final_message,
+                                    final_media,
+                                    final_attachment_media,
+                                    final_attachment_prompt,
+                                )
+                                .await;
                             }
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            // Lightweight notification for spawn_only tool completions
-                            // (e.g. fm_tts success/failure) — send directly, no LLM turn.
-                            if content.starts_with('✓') || content.starts_with('✗') {
-                                tracing::info!(task = %task_label, "spawn_only notification: {}", content);
-                                let _ = self.out_tx.send(octos_core::OutboundMessage {
-                                    channel: self.channel.clone(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: content.clone(),
-                                    reply_to: None,
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                }).await;
-                            } else {
-                                // Full background result (from spawn subagent) — inject + rewrite
-                                self.inject_background_result(&task_label, &content, false).await;
-                                let rewrite_msg = octos_core::InboundMessage {
-                                    channel: self.channel.clone(),
-                                    sender_id: "system".to_string(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: format!(
-                                        "[REWRITE] The background task \"{task_label}\" has completed. \
-                                         Rewrite the raw report above into a clean, well-structured, \
-                                         readable message for the user. Keep all key findings, data, \
-                                         and citations. Use proper Markdown formatting. \
-                                         Match the language of the original research request."
-                                    ),
-                                    timestamp: chrono::Utc::now(),
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                    message_id: None,
-                                };
-                                self.process_inbound(rewrite_msg, vec![]).await;
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                            media,
+                            ack,
+                        }) => {
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
+                        }
+                        Some(ActorMessage::TaskStatusChanged { task_json }) => {
+                            // Push task status change to the web client via SSE
+                            let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: String::new(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({
+                                    "topic": self.session_key.topic(),
+                                    "_task_status": task_json
+                                }),
+                            }).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             debug!(session = %self.session_key, "cancel requested");
@@ -985,6 +2178,7 @@ impl SessionActor {
                     }
                 }
                 _ = tokio::time::sleep(self.idle_timeout) => {
+                    record_timeout("idle_actor");
                     debug!(session = %self.session_key, "idle timeout, shutting down actor");
                     break;
                 }
@@ -1032,7 +2226,24 @@ impl SessionActor {
                 self.handle_thinking_command(&parts[1..]).await;
                 true
             }
-            _ => false, // Unknown slash command — pass through to LLM
+            _ => {
+                // Unknown slash command — show help instead of passing to LLM
+                self.send_reply(
+                    "Unknown command. Available commands:\n\
+                     /new [name] — start a new session\n\
+                     /s [name] — switch to a session\n\
+                     /sessions — list all sessions\n\
+                     /back — return to default session\n\
+                     /delete — delete current session\n\
+                     /soul [text] — view or set persona\n\
+                     /status — show agent status\n\
+                     /adaptive — view adaptive routing\n\
+                     /reset — reset session state\n\
+                     /help — show this help",
+                )
+                .await;
+                true
+            }
         }
     }
 
@@ -1483,12 +2694,18 @@ impl SessionActor {
         &mut self,
         message: InboundMessage,
         image_media: Vec<String>,
-    ) -> (InboundMessage, Vec<String>) {
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) -> (InboundMessage, Vec<String>, Vec<String>, Option<String>) {
         match self.queue_mode {
-            QueueMode::Followup | QueueMode::Speculative => (message, image_media),
+            QueueMode::Followup | QueueMode::Speculative => {
+                (message, image_media, attachment_media, attachment_prompt)
+            }
             QueueMode::Collect => {
                 let mut combined_content = message.content.clone();
                 let mut combined_media = image_media;
+                let mut combined_attachment_media = attachment_media;
+                let mut combined_attachment_prompt = attachment_prompt;
                 let mut count = 0u32;
 
                 // Non-blocking drain of queued inbound messages
@@ -1497,6 +2714,8 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling batch");
@@ -1507,13 +2726,28 @@ impl SessionActor {
                             combined_content
                                 .push_str(&format!("\n---\nQueued #{count}: {}", queued.content));
                             combined_media.extend(queued_media);
+                            combined_attachment_media.extend(queued_attachment_media);
+                            combined_attachment_prompt = merge_attachment_prompt_summaries(
+                                combined_attachment_prompt,
+                                queued_attachment_prompt,
+                            );
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
+                            media,
+                            ack,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
                                 .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
+                            }
+                        }
+                        Ok(ActorMessage::TaskStatusChanged { .. }) => {
+                            // Ignore in drain — status is pushed via the main loop
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1524,7 +2758,12 @@ impl SessionActor {
                 }
                 let mut msg = message;
                 msg.content = combined_content;
-                (msg, combined_media)
+                (
+                    msg,
+                    combined_media,
+                    combined_attachment_media,
+                    combined_attachment_prompt,
+                )
             }
             QueueMode::Steer | QueueMode::Interrupt => {
                 // Coalescing delay: give rapid follow-up messages time to arrive
@@ -1532,6 +2771,8 @@ impl SessionActor {
 
                 let mut latest_message = message;
                 let mut latest_media = image_media;
+                let mut latest_attachment_media = attachment_media;
+                let mut latest_attachment_prompt = attachment_prompt;
 
                 // Non-blocking drain: keep only the newest inbound message
                 loop {
@@ -1539,6 +2780,8 @@ impl SessionActor {
                         Ok(ActorMessage::Inbound {
                             message: queued,
                             image_media: queued_media,
+                            attachment_media: queued_attachment_media,
+                            attachment_prompt: queued_attachment_prompt,
                         }) => {
                             if octos_core::is_abort_trigger(&queued.content) {
                                 debug!(session = %self.session_key, "abort in queue, cancelling");
@@ -1548,13 +2791,25 @@ impl SessionActor {
                             debug!(session = %self.session_key, "steer: replacing with newer message");
                             latest_message = queued;
                             latest_media = queued_media;
+                            latest_attachment_media = queued_attachment_media;
+                            latest_attachment_prompt = queued_attachment_prompt;
                         }
                         Ok(ActorMessage::BackgroundResult {
                             task_label,
                             content,
+                            kind,
+                            media,
+                            ack,
                         }) => {
-                            self.inject_background_result(&task_label, &content, true)
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
                                 .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
+                            }
+                        }
+                        Ok(ActorMessage::TaskStatusChanged { .. }) => {
+                            // Ignore in drain — status is pushed via the main loop
                         }
                         Ok(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -1563,26 +2818,88 @@ impl SessionActor {
                         Err(_) => break,
                     }
                 }
-                (latest_message, latest_media)
+                (
+                    latest_message,
+                    latest_media,
+                    latest_attachment_media,
+                    latest_attachment_prompt,
+                )
             }
         }
     }
 
-    /// Inject a background task result into the conversation.
-    ///
-    /// For long results (>1000 chars), the full content is saved to the memory
-    /// bank and only a summary is injected into session context.  The agent can
-    /// retrieve the full report via `recall_memory("<slug>")`.
-    /// Inject a background task result into the conversation context.
-    ///
-    /// When `notify` is true, sends a preview notification directly to the user.
-    /// When false, the caller is responsible for triggering an LLM rewrite turn
-    /// that will produce a clean user-facing message.
-    async fn inject_background_result(&self, task_label: &str, content: &str, notify: bool) {
-        const SUMMARY_THRESHOLD: usize = 1000;
-        const SUMMARY_CHARS: usize = 800;
+    /// Persist an assistant-visible background result and emit the matching
+    /// committed session-result event metadata for the web/runtime surfaces.
+    async fn deliver_background_notification(&self, content: String, media: Vec<String>) -> bool {
+        let content = finalize_assistant_content(&self.session_key, &self.user_workspace, &content);
+        let persisted = persist_assistant_message(
+            &self.session_handle,
+            &self.session_key,
+            content.clone(),
+            media.clone(),
+        )
+        .await;
 
-        let (context_content, notification) = if content.len() > SUMMARY_THRESHOLD {
+        let Some(persisted_message) = persisted else {
+            record_result_delivery(
+                "background_notification",
+                "history_not_persisted",
+                "notification",
+            );
+            warn!(
+                session = %self.session_key,
+                "skipping background notification fanout because history was not persisted"
+            );
+            return false;
+        };
+
+        let metadata = persisted_session_result_metadata(
+            &self.session_key,
+            &persisted_message,
+            &content,
+            &media,
+        );
+
+        let _ = send_outbound_with_timeout(
+            &self.session_key,
+            &self.out_tx,
+            OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content,
+                reply_to: None,
+                media,
+                metadata,
+            },
+            "background_notification",
+        )
+        .await;
+
+        true
+    }
+
+    async fn handle_background_result(
+        &self,
+        task_label: &str,
+        content: &str,
+        kind: BackgroundResultKind,
+        media: Vec<String>,
+    ) -> bool {
+        if kind == BackgroundResultKind::Notification {
+            self.deliver_background_notification(content.to_string(), media)
+                .await
+        } else {
+            let report_message = self
+                .prepare_background_report_result(task_label, content)
+                .await;
+            self.deliver_background_notification(report_message, Vec::new())
+                .await
+        }
+    }
+
+    async fn prepare_background_report_result(&self, task_label: &str, content: &str) -> String {
+        const SUMMARY_THRESHOLD: usize = 1000;
+        if content.len() > SUMMARY_THRESHOLD {
             // Save full report to memory bank
             let slug = task_label
                 .chars()
@@ -1609,51 +2926,12 @@ impl SessionActor {
                 }
             }
 
-            // Truncate for context injection
-            let summary: String = content.chars().take(SUMMARY_CHARS).collect();
-            let ctx = format!(
-                "[Background task \"{task_label}\" completed]\n\n\
-                 {summary}\n\n[... truncated — full report ({} chars) saved to memory bank as \"{slug}\". \
-                 Use recall_memory(\"{slug}\") to load the complete report.]",
-                content.len(),
-            );
-
-            // Notification includes a preview for the user
             let preview: String = content.chars().take(300).collect();
-            let notif = format!(
+            format!(
                 "✅ **{task_label}** completed.\n\n{preview}...\n\n_Full report saved. Ask me to recall it for details._",
-            );
-
-            (ctx, notif)
+            )
         } else {
-            // Short result — inject fully
-            let ctx = format!("[Background task \"{task_label}\" completed]\n\n{content}");
-            let notif = format!("✅ **{task_label}** completed.\n\n{content}");
-            (ctx, notif)
-        };
-
-        let system_msg = Message::system(context_content);
-        {
-            let mut handle = self.session_handle.lock().await;
-            if let Err(e) = handle.add_message(system_msg).await {
-                warn!(session = %self.session_key, error = %e, "failed to inject background result");
-            }
-        }
-
-        if notify {
-            // Send raw preview directly (used when agent is busy and will see
-            // the injected context on its next turn).
-            let _ = self
-                .out_tx
-                .send(OutboundMessage {
-                    channel: self.channel.clone(),
-                    chat_id: self.chat_id.clone(),
-                    content: notification,
-                    reply_to: None,
-                    media: vec![],
-                    metadata: serde_json::json!({}),
-                })
-                .await;
+            format!("✅ **{task_label}** completed.\n\n{content}")
         }
     }
 
@@ -1664,12 +2942,15 @@ impl SessionActor {
         media
             .into_iter()
             .map(|path| {
-                let src = std::path::Path::new(&path);
+                let resolved = octos_bus::file_handle::resolve_upload_reference(&path)
+                    .map(|candidate| candidate.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let src = std::path::Path::new(&resolved);
                 if !src.exists() {
-                    return path;
+                    return resolved;
                 }
                 let Some(filename) = src.file_name() else {
-                    return path;
+                    return resolved;
                 };
                 let dest = self.user_workspace.join(filename);
                 match std::fs::copy(src, &dest) {
@@ -1689,11 +2970,191 @@ impl SessionActor {
                             error = %e,
                             "failed to copy media to workspace, using original path"
                         );
-                        path
+                        resolved
                     }
                 }
             })
             .collect()
+    }
+
+    fn build_turn_attachment_context(
+        &self,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) -> TurnAttachmentContext {
+        let mut audio_attachment_paths = Vec::new();
+        let mut file_attachment_paths = Vec::new();
+        for path in &attachment_media {
+            if octos_bus::media::is_audio(path) {
+                audio_attachment_paths.push(path.clone());
+            } else {
+                file_attachment_paths.push(path.clone());
+            }
+        }
+
+        TurnAttachmentContext {
+            attachment_paths: attachment_media,
+            audio_attachment_paths,
+            file_attachment_paths,
+            prompt_summary: attachment_prompt,
+        }
+    }
+
+    fn persisted_user_content(
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> String {
+        if inbound.content.is_empty() && !image_media.is_empty() {
+            "[User sent an image]".to_string()
+        } else if inbound.content.is_empty() && !attachment_media.is_empty() {
+            "[User sent attachments]".to_string()
+        } else {
+            inbound.content.clone()
+        }
+    }
+
+    fn forced_background_workflow_for_turn(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+    ) -> Option<WorkflowInstance> {
+        if !image_media.is_empty() || !attachment_media.is_empty() {
+            return None;
+        }
+        if self.channel == "system" {
+            return None;
+        }
+        WorkflowKind::detect_forced_background(&inbound.content).map(WorkflowKind::build)
+    }
+
+    async fn maybe_start_forced_background_workflow(
+        &self,
+        inbound: &InboundMessage,
+        image_media: &[String],
+        attachment_media: &[String],
+        attachment_prompt: Option<&str>,
+        persisted_user_content: &str,
+        reply_to: Option<String>,
+    ) -> bool {
+        let Some(workflow) =
+            self.forced_background_workflow_for_turn(inbound, image_media, attachment_media)
+        else {
+            return false;
+        };
+
+        let mut task = inbound.content.clone();
+        if let Some(prompt) = attachment_prompt.filter(|value| !value.trim().is_empty()) {
+            task.push_str("\n\nAttachment context:\n");
+            task.push_str(prompt);
+        }
+
+        let workflow_label = workflow.label.clone();
+        let workflow_ack = workflow.ack_message.clone();
+        let args = serde_json::json!({
+            "task": task,
+            "label": workflow_label,
+            "mode": "background",
+            "allowed_tools": workflow.allowed_tools.clone(),
+            "additional_instructions": workflow.additional_instructions.clone(),
+            "workflow": workflow.clone(),
+        });
+
+        let tool_registry = self.agent.tool_registry();
+        let spawn_result = match tool_registry.execute("spawn", &args).await {
+            Ok(result) if result.success => result,
+            Ok(result) => {
+                warn!(
+                    session = %self.session_key,
+                    workflow = %workflow.label,
+                    error = %result.output,
+                    "forced background spawn returned failure"
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    session = %self.session_key,
+                    workflow = %workflow.label,
+                    error = %error,
+                    "forced background spawn failed"
+                );
+                return false;
+            }
+        };
+
+        let user_msg = Message {
+            role: MessageRole::User,
+            content: persisted_user_content.to_string(),
+            media: vec![],
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            timestamp: chrono::Utc::now(),
+        };
+        {
+            let mut handle = self.session_handle.lock().await;
+            let session = handle.get_or_create();
+            if session.summary.is_none() && !persisted_user_content.trim().is_empty() {
+                session.summary = Some(persisted_user_content.chars().take(100).collect());
+            }
+            if let Err(error) = handle.add_message(user_msg).await {
+                warn!(session = %self.session_key, error = %error, "failed to persist user message for forced background workflow");
+            }
+        }
+
+        let ack_content = workflow_ack;
+        let persisted = persist_assistant_message(
+            &self.session_handle,
+            &self.session_key,
+            ack_content.clone(),
+            vec![],
+        )
+        .await;
+
+        let _ = self
+            .out_tx
+            .send(OutboundMessage {
+                channel: self.channel.clone(),
+                chat_id: self.chat_id.clone(),
+                content: ack_content,
+                reply_to,
+                media: vec![],
+                metadata: serde_json::json!({
+                    "_history_persisted": persisted,
+                    "spawn_output": spawn_result.output,
+                }),
+            })
+            .await;
+
+        if self.channel == "api" {
+            let bg_tasks = tool_registry
+                .supervisor()
+                .get_tasks_for_session(&self.session_key.to_string())
+                .into_iter()
+                .filter(|task| task.status.is_active())
+                .map(|task| sanitize_task_for_response(&self.data_dir, &task))
+                .collect::<Vec<_>>();
+
+            let _ = self
+                .out_tx
+                .send(OutboundMessage {
+                    channel: self.channel.clone(),
+                    chat_id: self.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: serde_json::json!({
+                        "_completion": true,
+                        "has_bg_tasks": !bg_tasks.is_empty(),
+                        "bg_tasks": bg_tasks,
+                    }),
+                })
+                .await;
+        }
+
+        true
     }
 
     /// Speculative processing: runs the LLM call but monitors the inbox.
@@ -1705,6 +3166,8 @@ impl SessionActor {
         &mut self,
         inbound: InboundMessage,
         image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
     ) {
         // Reset overflow cancellation from any prior command handling (#21).
         self.overflow_cancelled.store(false, Ordering::Release);
@@ -1725,6 +3188,9 @@ impl SessionActor {
             "speculative: entering concurrent processing"
         );
 
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
         let _permit = match self.semaphore.acquire().await {
@@ -1732,17 +3198,28 @@ impl SessionActor {
             Err(_) => return,
         };
 
+        if self
+            .maybe_start_forced_background_workflow(
+                &inbound,
+                &image_media,
+                &attachment_media,
+                attachment_prompt.as_deref(),
+                &persisted_user_content,
+                inbound_message_id.clone(),
+            )
+            .await
+        {
+            self.cancelled.store(false, Ordering::Release);
+            return;
+        }
+
         let max_history = self.max_history.load(Ordering::Acquire);
 
         // Save the primary user message to session history BEFORE spawning
         // so overflow reads see it in context (chronological ordering).
         let user_msg = Message {
             role: MessageRole::User,
-            content: if inbound.content.is_empty() && !image_media.is_empty() {
-                "[User sent an image]".to_string()
-            } else {
-                inbound.content.clone()
-            },
+            content: persisted_user_content,
             media: image_media.clone(),
             tool_calls: None,
             tool_call_id: None,
@@ -1847,6 +3324,7 @@ impl SessionActor {
         let agent = Arc::clone(&self.agent);
         let content = inbound.content.clone();
         let media = image_media;
+        let attachments = self.build_turn_attachment_context(attachment_media, attachment_prompt);
         let tracker = Arc::clone(&token_tracker);
         let session_timeout = self.session_timeout;
 
@@ -1876,7 +3354,13 @@ impl SessionActor {
             let start = Instant::now();
             let result = tokio::time::timeout(
                 session_timeout,
-                agent.process_message_tracked(&content, &history_for_agent, media, &tracker),
+                agent.process_message_tracked_with_attachments(
+                    &content,
+                    &history_for_agent,
+                    media,
+                    attachments,
+                    &tracker,
+                ),
             )
             .await;
             eprintln!(
@@ -1917,7 +3401,12 @@ impl SessionActor {
                 // New message arrived in inbox
                 msg = self.inbox.recv() => {
                     match msg {
-                        Some(ActorMessage::Inbound { message, image_media: _ }) => {
+                        Some(ActorMessage::Inbound {
+                            message,
+                            image_media: _,
+                            attachment_media: _,
+                            attachment_prompt: _,
+                        }) => {
                             if octos_core::is_abort_trigger(&message.content) {
                                 self.cancelled.store(true, Ordering::Release);
                                 self.send_reply(octos_core::abort_response(&message.content)).await;
@@ -1930,6 +3419,25 @@ impl SessionActor {
                                 continue;
                             }
                             let elapsed = started.elapsed();
+
+                            if self.queue_mode == QueueMode::Interrupt {
+                                // Interrupt mode: abort the primary agent task
+                                // so the new message can be processed immediately.
+                                info!(
+                                    session = %self.session_key,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    "interrupt: aborting primary task for new message"
+                                );
+                                agent_task.abort();
+                                self.cancelled.store(true, Ordering::Release);
+
+                                // Process the interrupting message as overflow
+                                // (same as speculative, but the primary is now dead)
+                                self.serve_overflow(&message, &overflow_history);
+                                overflow_served = true;
+                                continue;
+                            }
+
                             info!(
                                 session = %self.session_key,
                                 elapsed_ms = elapsed.as_millis(),
@@ -1941,19 +3449,32 @@ impl SessionActor {
                             self.serve_overflow(&message, &overflow_history);
                             overflow_served = true;
                         }
-                        Some(ActorMessage::BackgroundResult { task_label, content }) => {
-                            if content.starts_with('✓') || content.starts_with('✗') {
-                                let _ = self.out_tx.send(octos_core::OutboundMessage {
-                                    channel: self.channel.clone(),
-                                    chat_id: self.chat_id.clone(),
-                                    content: content.clone(),
-                                    reply_to: None,
-                                    media: vec![],
-                                    metadata: serde_json::json!({}),
-                                }).await;
-                            } else {
-                                self.inject_background_result(&task_label, &content, true).await;
+                        Some(ActorMessage::BackgroundResult {
+                            task_label,
+                            content,
+                            kind,
+                            media,
+                            ack,
+                        }) => {
+                            let persisted = self
+                                .handle_background_result(&task_label, &content, kind, media)
+                                .await;
+                            if let Some(ack) = ack {
+                                let _ = ack.send(persisted);
                             }
+                        }
+                        Some(ActorMessage::TaskStatusChanged { task_json }) => {
+                            let _ = self.out_tx.send(octos_core::OutboundMessage {
+                                channel: self.channel.clone(),
+                                chat_id: self.chat_id.clone(),
+                                content: String::new(),
+                                reply_to: None,
+                                media: vec![],
+                                metadata: serde_json::json!({
+                                    "topic": self.session_key.topic(),
+                                    "_task_status": task_json
+                                }),
+                            }).await;
                         }
                         Some(ActorMessage::Cancel) => {
                             self.cancelled.store(true, Ordering::Release);
@@ -2053,34 +3574,63 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        let bg_tasks = self.agent.tool_registry().bg_task_count();
-        // Also check spawn_only_invoked flag — set when a spawn_only tool was
-        // actually called during this agent run. This is more precise than
-        // checking if spawn_only tools are registered (which is overbroad).
-        let spawn_only_invoked = self.agent.tool_registry().spawn_only_was_invoked();
+        let supervisor = self.agent.tool_registry().supervisor();
+        let bg_tasks = supervisor.task_count();
+        let all_tasks = supervisor.get_all_tasks();
+        let had_bg_tasks = !all_tasks.is_empty(); // any task was spawned, even if completed
+        let bg_task_details: Vec<_> = supervisor.get_active_tasks();
+        if !all_tasks.is_empty() {
+            for t in &all_tasks {
+                info!(
+                    session = %self.session_key,
+                    task_id = %t.id,
+                    tool = %t.tool_name,
+                    status = ?t.status,
+                    files = ?t.output_files,
+                    error = ?t.error,
+                    "task supervisor report"
+                );
+            }
+        }
         let completion_meta = match &agent_result {
             Ok(Ok(cr)) => {
                 info!(session = %self.session_key, messages = cr.messages.len(), content_len = cr.content.len(), bg_tasks, "agent completed, saving messages");
+                let provider_metadata = cr.provider_metadata.clone();
+                let model_label = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    });
                 serde_json::json!({
                     "_completion": true,
-                    "model": format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                    "model": model_label,
+                    "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
+                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
+                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
-                    "has_bg_tasks": bg_tasks > 0 || spawn_only_invoked,
+                    "has_bg_tasks": had_bg_tasks,
+                    "bg_tasks": bg_task_details,
                 })
             }
             Ok(Err(e)) => {
                 warn!(session = %self.session_key, error = %e, "agent returned error");
-                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
+                serde_json::json!({"_completion": true, "has_bg_tasks": had_bg_tasks, "bg_tasks": bg_task_details})
             }
             Err(e) => {
                 warn!(session = %self.session_key, error = %e, "agent timed out");
-                serde_json::json!({"_completion": true, "has_bg_tasks": bg_tasks > 0})
+                serde_json::json!({"_completion": true, "has_bg_tasks": had_bg_tasks, "bg_tasks": bg_task_details})
             }
         };
         match agent_result {
             Ok(Ok(conv_response)) => {
+                let final_content = finalize_assistant_content(
+                    &self.session_key,
+                    &self.user_workspace,
+                    &conv_response.content,
+                );
                 // Save tool calls, tool results, and assistant reply to history.
                 // Skip the first message (user msg) — we already saved it before
                 // spawning to maintain chronological ordering.
@@ -2106,7 +3656,7 @@ impl SessionActor {
                     if !conv_response.content.is_empty() {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
+                            content: final_content.clone(),
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
@@ -2172,7 +3722,9 @@ impl SessionActor {
                             content: String::new(),
                             reply_to: None,
                             media: vec![abs_file.to_string_lossy().into_owned()],
-                            metadata: serde_json::json!({}),
+                            metadata: serde_json::json!({
+                                "topic": self.session_key.topic()
+                            }),
                         };
                         if let Err(e) = self.out_tx.send(file_msg).await {
                             warn!(session = %self.session_key, error = %e, "failed to auto-deliver report file");
@@ -2181,7 +3733,7 @@ impl SessionActor {
                 }
 
                 // Send reply
-                let content = strip_think_tags(&conv_response.content);
+                let content = strip_think_tags(&final_content);
                 let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
                 let is_silent = content.trim().is_empty()
                     || content.contains("[SILENT]")
@@ -2283,33 +3835,39 @@ impl SessionActor {
             }
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content: format!("Error: {e}"),
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
+                let content = format!("Error: {e}");
+                let _ = persist_terminal_reply_and_fanout(
+                    &self.session_handle,
+                    &self.session_key,
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
+                    vec![],
+                )
+                .await;
             }
             Err(_) => {
+                record_timeout("session_turn");
                 tracing::error!(session = %self.session_key, "session processing timed out");
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content: "Processing timed out. Please try again.".to_string(),
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
+                let content = "Processing timed out. Please try again.".to_string();
+                let _ = persist_terminal_reply_and_fanout(
+                    &self.session_handle,
+                    &self.session_key,
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
+                    vec![],
+                )
+                .await;
             }
         }
+
+        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
+            .await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
@@ -2391,6 +3949,7 @@ impl SessionActor {
         let history = pre_primary_history.to_vec();
         let active_sessions = self.active_sessions.clone();
         let overflow_cancelled = Arc::clone(&self.overflow_cancelled);
+        let user_workspace = self.user_workspace.clone();
 
         tokio::spawn(async move {
             // Save user message to history first
@@ -2486,6 +4045,20 @@ impl SessionActor {
                     session = %session_key,
                     "overflow task cancelled by command, suppressing response"
                 );
+                if let Some(notice) =
+                    snapshot_workspace_turn_for_path(&session_key, user_workspace.clone(), &content)
+                        .await
+                {
+                    emit_workspace_snapshot_notice(
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        sender_user_id.as_deref(),
+                        notice,
+                    )
+                    .await;
+                }
                 // Still decrement and return — skip sending any reply.
                 overflow_counter.fetch_sub(1, Ordering::Release);
                 return;
@@ -2493,6 +4066,11 @@ impl SessionActor {
 
             match result {
                 Ok(Ok(conv_response)) => {
+                    let final_content = finalize_assistant_content(
+                        &session_key,
+                        &user_workspace,
+                        &conv_response.content,
+                    );
                     // Save ONLY the final assistant reply to session history.
                     // Intermediate tool_call/tool_result messages are NOT saved
                     // to avoid tool_call ID collisions when multiple overflow
@@ -2501,7 +4079,7 @@ impl SessionActor {
                         let mut handle = session_handle.lock().await;
                         let final_reply = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
+                            content: final_content.clone(),
                             media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
@@ -2511,7 +4089,7 @@ impl SessionActor {
                         let _ = handle.add_message(final_reply).await;
                     }
 
-                    let reply = strip_think_tags(&conv_response.content);
+                    let reply = strip_think_tags(&final_content);
                     // Prepend thinking content when show_thinking is enabled
                     let reply = if user_status_config.show_thinking {
                         let prefix =
@@ -2540,10 +4118,10 @@ impl SessionActor {
                     if !reply.trim().is_empty() && !already_streamed {
                         let _ = out_tx
                             .send(OutboundMessage {
-                                channel,
-                                chat_id,
+                                channel: channel.clone(),
+                                chat_id: chat_id.clone(),
                                 content: reply,
-                                reply_to: overflow_reply_to,
+                                reply_to: overflow_reply_to.clone(),
                                 media: vec![],
                                 metadata: serde_json::json!({}),
                             })
@@ -2552,36 +4130,61 @@ impl SessionActor {
                 }
                 Ok(Err(e)) => {
                     tracing::error!(session = %session_key, error = %e, "overflow agent task failed");
-                    let _ = out_tx
-                        .send(OutboundMessage {
-                            channel,
-                            chat_id,
-                            content: format!("Error: {e}"),
-                            reply_to: overflow_reply_to,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
+                    let content = format!("Error: {e}");
+                    let _ = persist_terminal_reply_and_fanout(
+                        &session_handle,
+                        &session_key,
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        content,
+                        vec![],
+                    )
+                    .await;
                 }
                 Err(_) => {
-                    let _ = out_tx
-                        .send(OutboundMessage {
-                            channel,
-                            chat_id,
-                            content: "Processing timed out.".to_string(),
-                            reply_to: overflow_reply_to,
-                            media: vec![],
-                            metadata: serde_json::json!({}),
-                        })
-                        .await;
+                    record_timeout("overflow_turn");
+                    let content = "Processing timed out.".to_string();
+                    let _ = persist_terminal_reply_and_fanout(
+                        &session_handle,
+                        &session_key,
+                        &out_tx,
+                        &channel,
+                        &chat_id,
+                        overflow_reply_to.clone(),
+                        content,
+                        vec![],
+                    )
+                    .await;
                 }
+            }
+
+            if let Some(notice) =
+                snapshot_workspace_turn_for_path(&session_key, user_workspace, &content).await
+            {
+                emit_workspace_snapshot_notice(
+                    &out_tx,
+                    &channel,
+                    &chat_id,
+                    overflow_reply_to.clone(),
+                    sender_user_id.as_deref(),
+                    notice,
+                )
+                .await;
             }
             // Decrement active overflow counter
             overflow_counter.fetch_sub(1, Ordering::Release);
         });
     }
 
-    async fn process_inbound(&mut self, inbound: InboundMessage, image_media: Vec<String>) {
+    async fn process_inbound(
+        &mut self,
+        inbound: InboundMessage,
+        image_media: Vec<String>,
+        attachment_media: Vec<String>,
+        attachment_prompt: Option<String>,
+    ) {
         // Capture the platform message ID for reply threading
         let inbound_message_id = inbound.message_id.clone();
 
@@ -2591,6 +4194,9 @@ impl SessionActor {
             Err(_) => return, // semaphore closed
         };
 
+        let persisted_user_content =
+            Self::persisted_user_content(&inbound, &image_media, &attachment_media);
+
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
         let history: Vec<Message> = {
@@ -2598,6 +4204,21 @@ impl SessionActor {
             let session = handle.get_or_create();
             session.get_history(max_history).to_vec()
         };
+
+        if self
+            .maybe_start_forced_background_workflow(
+                &inbound,
+                &image_media,
+                &attachment_media,
+                attachment_prompt.as_deref(),
+                &persisted_user_content,
+                inbound_message_id.clone(),
+            )
+            .await
+        {
+            self.cancelled.store(false, Ordering::Release);
+            return;
+        }
 
         // Token tracker for status indicator
         let token_tracker = Arc::new(TokenTracker::new());
@@ -2680,10 +4301,11 @@ impl SessionActor {
         let llm_start = Instant::now();
         let result = tokio::time::timeout(
             self.session_timeout,
-            self.agent.process_message_tracked(
+            self.agent.process_message_tracked_with_attachments(
                 &inbound.content,
                 &history,
                 image_media,
+                self.build_turn_attachment_context(attachment_media, attachment_prompt),
                 &token_tracker,
             ),
         )
@@ -2752,7 +4374,12 @@ impl SessionActor {
         // Capture annotation data before match moves result
         let annotation_data: Option<(String, u32, u32, u64)> = if let Ok(Ok(ref cr)) = result {
             Some((
-                format!("{}/{}", self.agent.provider_name(), self.agent.model_id()),
+                cr.provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.display_label())
+                    .unwrap_or_else(|| {
+                        format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
+                    }),
                 cr.token_usage.input_tokens,
                 cr.token_usage.output_tokens,
                 llm_latency.as_secs(),
@@ -2763,9 +4390,42 @@ impl SessionActor {
 
         match result {
             Ok(Ok(conv_response)) => {
+                let final_content = finalize_assistant_content(
+                    &self.session_key,
+                    &self.user_workspace,
+                    &conv_response.content,
+                );
+                let mut assistant_media: Vec<String> = conv_response
+                    .files_to_send
+                    .iter()
+                    .map(|path| {
+                        normalize_session_result_media_path(
+                            &self.user_workspace,
+                            &self.data_dir,
+                            path,
+                        )
+                    })
+                    .collect();
+                if assistant_media.is_empty() {
+                    assistant_media = fallback_session_result_media_paths(
+                        &self.session_key,
+                        &self.user_workspace,
+                        &self.data_dir,
+                        &conv_response.files_modified,
+                    );
+                }
+                if assistant_media.is_empty() {
+                    assistant_media = fallback_session_result_media_from_messages(
+                        &self.session_key,
+                        &self.user_workspace,
+                        &self.data_dir,
+                        &conv_response.messages,
+                    );
+                }
                 // Save all messages from the agent (user msg, tool calls, tool
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
+                let mut persisted_assistant_message = None;
                 {
                     let mut handle = self.session_handle.lock().await;
                     // Auto-generate summary from first user message
@@ -2777,8 +4437,18 @@ impl SessionActor {
                         }
                     }
 
+                    let mut persisted_user_message = false;
                     for msg in &conv_response.messages {
-                        if let Err(e) = handle.add_message(msg.clone()).await {
+                        let message_to_save =
+                            if !persisted_user_message && msg.role == MessageRole::User {
+                                persisted_user_message = true;
+                                let mut sanitized = msg.clone();
+                                sanitized.content = persisted_user_content.clone();
+                                sanitized
+                            } else {
+                                msg.clone()
+                            };
+                        if let Err(e) = handle.add_message(message_to_save).await {
                             warn!(session = %self.session_key, role = ?msg.role, error = %e, "failed to persist message");
                         }
                     }
@@ -2790,15 +4460,22 @@ impl SessionActor {
                     if !conv_response.content.is_empty() {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
-                            content: conv_response.content.clone(),
-                            media: vec![],
+                            content: final_content.clone(),
+                            media: assistant_media.clone(),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
-                        if let Err(e) = handle.add_message(assistant_msg).await {
-                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                        let timestamp = assistant_msg.timestamp;
+                        match handle.add_message_with_seq(assistant_msg).await {
+                            Ok(seq) => {
+                                persisted_assistant_message =
+                                    Some(PersistedSessionMessage { seq, timestamp });
+                            }
+                            Err(e) => {
+                                warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
+                            }
                         }
                     }
 
@@ -2814,7 +4491,7 @@ impl SessionActor {
                 }
 
                 // Send reply — always goes to this actor's chat (no race!)
-                let content = strip_think_tags(&conv_response.content);
+                let content = strip_think_tags(&final_content);
 
                 let is_cron = inbound.channel == "system" && inbound.sender_id == "cron";
                 let is_silent = content.trim().is_empty()
@@ -2882,6 +4559,17 @@ impl SessionActor {
                     };
 
                     if !streamed {
+                        let metadata = persisted_assistant_message
+                            .as_ref()
+                            .map(|persisted| {
+                                persisted_session_result_metadata(
+                                    &self.session_key,
+                                    persisted,
+                                    &final_content,
+                                    &assistant_media,
+                                )
+                            })
+                            .unwrap_or_else(|| serde_json::json!({}));
                         let _ = self
                             .out_tx
                             .send(OutboundMessage {
@@ -2890,7 +4578,7 @@ impl SessionActor {
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
                                 media: vec![],
-                                metadata: serde_json::json!({}),
+                                metadata,
                             })
                             .await;
                     }
@@ -2898,33 +4586,39 @@ impl SessionActor {
             }
             Ok(Err(e)) => {
                 tracing::error!(session = %self.session_key, error = %e, "agent processing failed");
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content: format!("Error: {e}"),
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
+                let content = format!("Error: {e}");
+                let _ = persist_terminal_reply_and_fanout(
+                    &self.session_handle,
+                    &self.session_key,
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
+                    vec![],
+                )
+                .await;
             }
             Err(_) => {
+                record_timeout("session_turn");
                 tracing::error!(session = %self.session_key, "session processing timed out");
-                let _ = self
-                    .out_tx
-                    .send(OutboundMessage {
-                        channel: self.channel.clone(),
-                        chat_id: self.chat_id.clone(),
-                        content: "Processing timed out. Please try again.".to_string(),
-                        reply_to: inbound_message_id.clone(),
-                        media: vec![],
-                        metadata: serde_json::json!({}),
-                    })
-                    .await;
+                let content = "Processing timed out. Please try again.".to_string();
+                let _ = persist_terminal_reply_and_fanout(
+                    &self.session_handle,
+                    &self.session_key,
+                    &self.out_tx,
+                    &self.channel,
+                    &self.chat_id,
+                    inbound_message_id.clone(),
+                    content,
+                    vec![],
+                )
+                .await;
             }
         }
+
+        self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
+            .await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);
@@ -3006,7 +4700,10 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use octos_agent::tools::{Tool, ToolResult};
+    use octos_core::{AgentId, ToolCall};
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -3018,6 +4715,220 @@ mod tests {
             "beforeafter"
         );
         assert_eq!(strip_think_tags("<think>unclosed"), "");
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_falls_back_to_root_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let root_styles = octos_home
+            .join("profiles")
+            .join("dspfac")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&root_styles).unwrap();
+        std::fs::write(root_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data).unwrap();
+
+        assert_eq!(resolved, root_styles);
+    }
+
+    #[test]
+    fn test_resolve_builtin_slides_styles_dir_does_not_use_unrelated_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let octos_home = dir.path().join(".octos");
+        let current_data = octos_home
+            .join("profiles")
+            .join("dspfac--newsbot")
+            .join("data");
+        let unrelated_styles = octos_home
+            .join("profiles")
+            .join("someone-else")
+            .join("data")
+            .join("skills")
+            .join("mofa-slides")
+            .join("styles");
+
+        std::fs::create_dir_all(&current_data).unwrap();
+        std::fs::create_dir_all(&unrelated_styles).unwrap();
+        std::fs::write(unrelated_styles.join("default.toml"), "name = 'default'\n").unwrap();
+
+        let resolved = resolve_builtin_slides_styles_dir(&current_data);
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn finalize_assistant_content_appends_site_preview_url_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::with_profile_topic("dspfac", "api", "web-123", "site astro");
+        let metadata = crate::project_templates::build_site_project_metadata(
+            "dspfac",
+            "web-123",
+            "site astro",
+            dir.path(),
+        )
+        .expect("site metadata");
+        let project_dir = dir.path().join(&metadata.project_dir);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("mofa-site-session.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let finalized = finalize_assistant_content(&session_key, dir.path(), "✅ Site rebuilt.");
+
+        assert!(finalized.contains("✅ Site rebuilt."));
+        assert!(finalized.contains(&metadata.preview_url));
+    }
+
+    #[test]
+    fn finalize_assistant_content_keeps_existing_site_preview_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let session_key = SessionKey::with_profile_topic("dspfac", "api", "web-123", "site astro");
+        let metadata = crate::project_templates::build_site_project_metadata(
+            "dspfac",
+            "web-123",
+            "site astro",
+            dir.path(),
+        )
+        .expect("site metadata");
+        let project_dir = dir.path().join(&metadata.project_dir);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("mofa-site-session.json"),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let original = format!("✅ Site rebuilt.\n\nPreview URL: {}", metadata.preview_url);
+        let finalized = finalize_assistant_content(&session_key, dir.path(), &original);
+
+        assert_eq!(finalized, original);
+    }
+
+    #[test]
+    fn session_task_query_store_hides_absolute_output_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        let workspace = data_dir
+            .join("users")
+            .join("api%3Asession")
+            .join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let output = workspace.join("voice.mp3");
+        std::fs::write(&output, b"audio").unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "fm_tts",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::DeliveringOutputs,
+            Some("send_file".to_string()),
+        );
+        supervisor.mark_completed(&task_id, vec![output.to_string_lossy().to_string()]);
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["runtime_state"], "completed");
+        assert_eq!(tasks[0]["runtime_detail"], "send_file");
+        let files = tasks[0]["output_files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        let handle = files[0].as_str().unwrap();
+        assert!(handle.starts_with("pf/"));
+        assert!(!handle.starts_with("/"));
+        assert_eq!(tasks[0]["parent_session_key"], "api:session");
+        assert!(
+            tasks[0]["child_session_key"]
+                .as_str()
+                .unwrap()
+                .starts_with("api:session#child-")
+        );
+        assert!(tasks[0]["task_ledger_path"].is_null());
+    }
+
+    #[test]
+    fn session_task_query_store_exposes_parsed_workflow_runtime_detail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+        let workspace = data_dir
+            .join("users")
+            .join("api%3Asession")
+            .join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "podcast_generate",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::DeliveringOutputs,
+            Some(
+                serde_json::json!({
+                    "workflow_kind": "research_podcast",
+                    "current_phase": "deliver_result"
+                })
+                .to_string(),
+            ),
+        );
+        supervisor.mark_completed(&task_id, vec![]);
+        supervisor.mark_child_session_outcome(
+            &task_id,
+            octos_agent::task_supervisor::ChildSessionTerminalState::Completed,
+            octos_agent::task_supervisor::ChildSessionJoinState::Joined,
+        );
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["runtime_state"], "completed");
+        assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
+        assert_eq!(tasks[0]["current_phase"], "deliver_result");
+        assert_eq!(
+            tasks[0]["runtime_detail"]["workflow_kind"],
+            "research_podcast"
+        );
+        assert_eq!(
+            tasks[0]["runtime_detail"]["current_phase"],
+            "deliver_result"
+        );
+        assert_eq!(tasks[0]["child_terminal_state"], "completed");
+        assert_eq!(tasks[0]["child_join_state"], "joined");
+        assert!(tasks[0]["child_failure_action"].is_null());
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
@@ -3080,6 +4991,190 @@ mod tests {
         }
     }
 
+    struct FilesToSendOnlyTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FilesToSendOnlyTool {
+        fn name(&self) -> &str {
+            "emit_deck"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck via files_to_send only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "deck generated".to_string(),
+                success: true,
+                files_to_send: vec![self.file_path.clone()],
+                ..Default::default()
+            })
+        }
+    }
+
+    struct FileModifiedOnlyTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for FileModifiedOnlyTool {
+        fn name(&self) -> &str {
+            "emit_deck_file_modified"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck via file_modified only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: "deck generated".to_string(),
+                success: true,
+                file_modified: Some(self.file_path.clone()),
+                ..Default::default()
+            })
+        }
+    }
+
+    struct RawGeneratedDeckTool {
+        file_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl Tool for RawGeneratedDeckTool {
+        fn name(&self) -> &str {
+            "emit_deck_raw_output"
+        }
+
+        fn description(&self) -> &str {
+            "Emit a deck path via raw tool output only"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
+            Ok(ToolResult {
+                output: format!("Generated PPTX: {}", self.file_path.display()),
+                success: true,
+                ..Default::default()
+            })
+        }
+    }
+
+    struct ToolThenEndProvider {
+        calls: AtomicUsize,
+        tool_name: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ToolThenEndProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let response = if call == 0 {
+                ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_emit_deck".to_string(),
+                        name: self.tool_name.to_string(),
+                        arguments: serde_json::json!({}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                }
+            } else {
+                ChatResponse {
+                    content: Some("done".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage::default(),
+                    provider_index: None,
+                }
+            };
+            Ok(response)
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    struct ErrorMockProvider {
+        name: String,
+        error: String,
+    }
+
+    impl ErrorMockProvider {
+        fn new(name: &str, error: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                error: error.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ErrorMockProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            _config: &ChatConfig,
+        ) -> eyre::Result<ChatResponse> {
+            Err(eyre::eyre!(self.error.clone()))
+        }
+
+        fn context_window(&self) -> u32 {
+            128_000
+        }
+
+        fn model_id(&self) -> &str {
+            &self.name
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.name
+        }
+    }
+
     fn make_response(text: &str) -> ChatResponse {
         ChatResponse {
             content: Some(text.to_string()),
@@ -3108,6 +5203,26 @@ mod tests {
                 message_id: None,
             },
             image_media: vec![],
+            attachment_media: vec![],
+            attachment_prompt: None,
+        }
+    }
+
+    fn make_attachment_inbound(summary: &str, attachment_path: &str) -> ActorMessage {
+        ActorMessage::Inbound {
+            message: InboundMessage {
+                channel: "cli".to_string(),
+                chat_id: "test".to_string(),
+                sender_id: "user".to_string(),
+                content: String::new(),
+                timestamp: chrono::Utc::now(),
+                media: vec![],
+                metadata: serde_json::json!({}),
+                message_id: None,
+            },
+            image_media: vec![],
+            attachment_media: vec![attachment_path.to_string()],
+            attachment_prompt: Some(summary.to_string()),
         }
     }
 
@@ -3179,6 +5294,135 @@ mod tests {
             queue_mode,
             responsiveness,
             adaptive_router,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    async fn setup_actor_with_tools_and_session_key(
+        session_key: SessionKey,
+        agent_provider: Arc<dyn LlmProvider>,
+        tools: octos_agent::ToolRegistry,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-custom"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 2,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let user_workspace = dir.path().join("workspace");
+
+        let actor = SessionActor {
+            session_key: session_key.clone(),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace,
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    async fn setup_actor_with_timeout(
+        agent_provider: Arc<dyn LlmProvider>,
+        session_timeout: Duration,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<Mutex<SessionManager>>,
+    ) {
+        let session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let agent = Agent::new(AgentId::new("test-timeout"), agent_provider, tools, memory)
+            .with_config(AgentConfig {
+                save_episodes: false,
+                max_iterations: 1,
+                ..Default::default()
+            });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout,
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
             memory_store: None,
             active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
@@ -3541,6 +5785,9 @@ mod tests {
         tx.send(ActorMessage::BackgroundResult {
             task_label: "research".to_string(),
             content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: None,
         })
         .await
         .unwrap();
@@ -3576,12 +5823,500 @@ mod tests {
             // Reload from disk (actor writes via its own SessionHandle to per-user dir)
             let handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
             let session = handle.session();
-            let has_bg_msg = session
+            let report_messages: Vec<_> = session
                 .messages
                 .iter()
-                .any(|m| m.content.contains("Background task") && m.content.contains("research"));
-            assert!(has_bg_msg, "background result not found in session history");
+                .filter(|m| {
+                    m.role == MessageRole::Assistant
+                        && m.content.contains("research")
+                        && m.content.contains("completed")
+                })
+                .collect();
+            assert_eq!(
+                report_messages.len(),
+                1,
+                "expected exactly one persisted assistant report result, got: {:?}",
+                session.messages
+            );
         }
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_followup_background_result_notifies_without_rewrite_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_secs(4), make_response("primary done"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("long task")).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed with 5 findings.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: None,
+        })
+        .await
+        .unwrap();
+
+        let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while responses.len() < 2 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => responses.push(msg.content),
+                _ => break,
+            }
+        }
+
+        assert!(
+            responses
+                .iter()
+                .any(|r| r.contains("research") && r.contains("completed")),
+            "background notification not found in: {:?}",
+            responses
+        );
+        assert!(
+            responses.iter().any(|r| r.contains("primary done")),
+            "primary response not found in: {:?}",
+            responses
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let report_messages: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                m.role == MessageRole::Assistant
+                    && m.content.contains("research")
+                    && m.content.contains("completed")
+            })
+            .collect();
+        assert!(
+            report_messages.len() == 1,
+            "expected exactly one persisted assistant report result, got: {:?}",
+            session.messages
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|m| !m.content.contains("[REWRITE]")),
+            "rewrite prompt leaked into session history: {:?}",
+            session.messages
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_notification_persists_media_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let media_path = dir.path().join("podcast_full_test.mp3");
+        std::fs::write(&media_path, vec![1u8; 4096]).unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "podcast_generate".to_string(),
+            content: String::new(),
+            kind: BackgroundResultKind::Notification,
+            media: vec![media_path.to_string_lossy().to_string()],
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background notification was not persisted"
+        );
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("outbound timeout")
+            .expect("outbound message");
+        assert_eq!(
+            outbound.media,
+            vec![media_path.to_string_lossy().to_string()]
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let persisted = session.messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.media == vec![media_path.to_string_lossy().to_string()]
+        });
+        assert!(persisted, "media notification not found in session history");
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_foreground_files_to_send_persist_as_topic_scoped_assistant_media() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
+        let absolute_deck = workspace.join(&relative_deck);
+        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
+        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
+
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        tools.register(FilesToSendOnlyTool {
+            file_path: relative_deck.clone(),
+        });
+
+        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "emit_deck",
+        });
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
+                .await;
+
+        tx.send(make_inbound("generate the deck")).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_terminal_reply = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if msg.content.contains("done") {
+                        saw_terminal_reply = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_terminal_reply, "terminal reply not observed");
+
+        let session_handle = SessionHandle::open(dir.path(), &session_key);
+        let session = session_handle.session();
+        let persisted = session.messages.iter().find(|message| {
+            message.role == MessageRole::Assistant && message.content == "done"
+        });
+        let persisted = persisted.expect("assistant reply should be persisted");
+        let expected_deck = std::fs::canonicalize(&absolute_deck)
+            .unwrap_or_else(|_| absolute_deck.clone())
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            persisted.media,
+            vec![expected_deck]
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_foreground_slides_file_modified_falls_back_to_assistant_media() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
+        let absolute_deck = workspace.join(&relative_deck);
+        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
+        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
+
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        tools.register(FileModifiedOnlyTool {
+            file_path: relative_deck.clone(),
+        });
+
+        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "emit_deck_file_modified",
+        });
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
+                .await;
+
+        tx.send(make_inbound("generate the deck")).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_terminal_reply = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if msg.content.contains("done") {
+                        saw_terminal_reply = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_terminal_reply, "terminal reply not observed");
+
+        let session_handle = SessionHandle::open(dir.path(), &session_key);
+        let session = session_handle.session();
+        let persisted = session.messages.iter().find(|message| {
+            message.role == MessageRole::Assistant && message.content == "done"
+        });
+        let persisted = persisted.expect("assistant reply should be persisted");
+        let expected_deck = std::fs::canonicalize(&absolute_deck)
+            .unwrap_or_else(|_| absolute_deck.clone())
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(persisted.media, vec![expected_deck]);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_foreground_slides_tool_output_falls_back_to_assistant_media() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
+        let absolute_deck = workspace.join(&relative_deck);
+        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
+        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
+
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        tools.register(RawGeneratedDeckTool {
+            file_path: absolute_deck.clone(),
+        });
+
+        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
+            calls: AtomicUsize::new(0),
+            tool_name: "emit_deck_raw_output",
+        });
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
+                .await;
+
+        tx.send(make_inbound("generate the deck")).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_terminal_reply = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if msg.content.contains("done") {
+                        saw_terminal_reply = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_terminal_reply, "terminal reply not observed");
+
+        let session_handle = SessionHandle::open(dir.path(), &session_key);
+        let session = session_handle.session();
+        let persisted = session.messages.iter().find(|message| {
+            message.role == MessageRole::Assistant && message.content == "done"
+        });
+        let persisted = persisted.expect("assistant reply should be persisted");
+        let expected_deck = std::fs::canonicalize(&absolute_deck)
+            .unwrap_or_else(|_| absolute_deck.clone())
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(persisted.media, vec![expected_deck]);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_background_notification_ack_stays_persisted_when_live_fanout_is_closed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new("agent", vec![]));
+        let (tx, rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+        drop(rx);
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        tx.send(ActorMessage::BackgroundResult {
+            task_label: "research".to_string(),
+            content: "Background research completed.".to_string(),
+            kind: BackgroundResultKind::Report,
+            media: vec![],
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ack_rx)
+                .await
+                .expect("ack timeout")
+                .expect("actor ack"),
+            "background report should still count as persisted when live fanout is unavailable"
+        );
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content.contains("Background research completed")),
+            "persisted background result not found in session history"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_timeout_failure_persists_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(Duration::from_millis(250), make_response("late reply"))],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_timeout(agent_llm, Duration::from_millis(50), &dir).await;
+
+        tx.send(make_inbound("slow request")).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout response")
+            .expect("outbound timeout message");
+        assert_eq!(outbound.content, "Processing timed out. Please try again.");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content == "Processing timed out. Please try again."),
+            "timeout message not found in session history: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_agent_error_persists_to_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_llm = Arc::new(ErrorMockProvider::new("agent", "scripted failure"));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_inbound("cause failure")).await.unwrap();
+
+        let outbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("error response")
+            .expect("outbound error message");
+        assert_eq!(outbound.content, "Error: scripted failure");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message.content == "Error: scripted failure"),
+            "error message not found in session history: {:?}",
+            session
+                .messages
+                .iter()
+                .map(|message| (message.role, message.content.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_attachment_hints_do_not_persist_in_session_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let agent_llm = Arc::new(DelayedMockProvider::new(
+            "agent",
+            vec![(
+                Duration::from_millis(50),
+                make_response("attachment processed"),
+            )],
+        ));
+
+        let (tx, mut rx, handle, _session_mgr) =
+            setup_actor_with_mode(agent_llm, QueueMode::Followup, None, false, &dir).await;
+
+        tx.send(make_attachment_inbound(
+            "[Attached files]\n- report.pdf",
+            "/tmp/uploads/report.pdf",
+        ))
+        .await
+        .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("response timeout")
+            .expect("channel closed");
+
+        let session_handle = SessionHandle::open(dir.path(), &SessionKey::new("cli", "test"));
+        let session = session_handle.session();
+        let contents = session
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| *content == "[User sent attachments]"),
+            "generic attachment placeholder missing from history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("[Attached files]")),
+            "transient attachment prompt leaked into history: {:?}",
+            contents
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("report.pdf")),
+            "attachment filename leaked into history: {:?}",
+            contents
+        );
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -3987,6 +6722,7 @@ mod tests {
                 ..Default::default()
             },
             llm: provider.clone(),
+            llm_strong: provider.clone(),
             llm_for_compaction: provider.clone(),
             memory,
             system_prompt: Arc::new(std::sync::RwLock::new("default prompt".to_string())),
@@ -4014,6 +6750,9 @@ mod tests {
             queue_mode: QueueMode::Followup,
             adaptive_router: None,
             memory_store: None,
+            plugin_dirs: Vec::new(),
+            plugin_extra_env: Vec::new(),
+            task_query_store: SessionTaskQueryStore::default(),
         };
 
         let registry = ActorRegistry::new(
@@ -4047,6 +6786,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4087,6 +6828,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4127,6 +6870,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg1,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4151,6 +6896,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg2,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk,
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4198,6 +6945,8 @@ mod tests {
             .dispatch(DispatchParams {
                 message: msg,
                 image_media: vec![],
+                attachment_media: vec![],
+                attachment_prompt: None,
                 session_key: sk.clone(),
                 reply_channel: "matrix",
                 reply_chat_id: "!room:localhost",
@@ -4254,5 +7003,241 @@ mod tests {
         assert_eq!(news.get_history(10).len(), 1);
         assert_eq!(weather.get_history(10)[0].content, "weather message");
         assert_eq!(news.get_history(10)[0].content, "news message");
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_creates_child_history_and_terminal_note() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent");
+        let child = SessionKey("api:parent#child-task-123".to_string());
+
+        let mut parent_handle = SessionHandle::open(dir.path(), &parent);
+        parent_handle
+            .add_message(Message::user("Research today’s market moves"))
+            .await
+            .unwrap();
+        parent_handle
+            .add_message(Message::assistant("Starting research"))
+            .await
+            .unwrap();
+
+        let spawned = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Spawned,
+            task_id: "task-123".to_string(),
+            task_label: "Research report".to_string(),
+            instruction: "Research today’s market moves".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("research".to_string()),
+            output_files: Vec::new(),
+            failure_action: None,
+            error: None,
+        };
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &spawned)
+                .await
+                .unwrap()
+        );
+
+        let completed = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Completed,
+            current_phase: Some("deliver_result".to_string()),
+            output_files: vec!["/tmp/report.md".to_string()],
+            ..spawned.clone()
+        };
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &completed)
+                .await
+                .unwrap()
+        );
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert_eq!(child_session.child_contracts.len(), 1);
+        let contract = &child_session.child_contracts[0];
+        assert_eq!(contract.task_id, "task-123");
+        assert_eq!(
+            contract.terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert_eq!(contract.join_state, Some(ChildSessionJoinState::Joined));
+        assert!(contract.joined_at.is_some());
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content == "Starting research"),
+            "child session should copy recent parent history"
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::System
+                    && message.content.contains("Background child session created")),
+            "child session should record spawn note"
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Assistant
+                    && message
+                        .content
+                        .contains("Background task \"Research report\" completed.")
+                    && message.content.contains("Join state: joined")
+                    && message.content.contains("/tmp/report.md")),
+            "child session should record terminal result"
+        );
+
+        let parent_handle = SessionHandle::open(dir.path(), &parent);
+        let parent_session = parent_handle.session();
+        assert_eq!(parent_session.child_contracts.len(), 1);
+        assert_eq!(
+            parent_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_marks_orphaned_terminal_events() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "missing-parent");
+        let child = SessionKey("api:missing-parent#child-task-404".to_string());
+
+        let completed = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::Completed,
+            task_id: "task-404".to_string(),
+            task_label: "Orphaned research".to_string(),
+            instruction: "Research the missing context".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("deliver_result".to_string()),
+            output_files: vec!["/tmp/orphaned.md".to_string()],
+            failure_action: None,
+            error: None,
+        };
+
+        assert!(
+            !persist_child_session_lifecycle(dir.path(), &completed)
+                .await
+                .unwrap()
+        );
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.child_contracts.len(), 1);
+        assert_eq!(
+            child_session.child_contracts[0].join_state,
+            Some(ChildSessionJoinState::Orphaned)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::Completed)
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Join state: orphaned"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persist_child_session_lifecycle_repairs_join_when_terminal_arrives_first() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let parent = SessionKey::new("api", "parent-session");
+        let child = SessionKey("api:parent-session#child-task-555".to_string());
+
+        let mut parent_handle = SessionHandle::open(dir.path(), &parent);
+        parent_handle
+            .add_message(Message::user("Start research"))
+            .await
+            .unwrap();
+
+        let terminal = ChildSessionLifecyclePayload {
+            kind: ChildSessionLifecycleKind::RetryableFailed,
+            task_id: "task-555".to_string(),
+            task_label: "Research retry".to_string(),
+            instruction: "Research with flaky upstream".to_string(),
+            parent_session_key: parent.to_string(),
+            child_session_key: child.to_string(),
+            workflow_kind: Some("deep_research".to_string()),
+            current_phase: Some("research".to_string()),
+            output_files: Vec::new(),
+            failure_action: Some(ChildSessionFailureAction::Retry),
+            error: Some("Upstream timed out".to_string()),
+        };
+
+        assert!(
+            persist_child_session_lifecycle(dir.path(), &terminal)
+                .await
+                .unwrap()
+        );
+
+        let child_handle = SessionHandle::open(dir.path(), &child);
+        let child_session = child_handle.session();
+        assert_eq!(child_session.parent_key, Some(parent.clone()));
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.content == "Start research"),
+            "terminal-only join should still seed recent parent history"
+        );
+        assert_eq!(
+            child_session.child_contracts[0].join_state,
+            Some(ChildSessionJoinState::Joined)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].terminal_state,
+            Some(ChildSessionTerminalState::RetryableFailure)
+        );
+        assert_eq!(
+            child_session.child_contracts[0].failure_action,
+            Some(PersistedChildSessionFailureAction::Retry)
+        );
+        assert!(
+            child_session.messages.iter().any(|message| {
+                message.content.contains("Failure action: retry")
+                    && message
+                        .content
+                        .contains("Next step: retry from the parent session")
+            }),
+            "retry policy note missing from terminal child session update"
+        );
+    }
+
+    #[test]
+    fn forced_background_workflow_detects_deep_research() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background(
+                "请对「全球AI代理竞争格局」做一次深度研究，并输出完整报告。"
+            ),
+            Some(WorkflowKind::DeepResearch)
+        );
+    }
+
+    #[test]
+    fn forced_background_workflow_detects_research_podcast() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background(
+                "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻，要求专业冷静。"
+            ),
+            Some(WorkflowKind::ResearchPodcast)
+        );
+    }
+
+    #[test]
+    fn forced_background_workflow_respects_foreground_override() {
+        assert_eq!(
+            WorkflowKind::detect_forced_background(
+                "请同步等待完成，不要后台。对这个主题做深度研究并直接在这里输出。"
+            ),
+            None
+        );
     }
 }
