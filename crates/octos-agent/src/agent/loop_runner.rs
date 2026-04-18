@@ -9,17 +9,17 @@ use eyre::Result;
 use octos_core::{Message, MessageRole, Task, TaskResult, TokenUsage};
 use octos_llm::{ChatConfig, ChatResponse, StopReason};
 use octos_memory::{Episode, EpisodeOutcome};
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{info, info_span, warn, Instrument};
 
 use super::activity::{ActivityTrackingReporter, LoopActivityState};
 use super::loop_compaction::{prepare_conversation_messages, prepare_task_messages};
 use super::message_repair::sanitize_tool_call_id;
 use super::turn_state::{LoopRetryReason, LoopTurnState};
-use super::{Agent, ConversationResponse, TASK_REPORTER, TokenTracker};
+use super::{Agent, ConversationResponse, TokenTracker, TASK_REPORTER};
 use crate::loop_detect::LoopDetector;
 use crate::progress::ProgressEvent;
 use crate::session::SessionLimits;
-use crate::tools::{TURN_ATTACHMENT_CTX, TurnAttachmentContext};
+use crate::tools::{TurnAttachmentContext, TURN_ATTACHMENT_CTX};
 
 const MAX_PARALLEL_TOOL_CALLS_PER_BATCH: usize = 8;
 const SHELL_RETRY_RECOVERY_THRESHOLD: usize = 4;
@@ -1053,8 +1053,8 @@ fn shell_retry_limit_message(content: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
 
     use async_trait::async_trait;
     use octos_core::{AgentId, MessageRole, TaskContext, TaskKind, ToolCall};

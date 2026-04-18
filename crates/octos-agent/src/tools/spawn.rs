@@ -1,8 +1,8 @@
 //! Spawn tool for background subagent execution.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use eyre::{Result, WrapErr};
@@ -16,8 +16,8 @@ use tracing::{info, warn};
 use super::{Tool, ToolPolicy, ToolRegistry, ToolResult};
 use crate::task_supervisor::TaskSupervisor;
 use crate::workspace_git::{
-    WorkspaceContractStatus, WorkspaceProjectKind,
     resolve_preferred_workspace_contract_artifact_path, resolve_workspace_contract_artifact_paths,
+    WorkspaceContractStatus, WorkspaceProjectKind,
 };
 use crate::{Agent, AgentConfig};
 
@@ -1639,12 +1639,10 @@ mod tests {
                 if task.status == crate::task_supervisor::TaskStatus::Completed {
                     assert_eq!(
                         task.output_files,
-                        vec![
-                            repo_root
-                                .join("output/deck.pptx")
-                                .to_string_lossy()
-                                .to_string()
-                        ]
+                        vec![repo_root
+                            .join("output/deck.pptx")
+                            .to_string_lossy()
+                            .to_string()]
                     );
                     break;
                 }
@@ -1666,12 +1664,10 @@ mod tests {
         );
         assert_eq!(
             tasks[0].output_files,
-            vec![
-                repo_root
-                    .join("output/deck.pptx")
-                    .to_string_lossy()
-                    .to_string()
-            ]
+            vec![repo_root
+                .join("output/deck.pptx")
+                .to_string_lossy()
+                .to_string()]
         );
     }
 

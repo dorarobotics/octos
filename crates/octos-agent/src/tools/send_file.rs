@@ -74,10 +74,7 @@ impl SendFileTool {
     /// Bind the current session topic so API send_file deliveries are persisted
     /// into the correct topic-scoped history instead of default.jsonl.
     pub fn with_topic(self, topic: Option<String>) -> Self {
-        *self
-            .default_topic
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = topic;
+        *self.default_topic.lock().unwrap_or_else(|e| e.into_inner()) = topic;
         self
     }
 

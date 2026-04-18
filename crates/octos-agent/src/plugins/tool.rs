@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::progress::ProgressEvent;
-use crate::tools::{TOOL_CTX, Tool, ToolContext, ToolResult};
+use crate::tools::{Tool, ToolContext, ToolResult, TOOL_CTX};
 
 use super::manifest::PluginToolDef;
 
@@ -118,13 +118,14 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style"
-                && let Some(style) = value.as_str()
-                    && let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir)
-                {
-                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
-                    continue;
+            if key == "style" {
+                if let Some(style) = value.as_str() {
+                    if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
+                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                        continue;
+                    }
                 }
+            }
             if key == "slides" {
                 if let Some(slides) = value.as_array() {
                     let rewritten_slides = slides
@@ -174,13 +175,15 @@ impl PluginTool {
                 .unwrap_or(false);
             if !has_audio_path
                 && input_schema_has_property(&self.tool_def.input_schema, "audio_path")
-                && let Some(ctx) = ctx
-                && ctx.audio_attachment_paths.len() == 1
             {
-                obj.insert(
-                    "audio_path".into(),
-                    serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.audio_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "audio_path".into(),
+                            serde_json::Value::String(ctx.audio_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
 
             let has_file_path = obj
@@ -188,15 +191,16 @@ impl PluginTool {
                 .and_then(|value| value.as_str())
                 .map(|value| !value.is_empty())
                 .unwrap_or(false);
-            if !has_file_path
-                && input_schema_has_property(&self.tool_def.input_schema, "file_path")
-                && let Some(ctx) = ctx
-                && ctx.file_attachment_paths.len() == 1
+            if !has_file_path && input_schema_has_property(&self.tool_def.input_schema, "file_path")
             {
-                obj.insert(
-                    "file_path".into(),
-                    serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
-                );
+                if let Some(ctx) = ctx {
+                    if ctx.file_attachment_paths.len() == 1 {
+                        obj.insert(
+                            "file_path".into(),
+                            serde_json::Value::String(ctx.file_attachment_paths[0].clone()),
+                        );
+                    }
+                }
             }
         }
 
@@ -950,7 +954,10 @@ mod tests {
             .with_work_dir(dir.path().to_path_buf())
             .with_timeout(Duration::from_secs(5));
 
-        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
 
         assert!(result.success);
         assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
@@ -986,12 +993,18 @@ mod tests {
             .with_work_dir(dir.path().to_path_buf())
             .with_timeout(Duration::from_secs(5));
 
-        let result = tool.execute(&json!({"out": output_rel})).await.expect("should succeed");
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
 
         assert!(result.success);
         assert_eq!(result.file_modified.as_deref(), Some(output_abs.as_path()));
         assert_eq!(result.files_to_send, vec![output_abs.clone()]);
-        assert!(output_abs.exists(), "generated deck should appear after fallback wait");
+        assert!(
+            output_abs.exists(),
+            "generated deck should appear after fallback wait"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
