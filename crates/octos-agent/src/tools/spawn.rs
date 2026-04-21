@@ -1644,11 +1644,11 @@ mod tests {
                 "task": "Build the deck",
                 "label": "Slides deliverable",
                 "mode": "background",
-                "allowed_tools": ["mofa_slides"],
+                "allowed_tools": [],
                 "workflow": {
                     "workflow_kind": "slides",
                     "current_phase": "design",
-                    "allowed_tools": ["mofa_slides"],
+                    "allowed_tools": [],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "deliver_media_only": false,
@@ -1732,11 +1732,11 @@ mod tests {
                 "task": "Build the deck",
                 "label": "Slides deliverable",
                 "mode": "background",
-                "allowed_tools": ["mofa_slides"],
+                "allowed_tools": [],
                 "workflow": {
                     "workflow_kind": "slides",
                     "current_phase": "design",
-                    "allowed_tools": ["mofa_slides"],
+                    "allowed_tools": [],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "deliver_media_only": false,
@@ -1977,11 +1977,11 @@ mod tests {
                 "task": "Produce a short podcast",
                 "label": "Research podcast",
                 "mode": "background",
-                "allowed_tools": ["podcast_generate"],
+                "allowed_tools": [],
                 "workflow": {
                     "workflow_kind": "research_podcast",
                     "current_phase": "research",
-                    "allowed_tools": ["podcast_generate"],
+                    "allowed_tools": [],
                     "terminal_output": {
                         "deliver_final_artifact_only": true,
                         "deliver_media_only": true,
