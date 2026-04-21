@@ -32,6 +32,20 @@ fn split_tool_calls(
     tool_calls.chunks(batch_size).collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellRetryRecoveryKind {
+    DiffLikeSuccess,
+    UsefulSuccess,
+    ValidationSuccess,
+    RetryLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellRetryRecovery {
+    kind: ShellRetryRecoveryKind,
+    content: String,
+}
+
 impl Agent {
     fn enforce_session_limits_on_tool_calls(
         &self,
@@ -286,7 +300,7 @@ impl Agent {
                         message_bytes = messages.iter().map(|m| m.content.len()).sum::<usize>(),
                         "calling LLM"
                     );
-                    let (response, streamed) = match self
+                    let (mut response, streamed) = match self
                         .call_llm_with_hooks(
                             &messages,
                             &tools_spec,
@@ -321,6 +335,7 @@ impl Agent {
                         }
                         Err(e) => return Err(e),
                     };
+                    Self::normalize_inline_invokes(&mut response);
                     self.reporter().report(ProgressEvent::Response {
                         content: response.content.clone().unwrap_or_default(),
                         iteration,
@@ -376,13 +391,17 @@ impl Agent {
                                 if let Some(warning) = loop_detector.record(&tc.name, &tc.arguments)
                                 {
                                     warn!("loop detected — breaking agent loop");
-                                    if let Some(recovered) = recover_shell_retry_output(
+                                    if let Some(recovery) = recover_shell_retry(
                                         &messages,
                                         SHELL_RETRY_RECOVERY_THRESHOLD,
                                     ) {
+                                        warn!(
+                                            recovery_kind = ?recovery.kind,
+                                            "loop detected after repeated shell attempts; returning recovered shell output"
+                                        );
                                         self.emit_cost_update(turn.total_usage(), &response.usage);
                                         return Ok(ConversationResponse {
-                                            content: recovered,
+                                            content: recovery.content,
                                             reasoning_content: None,
                                             provider_metadata: None,
                                             token_usage: turn.total_usage().clone(),
@@ -422,13 +441,17 @@ impl Agent {
                             )
                             .await?;
 
-                            if let Some(recovered) = recover_shell_retry_output(
+                            if let Some(recovery) = recover_shell_retry(
                                 &messages,
                                 SHELL_RETRY_RECOVERY_THRESHOLD,
                             ) {
+                                warn!(
+                                    recovery_kind = ?recovery.kind,
+                                    "ending turn after repeated shell attempts with recovered shell output"
+                                );
                                 self.emit_cost_update(turn.total_usage(), &response.usage);
                                 return Ok(ConversationResponse {
-                                    content: recovered,
+                                    content: recovery.content,
                                     reasoning_content: None,
                                     provider_metadata: Some(
                                         self.llm.provider_metadata_for_index(
@@ -586,7 +609,7 @@ impl Agent {
                 prepare_task_messages(self, &mut messages, &mut turn);
                 let total_usage = turn.total_usage().clone();
 
-                let (response, _streamed) = self
+                let (mut response, _streamed) = self
                     .call_llm_with_hooks(
                         &messages,
                         &tools_spec,
@@ -596,6 +619,7 @@ impl Agent {
                         &mut turn,
                     )
                     .await?;
+                Self::normalize_inline_invokes(&mut response);
                 turn.record_usage(response.usage.input_tokens, response.usage.output_tokens, None);
 
                 let tool_names: Vec<&str> = response
@@ -923,7 +947,10 @@ fn merge_tool_messages_in_order(
     ordered
 }
 
-fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> Option<String> {
+fn recover_shell_retry(
+    messages: &[Message],
+    min_shell_streak: usize,
+) -> Option<ShellRetryRecovery> {
     let recent = recent_tool_results(messages, min_shell_streak * 3);
     let shell_results: Vec<&str> = recent
         .iter()
@@ -943,7 +970,10 @@ fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> 
     shell_results
         .iter()
         .find(|content| is_diff_like_shell_output(content))
-        .map(|content| strip_success_exit_suffix(content))
+        .map(|content| ShellRetryRecovery {
+            kind: ShellRetryRecoveryKind::DiffLikeSuccess,
+            content: strip_success_exit_suffix(content),
+        })
         .or_else(|| {
             (failed_shells >= 2)
                 .then(|| {
@@ -952,13 +982,32 @@ fn recover_shell_retry_output(messages: &[Message], min_shell_streak: usize) -> 
                         .find(|content| is_validation_like_shell_output(content))
                 })
                 .flatten()
-                .map(|content| strip_success_exit_suffix(content))
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::ValidationSuccess,
+                    content: strip_success_exit_suffix(content),
+                })
+        })
+        .or_else(|| {
+            (failed_shells >= 1)
+                .then(|| {
+                    shell_results
+                        .iter()
+                        .find(|content| is_recoverable_non_diff_shell_output(content))
+                })
+                .flatten()
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::UsefulSuccess,
+                    content: strip_success_exit_suffix(content),
+                })
         })
         .or_else(|| {
             (failed_shells >= min_shell_streak.saturating_sub(1))
                 .then(|| shell_results.first().copied())
                 .flatten()
-                .map(shell_retry_limit_message)
+                .map(|content| ShellRetryRecovery {
+                    kind: ShellRetryRecoveryKind::RetryLimit,
+                    content: shell_retry_limit_message(content),
+                })
         })
 }
 
@@ -1034,6 +1083,25 @@ fn is_validation_like_shell_output(content: &str) -> bool {
         .any(|marker| content.contains(marker))
 }
 
+fn is_recoverable_non_diff_shell_output(content: &str) -> bool {
+    is_useful_shell_output(content) && content.lines().any(is_git_status_short_line)
+}
+
+fn is_git_status_short_line(line: &str) -> bool {
+    let line = line.trim_end();
+    let bytes = line.as_bytes();
+    if bytes.len() < 4 || !bytes[2].is_ascii_whitespace() {
+        return false;
+    }
+
+    let status = &line[..2];
+    let has_status = status.chars().any(|ch| ch != ' ');
+    let valid_status = status
+        .chars()
+        .all(|ch| matches!(ch, ' ' | 'M' | 'A' | 'D' | 'R' | 'C' | 'U' | '?' | '!'));
+    has_status && valid_status && !line[3..].trim().is_empty()
+}
+
 fn strip_success_exit_suffix(content: &str) -> String {
     content
         .strip_suffix("\n\nExit code: 0")
@@ -1061,7 +1129,9 @@ mod tests {
     use octos_llm::{ChatResponse, LlmProvider, StopReason, TokenUsage as LlmTokenUsage};
     use octos_memory::EpisodeStore;
 
-    use crate::tools::{Tool, ToolRegistry, ToolResult};
+    use crate::plugins::manifest::PluginToolDef;
+    use crate::plugins::PluginTool;
+    use crate::tools::{Tool, ToolRegistry, ToolResult, TurnAttachmentContext};
 
     struct FilesToSendOnlyTool {
         file_path: PathBuf,
@@ -1337,6 +1407,87 @@ mod tests {
         }
     }
 
+    struct ConsecutiveVoiceSaveProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for ConsecutiveVoiceSaveProvider {
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _tools: &[octos_llm::ToolSpec],
+            _config: &octos_llm::ChatConfig,
+        ) -> Result<ChatResponse> {
+            let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let response = match call {
+                0 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_save_yangmi".to_string(),
+                        name: "fm_voice_save".to_string(),
+                        arguments: serde_json::json!({"name": "yangmi"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                1 => ChatResponse {
+                    content: Some("yangmi saved".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                2 => ChatResponse {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_save_douwentao".to_string(),
+                        name: "fm_voice_save".to_string(),
+                        arguments: serde_json::json!({"name": "douwentao"}),
+                        metadata: None,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+                _ => ChatResponse {
+                    content: Some("douwentao saved".to_string()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    stop_reason: StopReason::EndTurn,
+                    usage: LlmTokenUsage::default(),
+                    provider_index: None,
+                },
+            };
+            Ok(response)
+        }
+
+        fn model_id(&self) -> &str {
+            "mock"
+        }
+
+        fn provider_name(&self) -> &str {
+            "mock"
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_test_script(path: &std::path::Path, content: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[tokio::test]
     async fn run_task_collects_files_to_send_without_file_modified() {
         let dir = tempfile::tempdir().unwrap();
@@ -1464,6 +1615,102 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn process_message_injects_distinct_audio_attachments_for_consecutive_voice_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_log = dir.path().join("plugin-inputs.jsonl");
+        let script_path = dir.path().join("mofa-fm-test.sh");
+        write_test_script(
+            &script_path,
+            r#"#!/bin/sh
+INPUT=$(cat)
+printf '%s\n' "$INPUT" >> "$INPUT_LOG"
+printf '{"output":"voice saved","success":true}\n'
+"#,
+        );
+
+        let first_audio = dir.path().join("yangmi_ref2.wav");
+        let second_audio = dir.path().join("douwentao.wav");
+        std::fs::write(&first_audio, b"fake wav 1").unwrap();
+        std::fs::write(&second_audio, b"fake wav 2").unwrap();
+        let first_audio = first_audio.to_string_lossy().into_owned();
+        let second_audio = second_audio.to_string_lossy().into_owned();
+
+        let def = PluginToolDef {
+            name: "fm_voice_save".to_string(),
+            description: "Save a cloned voice".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "audio_path": {"type": "string"}
+                },
+                "required": ["name", "audio_path"]
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let plugin = PluginTool::new("mofa-fm".into(), def, script_path).with_extra_env(vec![(
+            "INPUT_LOG".into(),
+            input_log.to_string_lossy().into_owned(),
+        )]);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(plugin);
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(ConsecutiveVoiceSaveProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let agent = Agent::new(AgentId::new("test-agent"), provider, tools, memory);
+
+        let first = agent
+            .process_message_with_attachments(
+                "克隆 yangmi 语音",
+                &[],
+                vec![],
+                TurnAttachmentContext {
+                    attachment_paths: vec![first_audio.clone()],
+                    audio_attachment_paths: vec![first_audio.clone()],
+                    file_attachment_paths: vec![],
+                    prompt_summary: Some("[Attached audio files]\n- yangmi_ref2.wav".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.content, "yangmi saved");
+
+        let second = agent
+            .process_message_with_attachments(
+                "克隆窦文涛语音",
+                &first.messages,
+                vec![],
+                TurnAttachmentContext {
+                    attachment_paths: vec![second_audio.clone()],
+                    audio_attachment_paths: vec![second_audio.clone()],
+                    file_attachment_paths: vec![],
+                    prompt_summary: Some("[Attached audio files]\n- douwentao.wav".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.content, "douwentao saved");
+
+        let log = std::fs::read_to_string(&input_log).unwrap();
+        let inputs = log
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["name"], "yangmi");
+        assert_eq!(inputs[0]["audio_path"], first_audio);
+        assert_eq!(inputs[1]["name"], "douwentao");
+        assert_eq!(inputs[1]["audio_path"], second_audio);
+    }
+
     #[test]
     fn split_tool_calls_caps_parallel_batches() {
         let tool_calls: Vec<ToolCall> = (0..9)
@@ -1581,9 +1828,10 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should recover");
-        assert!(recovered.contains("diff --git"));
-        assert!(!recovered.contains("Exit code: 0"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
+        assert!(recovered.content.contains("diff --git"));
+        assert!(!recovered.content.contains("Exit code: 0"));
     }
 
     #[test]
@@ -1707,9 +1955,420 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should recover");
-        assert!(recovered.contains("diff --git"));
-        assert!(!recovered.contains("Exit code: 0"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::DiffLikeSuccess);
+        assert!(recovered.content.contains("diff --git"));
+        assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_accepts_useful_non_diff_success() {
+        let messages = vec![
+            Message::user("repair the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: first failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --workspace"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: second failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git status --short"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --locked"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: third failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::UsefulSuccess);
+        assert!(recovered.content.contains("src/lib.rs"));
+        assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_does_not_return_git_commit_setup_output() {
+        let messages = vec![
+            Message::user("return the final diff"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "mkdir repo && cd repo && git init"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "Initialized empty Git repository in /tmp/repo/.git/\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cd repo && git commit -m initial"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "[master (root-commit) 1e19620] initial commit\n 1 file changed, 2 insertions(+)\n create mode 100644 notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git diff -- notes.txt"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "fatal: ambiguous argument 'notes.txt'\n\nExit code: 128".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "/tmp\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(recover_shell_retry(&messages, 4).is_none());
+    }
+
+    #[test]
+    fn recover_shell_retry_output_prefers_validation_success_over_useful_success() {
+        let messages = vec![
+            Message::user("repair the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: first failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --workspace"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: second failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test broken_case -- --nocapture"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "test result: ok. 1 passed; 0 failed\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cargo test --locked"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "error: third failure\n\nExit code: 101".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        let recovered = recover_shell_retry(&messages, 4).expect("should recover");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::ValidationSuccess);
+        assert!(recovered.content.contains("test result: ok"));
+        assert!(!recovered.content.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn recover_shell_retry_output_requires_failure_before_useful_success() {
+        let messages = vec![
+            Message::user("inspect the repo"),
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "pwd"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "/tmp/octos\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_1".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_2".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "ls src"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "lib.rs\nmain.rs\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_2".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_3".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "git status --short"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: " M src/lib.rs\n?? notes.txt\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_3".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                media: vec![],
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_shell_4".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::json!({"command": "cat Cargo.toml"}),
+                    metadata: None,
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: "[package]\nname = \"octos\"\n\nExit code: 0".into(),
+                media: vec![],
+                tool_calls: None,
+                tool_call_id: Some("call_shell_4".into()),
+                reasoning_content: None,
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        assert!(recover_shell_retry(&messages, 4).is_none());
     }
 
     #[test]
@@ -1810,8 +2469,9 @@ mod tests {
             },
         ];
 
-        let recovered = recover_shell_retry_output(&messages, 4).expect("should stop");
-        assert!(recovered.contains("[SHELL RETRY LIMIT]"));
-        assert!(recovered.contains("could not find Cargo.toml"));
+        let recovered = recover_shell_retry(&messages, 4).expect("should stop");
+        assert_eq!(recovered.kind, ShellRetryRecoveryKind::RetryLimit);
+        assert!(recovered.content.contains("[SHELL RETRY LIMIT]"));
+        assert!(recovered.content.contains("could not find Cargo.toml"));
     }
 }

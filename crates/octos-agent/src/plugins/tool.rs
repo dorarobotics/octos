@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::progress::ProgressEvent;
+use crate::subprocess_env::{sanitize_command_env, should_forward_env_name, EnvAllowlist};
 use crate::tools::{Tool, ToolContext, ToolResult, TOOL_CTX};
 
 use super::manifest::PluginToolDef;
@@ -25,6 +26,7 @@ pub struct PluginTool {
     /// Environment variables to strip from the plugin's environment.
     blocked_env: Vec<String>,
     /// Extra environment variables to inject into the plugin's environment.
+    /// Secret-like names require the tool manifest's explicit env allowlist.
     extra_env: Vec<(String, String)>,
     /// Working directory for plugin execution (created on first use).
     work_dir: Option<PathBuf>,
@@ -118,12 +120,18 @@ impl PluginTool {
                     continue;
                 }
             }
-            if key == "style" {
-                if let Some(style) = value.as_str() {
-                    if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
-                        rewritten.insert(key.clone(), serde_json::Value::String(resolved));
-                        continue;
-                    }
+            if key == "style"
+                && let Some(style) = value.as_str()
+            {
+                if self.tool_def.name.starts_with("mofa_")
+                    && let Some(normalized) = normalize_mofa_style_name(style)
+                {
+                    rewritten.insert(key.clone(), serde_json::Value::String(normalized));
+                    continue;
+                }
+                if let Some(resolved) = resolve_slides_style_in_work_dir(style, work_dir) {
+                    rewritten.insert(key.clone(), serde_json::Value::String(resolved));
+                    continue;
                 }
             }
             if key == "slides" {
@@ -223,7 +231,7 @@ impl PluginTool {
         effective_args
     }
 
-    fn detect_output_file(
+    async fn detect_output_file(
         &self,
         effective_args: &serde_json::Value,
         output: &str,
@@ -274,23 +282,45 @@ impl PluginTool {
         } else {
             None
         };
-        let found = out_file.or(from_output).inspect(|path| {
-            if path.exists() {
-                return;
-            }
-
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if path.exists() {
-                    return;
+        let found = match out_file.or(from_output) {
+            Some(path) => {
+                let resolved = if path.exists() {
+                    path
+                } else {
+                    self.wait_for_output_file(path).await
+                };
+                if resolved.exists() {
+                    Some(resolved)
+                } else {
+                    tracing::warn!(
+                        file = %resolved.display(),
+                        "auto-detected plugin output file was not created; skipping delivery"
+                    );
+                    None
                 }
             }
-        });
+            None => None,
+        };
         if let Some(ref abs) = found {
             tracing::info!(file = %abs.display(), "auto-detected output file for delivery");
             files_to_send.push(abs.clone());
         }
         found
+    }
+
+    async fn wait_for_output_file(&self, path: std::path::PathBuf) -> std::path::PathBuf {
+        if path.exists() {
+            return path;
+        }
+
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if path.exists() {
+                return path;
+            }
+        }
+
+        path
     }
 }
 
@@ -366,6 +396,22 @@ fn resolve_slides_style_in_work_dir(style: &str, work_dir: &std::path::Path) -> 
         .then(|| resolved.to_string_lossy().into_owned())
 }
 
+fn normalize_mofa_style_name(style: &str) -> Option<String> {
+    let trimmed = style.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = std::path::Path::new(trimmed);
+    let filename = candidate.file_name()?.to_str()?.trim();
+    let mut normalized = filename;
+    while let Some(stripped) = normalized.strip_suffix(".toml") {
+        normalized = stripped;
+    }
+    let normalized = normalized.trim();
+    (!normalized.is_empty()).then(|| normalized.to_string())
+}
+
 #[async_trait]
 impl Tool for PluginTool {
     fn name(&self) -> &str {
@@ -415,6 +461,9 @@ impl Tool for PluginTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        let env_allowlist = EnvAllowlist::from_strings(&self.tool_def.env);
+        sanitize_command_env(&mut cmd, &env_allowlist);
+
         // Remove blocked environment variables
         for var in &self.blocked_env {
             cmd.env_remove(var);
@@ -422,7 +471,16 @@ impl Tool for PluginTool {
 
         // Inject extra environment variables (e.g. provider base URLs, API keys)
         for (key, val) in &self.extra_env {
-            cmd.env(key, val);
+            if should_forward_env_name(key, &env_allowlist) {
+                cmd.env(key, val);
+            } else {
+                tracing::debug!(
+                    plugin = %self.plugin_name,
+                    tool = %self.tool_def.name,
+                    env = %key,
+                    "skipping non-allowlisted secret environment variable for plugin tool"
+                );
+            }
         }
 
         // Set working directory so relative paths in tool args (e.g.
@@ -607,6 +665,7 @@ impl Tool for PluginTool {
             // Check multiple locations: work_dir, cwd, and the output text itself.
             let file_modified = if file_modified.is_none() && files_to_send.is_empty() {
                 self.detect_output_file(&effective_args, &output, &mut files_to_send)
+                    .await
             } else {
                 file_modified
             };
@@ -630,7 +689,9 @@ impl Tool for PluginTool {
         }
 
         let mut files_to_send = Vec::new();
-        let file_modified = self.detect_output_file(&effective_args, &output, &mut files_to_send);
+        let file_modified = self
+            .detect_output_file(&effective_args, &output, &mut files_to_send)
+            .await;
 
         Ok(ToolResult {
             output,
@@ -655,6 +716,7 @@ mod tests {
             description: desc.to_string(),
             input_schema: json!({"type": "object", "properties": {"msg": {"type": "string"}}}),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         }
     }
@@ -736,6 +798,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -770,6 +833,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -799,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_workspace_file_args_resolves_workspace_style_paths() {
+    fn rewrite_workspace_file_args_keeps_mofa_style_as_name() {
         let dir = tempfile::tempdir().unwrap();
         let styles = dir.path().join("styles");
         std::fs::create_dir_all(&styles).unwrap();
@@ -816,6 +880,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
@@ -825,7 +890,65 @@ mod tests {
             "style": "cyberpunk-neon"
         }));
 
-        assert_eq!(rewritten["style"], style.to_string_lossy().to_string());
+        assert_eq!(rewritten["style"], "cyberpunk-neon");
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_strips_mofa_style_toml_paths_to_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let styles = dir.path().join("styles");
+        std::fs::create_dir_all(&styles).unwrap();
+        let style = styles.join("cyberpunk-neon.toml");
+        std::fs::write(&style, b"[meta]\nname='Cyberpunk'\n").unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "style": style.to_string_lossy().to_string()
+        }));
+
+        assert_eq!(rewritten["style"], "cyberpunk-neon");
+    }
+
+    #[test]
+    fn rewrite_workspace_file_args_strips_repeated_mofa_style_toml_suffixes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "Slides tool".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "style": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"))
+            .with_work_dir(dir.path().to_path_buf());
+
+        let rewritten = tool.rewrite_workspace_file_args(&json!({
+            "style": "/tmp/styles/nb-pro.toml.toml"
+        }));
+
+        assert_eq!(rewritten["style"], "nb-pro");
     }
 
     #[test]
@@ -841,6 +964,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("plug".into(), def, PathBuf::from("/bin/true"));
@@ -907,6 +1031,56 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(unix)]
+    async fn execute_does_not_expose_secret_extra_env_without_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let def = make_tool_def("env_tool", "prints env");
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-regression".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "missing");
+        assert!(!result.output.contains("sk-octos-plugin-regression"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_exposes_secret_extra_env_with_tool_allowlist() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\nread INPUT || true\nVALUE=${OPENAI_API_KEY:-missing}\necho '{\"output\":\"'\"$VALUE\"'\",\"success\":true}'\n",
+        );
+
+        let mut def = make_tool_def("env_tool", "prints env");
+        def.env.push("OPENAI_API_KEY".into());
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_extra_env(vec![(
+                "OPENAI_API_KEY".into(),
+                "sk-octos-plugin-allowed".into(),
+            )])
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool.execute(&json!({})).await.expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.output, "sk-octos-plugin-allowed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
     async fn execute_fallback_on_non_json_stdout() {
         // Script that outputs plain text (not JSON).
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -948,6 +1122,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -987,6 +1162,7 @@ mod tests {
                 }
             }),
             spawn_only: false,
+            env: vec![],
             spawn_only_message: None,
         };
         let tool = PluginTool::new("p".into(), def, script_path)
@@ -1005,6 +1181,45 @@ mod tests {
             output_abs.exists(),
             "generated deck should appear after fallback wait"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(unix)]
+    async fn execute_fallback_skips_missing_generated_pptx() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let output_rel = "slides/demo/output/deck.pptx";
+
+        let script_path = dir.path().join("script.sh");
+        write_test_script(
+            &script_path,
+            "#!/bin/sh\necho 'Generated PPTX: slides/demo/output/deck.pptx'\n",
+        );
+
+        let def = PluginToolDef {
+            name: "mofa_slides".to_string(),
+            description: "slides output".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "out": {"type": "string"}
+                }
+            }),
+            spawn_only: false,
+            env: vec![],
+            spawn_only_message: None,
+        };
+        let tool = PluginTool::new("p".into(), def, script_path)
+            .with_work_dir(dir.path().to_path_buf())
+            .with_timeout(Duration::from_secs(5));
+
+        let result = tool
+            .execute(&json!({"out": output_rel}))
+            .await
+            .expect("should succeed");
+
+        assert!(result.success);
+        assert_eq!(result.file_modified, None);
+        assert!(result.files_to_send.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -13,6 +13,7 @@ use tokio::time::timeout;
 use super::{Tool, ToolResult};
 use crate::policy::{CommandPolicy, Decision, SafePolicy};
 use crate::sandbox::{NoSandbox, Sandbox};
+use crate::subprocess_env::{EnvAllowlist, sanitize_command_env};
 
 /// Tool for executing shell commands.
 pub struct ShellTool {
@@ -78,6 +79,54 @@ fn apply_frontend_tool_env(cmd: &mut tokio::process::Command, cwd: &Path) {
     cmd.env("ASTRO_TELEMETRY_DISABLED", "1")
         .env("NPM_CONFIG_CACHE", &cache_dir)
         .env("npm_config_cache", &cache_dir);
+}
+
+#[cfg(windows)]
+const NULL_DEVICE_PATH: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_DEVICE_PATH: &str = "/dev/null";
+
+fn contains_git_invocation(command: &str) -> bool {
+    command
+        .split(['\n', ';'])
+        .flat_map(|segment| segment.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .any(segment_invokes_git)
+}
+
+fn segment_invokes_git(segment: &str) -> bool {
+    let mut remaining = segment.trim_start();
+    loop {
+        if remaining == "git" || remaining.starts_with("git ") {
+            return true;
+        }
+        let Some(token_end) = remaining.find(char::is_whitespace) else {
+            return false;
+        };
+        let token = &remaining[..token_end];
+        if token == "env" || looks_like_env_assignment(token) {
+            remaining = remaining[token_end..].trim_start();
+            continue;
+        }
+        return false;
+    }
+}
+
+fn looks_like_env_assignment(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn apply_git_tool_env(cmd: &mut tokio::process::Command, command: &str) {
+    if contains_git_invocation(command) {
+        cmd.env("GIT_CONFIG_GLOBAL", NULL_DEVICE_PATH)
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,6 +214,8 @@ impl Tool for ShellTool {
         let mut cmd = self.sandbox.wrap_command(&input.command, &self.cwd);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         apply_frontend_tool_env(&mut cmd, &self.cwd);
+        apply_git_tool_env(&mut cmd, &input.command);
+        sanitize_command_env(&mut cmd, &EnvAllowlist::empty());
 
         let child = match cmd.spawn() {
             Ok(c) => c,
@@ -354,5 +405,52 @@ mod tests {
         let cache = lines.next().unwrap_or_default();
         assert!(cache.contains("octos-frontend-tool-cache"));
         assert!(!cache.contains(".octos-tool-cache"));
+    }
+
+    #[test]
+    fn shell_does_not_expose_configured_api_key_to_env_or_echo() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("tools::shell::tests::child_shell_api_key_not_visible")
+            .arg("--exact")
+            .arg("--ignored")
+            .env("OPENAI_API_KEY", "sk-octos-shell-regression")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child regression test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn child_shell_api_key_not_visible() {
+        let tool = ShellTool::new(std::env::temp_dir());
+        #[cfg(windows)]
+        let command = "if defined OPENAI_API_KEY (echo env=%OPENAI_API_KEY%) else (echo env_missing) & echo echo=%OPENAI_API_KEY%";
+        #[cfg(not(windows))]
+        let command = "if env | grep -q '^OPENAI_API_KEY='; then printf 'env=%s\\n' \"$OPENAI_API_KEY\"; else printf 'env_missing\\n'; fi; printf 'echo=%s\\n' \"$OPENAI_API_KEY\"";
+
+        let result = tool
+            .execute(&serde_json::json!({ "command": command }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "shell command failed: {}", result.output);
+        assert!(!result.output.contains("sk-octos-shell-regression"));
+        assert!(result.output.contains("env_missing"), "{}", result.output);
+    }
+
+    #[test]
+    fn detects_git_invocation_in_compound_shell_command() {
+        assert!(contains_git_invocation(
+            "cd /tmp/repo && git diff -- notes.txt"
+        ));
+        assert!(contains_git_invocation("GIT_DIR=.git git status --short"));
+        assert!(contains_git_invocation("env GIT_DIR=.git git status"));
+        assert!(!contains_git_invocation("printf 'git diff -- notes.txt'"));
     }
 }

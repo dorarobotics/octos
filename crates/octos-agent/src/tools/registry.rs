@@ -84,6 +84,8 @@ pub struct ToolRegistry {
     spawn_only_invoked: Arc<std::sync::atomic::AtomicBool>,
     /// Session key for tagging background tasks (set per-session).
     session_key: Option<String>,
+    /// Precomputed output directory hint for spawn_only tool messaging.
+    output_dir_hint: Option<String>,
 }
 
 impl Default for ToolRegistry {
@@ -110,6 +112,7 @@ impl ToolRegistry {
             supervisor: Arc::new(TaskSupervisor::new()),
             spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             session_key: None,
+            output_dir_hint: None,
         }
     }
 
@@ -152,11 +155,20 @@ impl ToolRegistry {
             .get(name)
             .cloned()
             .unwrap_or_else(|| "SUCCESS: Task is now running in background. The result will be delivered to the user automatically. No further action needed.".to_string());
-        // Include output dir from OCTOS_DATA_DIR so LLM can reference files if needed
-        let output_dir = std::env::var("OCTOS_DATA_DIR")
-            .map(|d| format!("{d}/skill-output/"))
-            .unwrap_or_else(|_| "skill-output/".to_string());
+        let output_dir = self
+            .output_dir_hint
+            .clone()
+            .unwrap_or_else(|| "skill-output/".to_string());
         format!("{base}\nOutput directory: {output_dir}")
+    }
+
+    /// Set the output directory hint included in spawn_only tool messages.
+    pub fn set_output_dir_hint(&mut self, output_dir: impl Into<String>) {
+        let mut output_dir = output_dir.into();
+        if !output_dir.ends_with('/') {
+            output_dir.push('/');
+        }
+        self.output_dir_hint = Some(output_dir);
     }
 
     /// Set background result sender for spawn_only task lifecycle notifications.
@@ -324,7 +336,9 @@ impl ToolRegistry {
     /// Create a new ToolRegistry by cloning all tools except the named exclusions.
     ///
     /// The new registry shares the same `Arc<dyn Tool>` instances (cheap).
-    /// Provider policy and context filter are also copied.
+    /// Provider policy and context filter are also copied. Runtime state that
+    /// is session-scoped stays fresh so cloned registries cannot leak task
+    /// status, result routing, or spawn-only flags across sessions.
     pub fn snapshot_excluding(&self, exclude: &[&str]) -> Self {
         let tools: HashMap<String, Arc<dyn Tool>> = self
             .tools
@@ -358,10 +372,11 @@ impl ToolRegistry {
             plugin_tools: self.plugin_tools.clone(),
             spawn_only: self.spawn_only.clone(),
             spawn_only_messages: self.spawn_only_messages.clone(),
-            background_result_sender: self.background_result_sender.clone(),
-            supervisor: self.supervisor.clone(),
-            spawn_only_invoked: self.spawn_only_invoked.clone(),
-            session_key: self.session_key.clone(),
+            background_result_sender: None,
+            supervisor: Arc::new(TaskSupervisor::new()),
+            spawn_only_invoked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            session_key: None,
+            output_dir_hint: self.output_dir_hint.clone(),
         }
     }
 
@@ -905,6 +920,38 @@ mod cwd_isolation_tests {
             "write_file should be re-registered"
         );
     }
+
+    #[test]
+    fn test_rebind_cwd_isolates_session_runtime_state() {
+        let initial_cwd = tempfile::tempdir().expect("create temp dir");
+        let mut registry =
+            ToolRegistry::with_builtins_and_sandbox(initial_cwd.path(), Box::new(NoSandbox));
+        registry.set_session_key("api:base-session".to_string());
+        registry.mark_spawn_only_invoked();
+        let base_task = registry.register_task("deep_search", "call-base");
+
+        let new_cwd = tempfile::tempdir().expect("create temp dir");
+        let rebound = registry.rebind_cwd(new_cwd.path(), Box::new(NoSandbox));
+
+        assert!(
+            rebound.supervisor().get_task(&base_task).is_none(),
+            "rebound registry must not inherit another session's task ledger"
+        );
+        assert!(
+            !rebound.spawn_only_was_invoked(),
+            "spawn-only invocation state is per agent run/session"
+        );
+
+        let rebound_task = rebound.register_task("deep_search", "call-rebound");
+        let rebound_task = rebound
+            .supervisor()
+            .get_task(&rebound_task)
+            .expect("rebound task should be tracked");
+        assert!(
+            rebound_task.session_key.is_none(),
+            "session key must be supplied by the new session actor, not inherited"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1179,5 +1226,16 @@ mod lifecycle_tests {
         assert!(active.contains(&"read_file".to_string()));
         assert!(active.contains(&"write_file".to_string()));
         assert!(active.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn spawn_only_message_uses_runtime_output_dir_hint() {
+        let mut reg = make_registry(5, 3);
+        reg.mark_spawn_only("mofa_slides", None);
+        reg.set_output_dir_hint("/tmp/octos-profile/skill-output");
+
+        let msg = reg.spawn_only_message("mofa_slides");
+
+        assert!(msg.contains("Output directory: /tmp/octos-profile/skill-output/"));
     }
 }

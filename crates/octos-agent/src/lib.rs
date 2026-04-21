@@ -31,6 +31,7 @@ mod sanitize;
 pub mod session;
 pub mod skills;
 pub mod steering;
+mod subprocess_env;
 pub mod task_supervisor;
 pub mod tools;
 pub mod turn;
@@ -47,7 +48,9 @@ pub use agent::{
 };
 pub use event_bus::{EventBus, EventSubscriber};
 pub use exec_env::{DockerEnvironment, ExecEnvironment, ExecOutput, LocalEnvironment};
-pub use hooks::{HookConfig, HookContext, HookEvent, HookExecutor, RobotPayload};
+pub use hooks::{
+    HookConfig, HookContext, HookEvent, HookExecutor, HookPayload, HookResult, RobotPayload,
+};
 pub use mcp::{McpClient, McpServerConfig};
 pub use permissions::{PermissionDenied, RobotPermissionPolicy, SafetyTier, WorkspaceBounds};
 pub use plugins::{PluginLoadResult, PluginLoader};
@@ -59,7 +62,9 @@ pub use sandbox::{create_sandbox, Sandbox, SandboxConfig, SandboxMode};
 pub use session::{SessionLimits, SessionState, SessionStateHandle, SessionUsage};
 pub use skills::{SkillInfo, SkillsLoader};
 pub use steering::{SteeringMessage, SteeringReceiver, SteeringSender};
-pub use task_supervisor::{BackgroundTask, TaskRuntimeState, TaskStatus, TaskSupervisor};
+pub use task_supervisor::{
+    BackgroundTask, TaskLifecycleState, TaskRuntimeState, TaskStatus, TaskSupervisor,
+};
 pub use tools::{
     admin::{register_admin_api_tools, AdminApiContext},
     ActivateToolsTool, BackgroundResultKind, BackgroundResultPayload, BrowserTool,

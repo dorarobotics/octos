@@ -62,7 +62,7 @@ pub(crate) use super::prompt::settings_str;
 /// Callback returning a JSON snapshot of task state for a given session key.
 pub type TaskQueryFn = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
 /// Callback fired when a session is deleted via API, used to stop the session actor.
-pub type SessionDeletedFn = Arc<dyn Fn(&str) + Send + Sync>;
+pub type SessionDeletedCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Context needed by adapters that require extra parameters beyond the common set.
 #[allow(dead_code)]
@@ -73,12 +73,14 @@ pub struct ChannelRegistrationCtx<'a> {
     pub session_mgr: &'a Arc<Mutex<SessionManager>>,
     #[cfg(feature = "api")]
     pub metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    #[cfg(not(feature = "api"))]
+    pub metrics_handle: Option<()>,
     pub task_query: Option<TaskQueryFn>,
     pub gateway_profile_id: Option<&'a str>,
     pub api_port_override: Option<u16>,
     pub wechat_bridge_url: Option<&'a str>,
     /// Callback to stop the session actor when a session is deleted via API.
-    pub on_session_deleted: Option<SessionDeletedFn>,
+    pub on_session_deleted: Option<SessionDeletedCallback>,
     #[cfg(feature = "matrix")]
     pub matrix_channel: &'a mut Option<Arc<octos_bus::MatrixChannel>>,
 }

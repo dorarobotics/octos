@@ -21,8 +21,8 @@ use octos_agent::tools::{
 };
 use octos_agent::{
     read_workspace_policy, workspace_policy_path, write_workspace_policy, Agent, AgentConfig,
-    HookContext, HookExecutor, TaskSupervisor, TokenTracker, TurnAttachmentContext,
-    WorkspacePolicy,
+    HookContext, HookExecutor, HookPayload, HookResult, TaskSupervisor, TokenTracker,
+    TurnAttachmentContext, WorkspacePolicy,
 };
 use octos_bus::{
     session::{
@@ -37,8 +37,8 @@ use octos_core::{
     METADATA_SENDER_USER_ID,
 };
 use octos_llm::{
-    AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider, ProviderRouter,
-    ResponsivenessObserver,
+    pricing::model_pricing, AdaptiveMode, AdaptiveRouter, EmbeddingProvider, LlmProvider,
+    ProviderRouter, ResponsivenessObserver,
 };
 use octos_memory::{EpisodeStore, MemoryStore};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
@@ -136,33 +136,6 @@ async fn persist_assistant_message(
     }
 }
 
-fn completion_has_bg_tasks(tools: &ToolRegistry, supervisor: &TaskSupervisor) -> bool {
-    tools.spawn_only_was_invoked() || !supervisor.get_all_tasks().is_empty()
-}
-
-fn forced_background_completion_has_bg_tasks(spawn_succeeded: bool, bg_task_count: usize) -> bool {
-    spawn_succeeded || bg_task_count > 0
-}
-
-fn persisted_session_result_metadata(
-    session_key: &SessionKey,
-    persisted: &PersistedSessionMessage,
-    content: &str,
-    media: &[String],
-) -> serde_json::Value {
-    serde_json::json!({
-        "topic": session_key.topic(),
-        "_history_persisted": true,
-        "_session_result": {
-            "seq": persisted.seq,
-            "role": "assistant",
-            "content": content,
-            "timestamp": persisted.timestamp.to_rfc3339(),
-            "media": media,
-        }
-    })
-}
-
 fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path) -> Option<String> {
     let topic = session_key.topic()?;
     let profile_id = session_key.profile_id().unwrap_or(MAIN_PROFILE_ID);
@@ -179,100 +152,21 @@ fn site_preview_url_for_session(session_key: &SessionKey, user_workspace: &Path)
         .filter(|value| !value.trim().is_empty())
 }
 
-fn normalize_session_result_media_path(
-    user_workspace: &Path,
-    data_dir: &Path,
-    path: &Path,
-) -> String {
-    let resolved = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        user_workspace.join(path)
-    };
-
-    std::fs::canonicalize(&resolved)
-        .or_else(|_| {
-            if path.is_relative() {
-                std::fs::canonicalize(data_dir.join(path))
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "absolute path not found",
-                ))
-            }
-        })
-        .unwrap_or(resolved)
-        .to_string_lossy()
-        .to_string()
-}
-
-fn fallback_session_result_media_paths(
-    session_key: &SessionKey,
-    user_workspace: &Path,
-    data_dir: &Path,
-    files_modified: &[PathBuf],
-) -> Vec<String> {
-    let is_slides = session_key
-        .topic()
-        .is_some_and(|topic| topic == "slides" || topic.starts_with("slides "));
-    if !is_slides {
-        return Vec::new();
-    }
-
-    files_modified
-        .iter()
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pptx"))
-        .map(|path| normalize_session_result_media_path(user_workspace, data_dir, path))
-        .collect()
-}
-
-fn fallback_session_result_media_from_messages(
-    session_key: &SessionKey,
-    user_workspace: &Path,
-    data_dir: &Path,
-    messages: &[Message],
-) -> Vec<String> {
-    let is_slides = session_key
-        .topic()
-        .is_some_and(|topic| topic == "slides" || topic.starts_with("slides "));
-    if !is_slides {
-        return Vec::new();
-    }
-
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == MessageRole::Tool)
-        .flat_map(|message| message.content.lines().rev())
-        .find_map(|line| {
-            line.strip_prefix("Generated PPTX: ")
-                .or_else(|| line.strip_prefix("Generated: "))
-                .map(|raw| {
-                    normalize_session_result_media_path(
-                        user_workspace,
-                        data_dir,
-                        Path::new(raw.trim()),
-                    )
-                })
-        })
-        .into_iter()
-        .collect()
-}
-
 fn finalize_assistant_content(
     session_key: &SessionKey,
     user_workspace: &Path,
     content: &str,
 ) -> String {
+    let content = strip_invoke_tags(content).trim().to_string();
     let is_site = session_key
         .topic()
         .is_some_and(|topic| topic == "site" || topic.starts_with("site "));
     if !is_site || content.trim().is_empty() || content.contains("/api/preview/") {
-        return content.to_string();
+        return content;
     }
 
     let Some(preview_url) = site_preview_url_for_session(session_key, user_workspace) else {
-        return content.to_string();
+        return content;
     };
 
     format!("{content}\n\nPreview URL: {preview_url}")
@@ -709,6 +603,7 @@ fn sanitize_task_for_response(
         "parent_session_key": task.parent_session_key,
         "child_session_key": task.child_session_key,
         "status": task.status,
+        "lifecycle_state": task.lifecycle_state(),
         "started_at": task.started_at,
         "updated_at": task.updated_at,
         "completed_at": task.completed_at,
@@ -885,6 +780,11 @@ fn merge_optional_text(existing: Option<String>, incoming: Option<String>) -> Op
         (None, Some(incoming)) => Some(incoming),
         (None, None) => None,
     }
+}
+
+fn topic_requires_serial_delivery(topic: Option<&str>) -> bool {
+    topic.is_some_and(|value| value.starts_with("slides"))
+        || topic.is_some_and(|value| value == "site" || value.starts_with("site "))
 }
 
 async fn snapshot_workspace_turn_for_path(
@@ -1549,9 +1449,13 @@ impl ActorFactory {
         // write_file/read_file) so the LLM can write+send in one flow.
         // data_dir is an extra allowed directory for pipeline-generated files.
         let send_file_tool = SendFileTool::with_context(proxy_tx.clone(), channel, chat_id)
-            .with_topic(session_key.topic().map(|value| value.to_string()))
+            .with_topic(session_key.topic().map(str::to_string))
             .with_base_dir(&user_workspace)
             .with_extra_allowed_dir(&self.data_dir);
+        let session_hook_context = self.hook_context_template.as_ref().map(|ctx| HookContext {
+            session_id: Some(session_key.to_string()),
+            profile_id: ctx.profile_id.clone(),
+        });
 
         // Create tool registry with cwd-bound tools pointing to the per-user workspace.
         // A fresh sandbox is created per user so the SBPL profile restricts writes
@@ -1604,6 +1508,17 @@ impl ActorFactory {
         if !self.plugin_dirs.is_empty() {
             spawn_tool = spawn_tool
                 .with_plugin_dirs(self.plugin_dirs.clone(), self.plugin_extra_env.clone());
+        }
+        if let Some(ref hooks) = self.hooks {
+            spawn_tool = spawn_tool.with_hooks(hooks.clone());
+        }
+        if let Some(ref ctx) = session_hook_context {
+            spawn_tool = spawn_tool.with_hook_context(ctx.clone());
+        }
+        if let Some(ref pipeline_factory) = self.pipeline_factory {
+            let pipeline_factory = pipeline_factory.clone();
+            spawn_tool =
+                spawn_tool.with_child_tool_factory(Arc::new(move || pipeline_factory.create()));
         }
 
         // Wire direct background result injection (bypasses InboundMessage relay)
@@ -1676,8 +1591,8 @@ impl ActorFactory {
 
         // Defer rarely-used per-session tools to keep active tool count low
         // for providers that choke on many tools (e.g. Dashscope).
-        // Keep run_pipeline active — it's a core research tool.
-        tools.defer(["spawn".to_string(), "cron".to_string()]);
+        // Keep cron active so reminder flows don't require activate_tools.
+        tools.defer(["spawn".to_string()]);
 
         // For slides sessions, auto-activate media tools and use primary model
         // (bypasses adaptive router which may pick a weak model).
@@ -1806,11 +1721,8 @@ impl ActorFactory {
         if let Some(ref hooks) = self.hooks {
             agent = agent.with_hooks(hooks.clone());
         }
-        if let Some(ref ctx) = self.hook_context_template {
-            agent = agent.with_hook_context(HookContext {
-                session_id: Some(session_key.to_string()),
-                profile_id: ctx.profile_id.clone(),
-            });
+        if let Some(ref ctx) = session_hook_context {
+            agent = agent.with_hook_context(ctx.clone());
         }
 
         // Wire the activate_tools back-reference now that tools are in Arc
@@ -1825,6 +1737,8 @@ impl ActorFactory {
             chat_id: chat_id.to_string(),
             inbox: rx,
             agent: Arc::new(agent),
+            hooks: self.hooks.clone(),
+            hook_context: session_hook_context,
             session_handle,
             llm_for_compaction: self.llm_for_compaction.clone(),
             out_tx: proxy_tx, // actor sends through proxy, not directly
@@ -1964,6 +1878,8 @@ struct SessionActor {
     inbox: mpsc::Receiver<ActorMessage>,
 
     agent: Arc<Agent>,
+    hooks: Option<Arc<HookExecutor>>,
+    hook_context: Option<HookContext>,
 
     /// Per-actor session handle — owns this session's data, no shared mutex.
     session_handle: Arc<Mutex<SessionHandle>>,
@@ -2012,6 +1928,52 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn emit_hook_payload(&self, payload: HookPayload) {
+        let Some(hooks) = self.hooks.as_ref() else {
+            return;
+        };
+        let event = payload.event;
+        match hooks.run(event, &payload).await {
+            HookResult::Allow => {}
+            HookResult::Modified(_) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    "lifecycle hook attempted to modify payload; ignoring"
+                );
+            }
+            HookResult::Deny(reason) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    reason,
+                    "lifecycle hook attempted to deny a non-blocking event"
+                );
+            }
+            HookResult::Error(error) => {
+                warn!(
+                    session = %self.session_key,
+                    event = ?event,
+                    error,
+                    "lifecycle hook failed"
+                );
+            }
+        }
+    }
+
+    async fn emit_resume_hook(&self) {
+        self.emit_hook_payload(HookPayload::on_resume(self.hook_context.as_ref()))
+            .await;
+    }
+
+    async fn emit_turn_end_hook(&self, turn_summary: &str) {
+        self.emit_hook_payload(HookPayload::on_turn_end(
+            git_turn_summary(turn_summary),
+            self.hook_context.as_ref(),
+        ))
+        .await;
+    }
+
     async fn snapshot_workspace_turn_if_needed(
         &self,
         turn_summary: &str,
@@ -2052,6 +2014,7 @@ impl SessionActor {
     }
 
     async fn run(mut self) {
+        self.emit_resume_hook().await;
         loop {
             tokio::select! {
                 msg = self.inbox.recv() => {
@@ -2126,11 +2089,15 @@ impl SessionActor {
                             let final_attachment_media =
                                 self.copy_media_to_workspace(final_attachment_media);
 
-                            // Use speculative path for API channel (web client) and
-                            // Speculative queue mode. The speculative path spawns the
-                            // agent call and handles overflow messages concurrently,
-                            // so users aren't blocked during long tool calls (pipelines).
-                            if self.queue_mode == QueueMode::Speculative || self.channel == "api" {
+                            // Most API sessions use speculative overflow so the web
+                            // client stays responsive during long tool calls. Contract-
+                            // owned slides/site sessions are the exception: allowing
+                            // overflow there can replay artifact-producing turns and
+                            // duplicate final deliveries, so keep those serialized.
+                            if !topic_requires_serial_delivery(self.session_key.topic())
+                                && (self.queue_mode == QueueMode::Speculative
+                                    || self.channel == "api")
+                            {
                                 self.process_inbound_speculative(
                                     final_message,
                                     final_media,
@@ -2862,12 +2829,17 @@ impl SessionActor {
             return false;
         };
 
-        let metadata = persisted_session_result_metadata(
-            &self.session_key,
-            &persisted_message,
-            &content,
-            &media,
-        );
+        let metadata = serde_json::json!({
+            "topic": self.session_key.topic(),
+            "_history_persisted": true,
+            "_session_result": {
+                "seq": persisted_message.seq,
+                "role": "assistant",
+                "content": content.clone(),
+                "timestamp": persisted_message.timestamp.to_rfc3339(),
+                "media": media.clone(),
+            }
+        });
 
         let _ = send_outbound_with_timeout(
             &self.session_key,
@@ -3023,52 +2995,6 @@ impl SessionActor {
         }
     }
 
-    fn should_pre_activate_fm_tts(
-        inbound: &InboundMessage,
-        image_media: &[String],
-        attachment_media: &[String],
-    ) -> bool {
-        if !image_media.is_empty() || !attachment_media.is_empty() {
-            return false;
-        }
-
-        let lower = inbound.content.to_ascii_lowercase();
-        let mentions_podcast = lower.contains("podcast") || inbound.content.contains("播客");
-        if mentions_podcast {
-            return false;
-        }
-
-        lower.contains("text to speech")
-            || lower.contains("read aloud")
-            || lower.contains("say in")
-            || lower.contains("tts")
-            || inbound.content.contains("声音说")
-            || inbound.content.contains("朗读")
-            || inbound.content.contains("念出来")
-            || inbound.content.contains("读出来")
-    }
-
-    fn should_force_background_tts(
-        channel: &str,
-        inbound: &InboundMessage,
-        image_media: &[String],
-        attachment_media: &[String],
-    ) -> bool {
-        channel != "system"
-            && Self::should_pre_activate_fm_tts(inbound, image_media, attachment_media)
-    }
-
-    fn maybe_pre_activate_turn_tools(
-        &self,
-        inbound: &InboundMessage,
-        image_media: &[String],
-        attachment_media: &[String],
-    ) {
-        if Self::should_pre_activate_fm_tts(inbound, image_media, attachment_media) {
-            self.agent.tool_registry().activate("fm_tts");
-        }
-    }
-
     fn forced_background_workflow_for_turn(
         &self,
         inbound: &InboundMessage,
@@ -3093,49 +3019,27 @@ impl SessionActor {
         persisted_user_content: &str,
         reply_to: Option<String>,
     ) -> bool {
+        let Some(workflow) =
+            self.forced_background_workflow_for_turn(inbound, image_media, attachment_media)
+        else {
+            return false;
+        };
+
         let mut task = inbound.content.clone();
         if let Some(prompt) = attachment_prompt.filter(|value| !value.trim().is_empty()) {
             task.push_str("\n\nAttachment context:\n");
             task.push_str(prompt);
         }
 
-        let (workflow_label, workflow_ack, allowed_tools, additional_instructions, workflow) =
-            if Self::should_force_background_tts(
-                &self.channel,
-                inbound,
-                image_media,
-                attachment_media,
-            ) {
-                (
-                    "Direct TTS".to_string(),
-                    "语音生成已在后台启动。完成后会把最终音频发送到当前会话。".to_string(),
-                    vec!["fm_tts".to_string()],
-                    "You are a background TTS worker. The user's request already specifies what should be spoken and which voice to use. Call fm_tts exactly once with the requested voice and spoken text, then stop. Do not answer normally. Do not use any other tool. Do not emit intermediate files or reports.".to_string(),
-                    None,
-                )
-            } else {
-                let Some(workflow) = self.forced_background_workflow_for_turn(
-                    inbound,
-                    image_media,
-                    attachment_media,
-                ) else {
-                    return false;
-                };
-                (
-                    workflow.label.clone(),
-                    workflow.ack_message.clone(),
-                    workflow.allowed_tools.clone(),
-                    workflow.additional_instructions.clone(),
-                    Some(workflow),
-                )
-            };
+        let workflow_label = workflow.label.clone();
+        let workflow_ack = workflow.ack_message.clone();
         let args = serde_json::json!({
             "task": task,
             "label": workflow_label,
             "mode": "background",
-            "allowed_tools": allowed_tools,
-            "additional_instructions": additional_instructions,
-            "workflow": workflow,
+            "allowed_tools": workflow.allowed_tools.clone(),
+            "additional_instructions": workflow.additional_instructions.clone(),
+            "workflow": workflow.clone(),
         });
 
         let tool_registry = self.agent.tool_registry();
@@ -3144,7 +3048,7 @@ impl SessionActor {
             Ok(result) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = %workflow_label,
+                    workflow = %workflow.label,
                     error = %result.output,
                     "forced background spawn returned failure"
                 );
@@ -3153,7 +3057,7 @@ impl SessionActor {
             Err(error) => {
                 warn!(
                     session = %self.session_key,
-                    workflow = %workflow_label,
+                    workflow = %workflow.label,
                     error = %error,
                     "forced background spawn failed"
                 );
@@ -3213,8 +3117,6 @@ impl SessionActor {
                 .filter(|task| task.status.is_active())
                 .map(|task| sanitize_task_for_response(&self.data_dir, &task))
                 .collect::<Vec<_>>();
-            let has_bg_tasks =
-                forced_background_completion_has_bg_tasks(spawn_result.success, bg_tasks.len());
 
             let _ = self
                 .out_tx
@@ -3226,12 +3128,14 @@ impl SessionActor {
                     media: vec![],
                     metadata: serde_json::json!({
                         "_completion": true,
-                        "has_bg_tasks": has_bg_tasks,
+                        "has_bg_tasks": !bg_tasks.is_empty(),
                         "bg_tasks": bg_tasks,
                     }),
                 })
                 .await;
         }
+
+        self.emit_turn_end_hook(persisted_user_content).await;
 
         true
     }
@@ -3269,8 +3173,6 @@ impl SessionActor {
 
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
-
-        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
 
         // ── Setup (needs &mut self briefly for permit + reporter) ────────
 
@@ -3655,11 +3557,10 @@ impl SessionActor {
 
         // Handle agent result — save messages (skipping user msg, already saved)
         // and send reply
-        let tools = self.agent.tool_registry();
-        let supervisor = tools.supervisor();
+        let supervisor = self.agent.tool_registry().supervisor();
         let bg_tasks = supervisor.task_count();
         let all_tasks = supervisor.get_all_tasks();
-        let had_bg_tasks = completion_has_bg_tasks(tools, &supervisor);
+        let had_bg_tasks = !all_tasks.is_empty(); // any task was spawned, even if completed
         let bg_task_details: Vec<_> = supervisor.get_active_tasks();
         if !all_tasks.is_empty() {
             for t in &all_tasks {
@@ -3684,14 +3585,29 @@ impl SessionActor {
                     .unwrap_or_else(|| {
                         format!("{}/{}", self.agent.provider_name(), self.agent.model_id())
                     });
+                let model_id = provider_metadata
+                    .as_ref()
+                    .map(|meta| meta.model.clone())
+                    .or_else(|| {
+                        let model = self.agent.model_id();
+                        if model.is_empty() {
+                            None
+                        } else {
+                            Some(model.to_string())
+                        }
+                    });
+                let session_cost = model_id.as_deref().and_then(model_pricing).map(|pricing| {
+                    pricing.cost(cr.token_usage.input_tokens, cr.token_usage.output_tokens)
+                });
                 serde_json::json!({
                     "_completion": true,
                     "model": model_label,
                     "provider": provider_metadata.as_ref().map(|meta| meta.provider.clone()),
-                    "model_id": provider_metadata.as_ref().map(|meta| meta.model.clone()),
-                    "endpoint": provider_metadata.and_then(|meta| meta.endpoint),
+                    "model_id": model_id,
+                    "endpoint": provider_metadata.as_ref().and_then(|meta| meta.endpoint.clone()),
                     "tokens_in": cr.token_usage.input_tokens,
                     "tokens_out": cr.token_usage.output_tokens,
+                    "session_cost": session_cost,
                     "duration_s": llm_latency.as_secs_f64().round() as u64,
                     "has_bg_tasks": had_bg_tasks,
                     "bg_tasks": bg_task_details,
@@ -3950,6 +3866,7 @@ impl SessionActor {
 
         self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
+        self.emit_turn_end_hook(&inbound.content).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         // This must happen AFTER the agent finishes, so it has had a chance to
@@ -4279,8 +4196,6 @@ impl SessionActor {
         let persisted_user_content =
             Self::persisted_user_content(&inbound, &image_media, &attachment_media);
 
-        self.maybe_pre_activate_turn_tools(&inbound, &image_media, &attachment_media);
-
         // Get conversation history
         let max_history = self.max_history.load(Ordering::Acquire);
         let history: Vec<Message> = {
@@ -4479,37 +4394,9 @@ impl SessionActor {
                     &self.user_workspace,
                     &conv_response.content,
                 );
-                let mut assistant_media: Vec<String> = conv_response
-                    .files_to_send
-                    .iter()
-                    .map(|path| {
-                        normalize_session_result_media_path(
-                            &self.user_workspace,
-                            &self.data_dir,
-                            path,
-                        )
-                    })
-                    .collect();
-                if assistant_media.is_empty() {
-                    assistant_media = fallback_session_result_media_paths(
-                        &self.session_key,
-                        &self.user_workspace,
-                        &self.data_dir,
-                        &conv_response.files_modified,
-                    );
-                }
-                if assistant_media.is_empty() {
-                    assistant_media = fallback_session_result_media_from_messages(
-                        &self.session_key,
-                        &self.user_workspace,
-                        &self.data_dir,
-                        &conv_response.messages,
-                    );
-                }
                 // Save all messages from the agent (user msg, tool calls, tool
                 // results, assistant replies) so the full context is preserved
                 // for subsequent calls.
-                let mut persisted_assistant_message = None;
                 {
                     let mut handle = self.session_handle.lock().await;
                     // Auto-generate summary from first user message
@@ -4545,21 +4432,14 @@ impl SessionActor {
                         let assistant_msg = Message {
                             role: MessageRole::Assistant,
                             content: final_content.clone(),
-                            media: assistant_media.clone(),
+                            media: vec![],
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: conv_response.reasoning_content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
-                        let timestamp = assistant_msg.timestamp;
-                        match handle.add_message_with_seq(assistant_msg).await {
-                            Ok(seq) => {
-                                persisted_assistant_message =
-                                    Some(PersistedSessionMessage { seq, timestamp });
-                            }
-                            Err(e) => {
-                                warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
-                            }
+                        if let Err(e) = handle.add_message(assistant_msg).await {
+                            warn!(session = %self.session_key, error = %e, "failed to persist assistant reply");
                         }
                     }
 
@@ -4643,17 +4523,6 @@ impl SessionActor {
                     };
 
                     if !streamed {
-                        let metadata = persisted_assistant_message
-                            .as_ref()
-                            .map(|persisted| {
-                                persisted_session_result_metadata(
-                                    &self.session_key,
-                                    persisted,
-                                    &final_content,
-                                    &assistant_media,
-                                )
-                            })
-                            .unwrap_or_else(|| serde_json::json!({}));
                         let _ = self
                             .out_tx
                             .send(OutboundMessage {
@@ -4662,7 +4531,7 @@ impl SessionActor {
                                 content: display_content,
                                 reply_to: inbound_message_id.clone(),
                                 media: vec![],
-                                metadata,
+                                metadata: serde_json::json!({}),
                             })
                             .await;
                     }
@@ -4703,6 +4572,7 @@ impl SessionActor {
 
         self.snapshot_workspace_turn_if_needed(&inbound.content, inbound_message_id.clone())
             .await;
+        self.emit_turn_end_hook(&inbound.content).await;
 
         // Reset per-session cancellation flag so the next message starts fresh.
         self.cancelled.store(false, Ordering::Release);
@@ -4736,11 +4606,49 @@ fn strip_think_tags(s: &str) -> String {
             break;
         }
     }
+    result = strip_invoke_tags(&result);
     // Collapse runs of 3+ newlines (left behind after stripping) to double newline
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
     }
     result.trim().to_string()
+}
+
+/// Strip inline XML-style tool invocation markup:
+/// `<invoke name="tool">...</invoke>` and self-closing `<invoke ... />`.
+fn strip_invoke_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+
+    loop {
+        let Some(start) = rest.find("<invoke") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let from_tag = &rest[start..];
+
+        let Some(open_end) = from_tag.find('>') else {
+            out.push_str(from_tag);
+            break;
+        };
+        let open_tag = &from_tag[..=open_end];
+        let after_open = &from_tag[open_end + 1..];
+
+        if open_tag.trim_end().ends_with("/>") {
+            rest = after_open;
+            continue;
+        }
+
+        if let Some(close_rel) = after_open.find("</invoke>") {
+            rest = &after_open[close_rel + "</invoke>".len()..];
+        } else {
+            // Unclosed invoke tag: drop the remainder to avoid leaking tool markup.
+            break;
+        }
+    }
+
+    out
 }
 
 /// Format token count with K suffix for readability (e.g. 22173 → "22.2K").
@@ -4784,11 +4692,25 @@ fn format_thinking_prefix(reasoning: Option<&str>) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use octos_agent::tools::{Tool, ToolResult};
-    use octos_core::{AgentId, ToolCall};
+    use octos_agent::{HookConfig, HookEvent};
     use octos_llm::{AdaptiveConfig, ChatConfig, ChatResponse, StopReason, TokenUsage, ToolSpec};
-    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
+
+    #[cfg(unix)]
+    fn capture_hook(event: HookEvent, log_path: &std::path::Path) -> HookConfig {
+        HookConfig {
+            event,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"payload=$(cat); printf "%s\n" "$payload" >> "$1""#.into(),
+                "sh".into(),
+                log_path.to_string_lossy().into_owned(),
+            ],
+            timeout_ms: 5000,
+            tool_filter: vec![],
+        }
+    }
 
     #[test]
     fn test_strip_think_tags() {
@@ -4799,6 +4721,18 @@ mod tests {
             "beforeafter"
         );
         assert_eq!(strip_think_tags("<think>unclosed"), "");
+        assert_eq!(
+            strip_think_tags("ok <invoke name=\"cron\">{\"action\":\"list\"}</invoke> done"),
+            "ok  done"
+        );
+    }
+
+    #[test]
+    fn test_strip_invoke_tags_self_closing() {
+        assert_eq!(
+            strip_invoke_tags("a<invoke name=\"cron\" args='{}' />b"),
+            "ab"
+        );
     }
 
     #[test]
@@ -4937,6 +4871,7 @@ mod tests {
         let payload = store.query_json(&session_key.to_string());
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["lifecycle_state"], "ready");
         assert_eq!(tasks[0]["runtime_state"], "completed");
         assert_eq!(tasks[0]["runtime_detail"], "send_file");
         let files = tasks[0]["output_files"].as_array().unwrap();
@@ -4997,6 +4932,7 @@ mod tests {
         let payload = store.query_json(&session_key.to_string());
         let tasks = payload.as_array().unwrap();
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["lifecycle_state"], "ready");
         assert_eq!(tasks[0]["runtime_state"], "completed");
         assert_eq!(tasks[0]["workflow_kind"], "research_podcast");
         assert_eq!(tasks[0]["current_phase"], "deliver_result");
@@ -5011,6 +4947,63 @@ mod tests {
         assert_eq!(tasks[0]["child_terminal_state"], "completed");
         assert_eq!(tasks[0]["child_join_state"], "joined");
         assert!(tasks[0]["child_failure_action"].is_null());
+    }
+
+    #[test]
+    fn session_task_query_store_projects_verifying_lifecycle_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data_dir = dir.path().join("profile-data");
+
+        let supervisor = Arc::new(TaskSupervisor::new());
+        let task_ledger_path = data_dir.join("tasks.jsonl");
+        supervisor.enable_persistence(&task_ledger_path).unwrap();
+        let task_id = supervisor.register_with_lineage(
+            "site_build",
+            "call-1",
+            Some("api:session"),
+            Some(task_ledger_path.to_str().unwrap()),
+        );
+        supervisor.mark_running(&task_id);
+        supervisor.mark_runtime_state(
+            &task_id,
+            octos_agent::TaskRuntimeState::VerifyingOutputs,
+            Some(
+                serde_json::json!({
+                    "workflow_kind": "site",
+                    "current_phase": "verify_contract"
+                })
+                .to_string(),
+            ),
+        );
+
+        let store = SessionTaskQueryStore::default();
+        let session_key = SessionKey::new("api", "session");
+        store.register(&session_key, &supervisor, &data_dir);
+
+        let payload = store.query_json(&session_key.to_string());
+        let tasks = payload.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["status"], "running");
+        assert_eq!(tasks[0]["lifecycle_state"], "verifying");
+        assert_eq!(tasks[0]["runtime_state"], "verifying_outputs");
+        assert_eq!(tasks[0]["workflow_kind"], "site");
+        assert_eq!(tasks[0]["current_phase"], "verify_contract");
+        assert_eq!(tasks[0]["runtime_detail"]["workflow_kind"], "site");
+        assert_eq!(
+            tasks[0]["runtime_detail"]["current_phase"],
+            "verify_contract"
+        );
+    }
+
+    #[test]
+    fn contract_owned_topics_require_serial_delivery() {
+        assert!(topic_requires_serial_delivery(Some(
+            "slides browser-acceptance"
+        )));
+        assert!(topic_requires_serial_delivery(Some("site")));
+        assert!(topic_requires_serial_delivery(Some("site astro-demo")));
+        assert!(!topic_requires_serial_delivery(Some("research")));
+        assert!(!topic_requires_serial_delivery(None));
     }
 
     // ── Mock providers for speculative overflow tests ────────────────────
@@ -5070,152 +5063,6 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             &self.name
-        }
-    }
-
-    struct FilesToSendOnlyTool {
-        file_path: PathBuf,
-    }
-
-    #[async_trait]
-    impl Tool for FilesToSendOnlyTool {
-        fn name(&self) -> &str {
-            "emit_deck"
-        }
-
-        fn description(&self) -> &str {
-            "Emit a deck via files_to_send only"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })
-        }
-
-        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
-            Ok(ToolResult {
-                output: "deck generated".to_string(),
-                success: true,
-                files_to_send: vec![self.file_path.clone()],
-                ..Default::default()
-            })
-        }
-    }
-
-    struct FileModifiedOnlyTool {
-        file_path: PathBuf,
-    }
-
-    #[async_trait]
-    impl Tool for FileModifiedOnlyTool {
-        fn name(&self) -> &str {
-            "emit_deck_file_modified"
-        }
-
-        fn description(&self) -> &str {
-            "Emit a deck via file_modified only"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })
-        }
-
-        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
-            Ok(ToolResult {
-                output: "deck generated".to_string(),
-                success: true,
-                file_modified: Some(self.file_path.clone()),
-                ..Default::default()
-            })
-        }
-    }
-
-    struct RawGeneratedDeckTool {
-        file_path: PathBuf,
-    }
-
-    #[async_trait]
-    impl Tool for RawGeneratedDeckTool {
-        fn name(&self) -> &str {
-            "emit_deck_raw_output"
-        }
-
-        fn description(&self) -> &str {
-            "Emit a deck path via raw tool output only"
-        }
-
-        fn input_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {}
-            })
-        }
-
-        async fn execute(&self, _args: &serde_json::Value) -> eyre::Result<ToolResult> {
-            Ok(ToolResult {
-                output: format!("Generated PPTX: {}", self.file_path.display()),
-                success: true,
-                ..Default::default()
-            })
-        }
-    }
-
-    struct ToolThenEndProvider {
-        calls: AtomicUsize,
-        tool_name: &'static str,
-    }
-
-    #[async_trait]
-    impl LlmProvider for ToolThenEndProvider {
-        async fn chat(
-            &self,
-            _messages: &[Message],
-            _tools: &[ToolSpec],
-            _config: &ChatConfig,
-        ) -> eyre::Result<ChatResponse> {
-            let call = self.calls.fetch_add(1, Ordering::Relaxed);
-            let response = if call == 0 {
-                ChatResponse {
-                    content: None,
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call_emit_deck".to_string(),
-                        name: self.tool_name.to_string(),
-                        arguments: serde_json::json!({}),
-                        metadata: None,
-                    }],
-                    stop_reason: StopReason::ToolUse,
-                    usage: TokenUsage::default(),
-                    provider_index: None,
-                }
-            } else {
-                ChatResponse {
-                    content: Some("done".to_string()),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    stop_reason: StopReason::EndTurn,
-                    usage: TokenUsage::default(),
-                    provider_index: None,
-                }
-            };
-            Ok(response)
-        }
-
-        fn context_window(&self) -> u32 {
-            128_000
-        }
-
-        fn model_id(&self) -> &str {
-            "mock"
-        }
-
-        fn provider_name(&self) -> &str {
-            "mock"
         }
     }
 
@@ -5354,6 +5201,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),
@@ -5381,69 +5230,6 @@ mod tests {
             overflow_cancelled: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
             user_workspace: dir.path().join("workspace"),
-            cron_tool: None,
-        };
-
-        let handle = tokio::spawn(actor.run());
-        (inbox_tx, out_rx, handle, session_mgr)
-    }
-
-    async fn setup_actor_with_tools_and_session_key(
-        session_key: SessionKey,
-        agent_provider: Arc<dyn LlmProvider>,
-        tools: octos_agent::ToolRegistry,
-        dir: &tempfile::TempDir,
-    ) -> (
-        mpsc::Sender<ActorMessage>,
-        mpsc::Receiver<OutboundMessage>,
-        JoinHandle<()>,
-        Arc<Mutex<SessionManager>>,
-    ) {
-        let session_mgr = Arc::new(Mutex::new(
-            SessionManager::open(&dir.path().join("sessions")).unwrap(),
-        ));
-        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
-        let agent = Agent::new(AgentId::new("test-custom"), agent_provider, tools, memory)
-            .with_config(AgentConfig {
-                save_episodes: false,
-                max_iterations: 2,
-                ..Default::default()
-            });
-
-        let (inbox_tx, inbox_rx) = mpsc::channel(32);
-        let (out_tx, out_rx) = mpsc::channel(64);
-        let user_workspace = dir.path().join("workspace");
-
-        let actor = SessionActor {
-            session_key: session_key.clone(),
-            channel: "cli".to_string(),
-            chat_id: "test".to_string(),
-            inbox: inbox_rx,
-            agent: Arc::new(agent),
-            session_handle: Arc::new(Mutex::new(SessionHandle::open(dir.path(), &session_key))),
-            llm_for_compaction: Arc::new(DelayedMockProvider::new(
-                "compaction",
-                vec![(Duration::ZERO, make_response("compacted"))],
-            )),
-            out_tx,
-            status_indicator: None,
-            sender_user_id: None,
-            user_status_config: UserStatusConfig::default(),
-            data_dir: dir.path().to_path_buf(),
-            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
-            idle_timeout: Duration::from_secs(60),
-            session_timeout: Duration::from_secs(120),
-            semaphore: Arc::new(Semaphore::new(10)),
-            global_shutdown: Arc::new(AtomicBool::new(false)),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            queue_mode: QueueMode::Followup,
-            responsiveness: ResponsivenessObserver::new(),
-            adaptive_router: None,
-            memory_store: None,
-            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            overflow_cancelled: Arc::new(AtomicBool::new(false)),
-            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
-            user_workspace,
             cron_tool: None,
         };
 
@@ -5483,6 +5269,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),
@@ -5515,6 +5303,310 @@ mod tests {
 
         let handle = tokio::spawn(actor.run());
         (inbox_tx, out_rx, handle, session_mgr)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_session_actor_emits_resume_and_turn_end_hooks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook_log = dir.path().join("session-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![
+            capture_hook(HookEvent::OnResume, &hook_log),
+            capture_hook(HookEvent::OnTurnEnd, &hook_log),
+        ]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        let agent = Agent::new(
+            AgentId::new("test-hooks"),
+            Arc::new(DelayedMockProvider::new(
+                "hooks",
+                vec![(Duration::ZERO, make_response("hook response"))],
+            )),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 1,
+            ..Default::default()
+        });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: Some(hooks),
+            hook_context: Some(HookContext {
+                session_id: Some("cli:test".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        inbox_tx
+            .send(make_inbound("hello   hook   turn"))
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap();
+
+        drop(inbox_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+
+        let lines = std::fs::read_to_string(&hook_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"on_resume\"")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"on_turn_end\"")));
+        assert!(lines
+            .iter()
+            .all(|line| line.contains("\"session_id\":\"cli:test\"")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"turn_summary\":\"hello hook turn\"")));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_forced_background_turn_emits_turn_end_hook() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook_log = dir.path().join("forced-background-hooks.jsonl");
+        let hooks = Arc::new(HookExecutor::new(vec![capture_hook(
+            HookEvent::OnTurnEnd,
+            &hook_log,
+        )]));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let (inbox_tx, inbox_rx) = mpsc::channel::<ActorMessage>(32);
+        let (spawn_tx, _spawn_rx) = mpsc::channel::<InboundMessage>(32);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+        tools.register(octos_agent::SpawnTool::new(
+            Arc::new(DelayedMockProvider::new(
+                "forced-background-worker",
+                vec![(Duration::ZERO, make_response("background complete"))],
+            )),
+            Arc::clone(&memory),
+            dir.path().to_path_buf(),
+            spawn_tx,
+        ));
+
+        let agent = Agent::new(
+            AgentId::new("test-forced-background-hooks"),
+            Arc::new(DelayedMockProvider::new(
+                "forced-background-primary",
+                vec![(Duration::ZERO, make_response("foreground fallback"))],
+            )),
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 1,
+            ..Default::default()
+        });
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: Some(hooks),
+            hook_context: Some(HookContext {
+                session_id: Some("cli:test".to_string()),
+                profile_id: Some("test-profile".to_string()),
+            }),
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: std::path::PathBuf::from("/tmp"),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: None,
+        };
+
+        let handle = tokio::spawn(actor.run());
+        inbox_tx
+            .send(make_inbound("请对这个主题做一次深度研究，并输出完整报告。"))
+            .await
+            .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        loop {
+            let lines = std::fs::read_to_string(&hook_log)
+                .ok()
+                .map(|contents| contents.lines().map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            if lines
+                .iter()
+                .any(|line| line.contains("\"event\":\"on_turn_end\""))
+            {
+                assert!(lines.iter().any(|line| {
+                    line.contains(
+                        "\"turn_summary\":\"请对这个主题做一次深度研究，并输出完整报告。\"",
+                    )
+                }));
+                break;
+            }
+
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "forced-background turn-end hook did not arrive in time"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        drop(inbox_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
+    async fn setup_actor_for_cron_regression(
+        agent_provider: Arc<dyn LlmProvider>,
+        dir: &tempfile::TempDir,
+    ) -> (
+        mpsc::Sender<ActorMessage>,
+        mpsc::Receiver<OutboundMessage>,
+        JoinHandle<()>,
+        Arc<octos_bus::CronService>,
+    ) {
+        let _session_mgr = Arc::new(Mutex::new(
+            SessionManager::open(&dir.path().join("sessions")).unwrap(),
+        ));
+        let memory = Arc::new(EpisodeStore::open(dir.path().join("memory")).await.unwrap());
+        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
+
+        let (cron_tx, _cron_rx) = mpsc::channel(64);
+        let cron_service = Arc::new(octos_bus::CronService::new(
+            dir.path().join("cron.json"),
+            cron_tx,
+        ));
+        let cron_tool = Arc::new(CronTool::with_context(cron_service.clone(), "cli", "test"));
+        tools.register_arc(cron_tool.clone());
+
+        let agent = Agent::new(
+            AgentId::new("test-cron-regression"),
+            agent_provider,
+            tools,
+            memory,
+        )
+        .with_config(AgentConfig {
+            save_episodes: false,
+            max_iterations: 6,
+            ..Default::default()
+        });
+
+        let (inbox_tx, inbox_rx) = mpsc::channel(32);
+        let (out_tx, out_rx) = mpsc::channel(64);
+
+        let actor = SessionActor {
+            session_key: SessionKey::new("cli", "test"),
+            channel: "cli".to_string(),
+            chat_id: "test".to_string(),
+            inbox: inbox_rx,
+            agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
+            session_handle: Arc::new(Mutex::new(SessionHandle::open(
+                dir.path(),
+                &SessionKey::new("cli", "test"),
+            ))),
+            llm_for_compaction: Arc::new(DelayedMockProvider::new(
+                "compaction",
+                vec![(Duration::ZERO, make_response("compacted"))],
+            )),
+            out_tx,
+            status_indicator: None,
+            sender_user_id: None,
+            user_status_config: UserStatusConfig::default(),
+            data_dir: dir.path().to_path_buf(),
+            max_history: Arc::new(std::sync::atomic::AtomicUsize::new(50)),
+            idle_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_secs(120),
+            semaphore: Arc::new(Semaphore::new(10)),
+            global_shutdown: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            queue_mode: QueueMode::Followup,
+            responsiveness: ResponsivenessObserver::new(),
+            adaptive_router: None,
+            memory_store: None,
+            active_overflow_tasks: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            overflow_cancelled: Arc::new(AtomicBool::new(false)),
+            active_sessions: Arc::new(RwLock::new(ActiveSessionStore::open(dir.path()).unwrap())),
+            user_workspace: dir.path().join("workspace"),
+            cron_tool: Some(cron_tool),
+        };
+
+        let handle = tokio::spawn(actor.run());
+        (inbox_tx, out_rx, handle, cron_service)
     }
 
     /// Build a minimal SessionActor with speculative mode + adaptive router.
@@ -5570,6 +5662,8 @@ mod tests {
             chat_id: "test".to_string(),
             inbox: inbox_rx,
             agent: Arc::new(agent),
+            hooks: None,
+            hook_context: None,
             session_handle: Arc::new(Mutex::new(SessionHandle::open(
                 dir.path(),
                 &SessionKey::new("cli", "test"),
@@ -5609,6 +5703,127 @@ mod tests {
     /// - After 1s, send an overflow message
     /// - The overflow should be served via serve_overflow while the slow call continues
     /// - Both responses should arrive
+    #[tokio::test]
+    async fn test_cron_timezone_reset_regression_chinese_transcript() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = Arc::new(DelayedMockProvider::new(
+            "cron-regression",
+            vec![
+                (
+                    Duration::ZERO,
+                    make_response("好的，我记住了，你的时区是 PDT。"),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response(
+                        "<invoke name=\"cron\">{\"action\":\"add\",\"message\":\"10分钟后提醒喝水\",\"after_seconds\":600,\"name\":\"drink-water\",\"timezone\":\"America/Los_Angeles\"}</invoke>",
+                    ),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("已设置好，10分钟后提醒你喝水。"),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("<invoke name=\"cron\">{\"action\":\"list\"}</invoke>"),
+                ),
+                (Duration::ZERO, make_response("当前已有提醒任务。")),
+                (
+                    Duration::ZERO,
+                    make_response(
+                        "<invoke name=\"cron\">{\"action\":\"add\",\"message\":\"10分钟后提醒站起来活动\",\"after_seconds\":600,\"name\":\"stand-up\",\"timezone\":\"America/Los_Angeles\"}</invoke>",
+                    ),
+                ),
+                (
+                    Duration::ZERO,
+                    make_response("重置后也已设置，10分钟后提醒你站起来活动。"),
+                ),
+            ],
+        ));
+
+        let (tx, mut rx, handle, cron_service) =
+            setup_actor_for_cron_regression(provider.clone(), &dir).await;
+
+        tx.send(make_inbound("把我的时区记成PDT")).await.unwrap();
+        let r1 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!r1.content.contains("<invoke"));
+        assert!(r1.content.contains("PDT"));
+
+        let before_first_add = chrono::Utc::now().timestamp_millis();
+        tx.send(make_inbound("10分钟后提醒我喝水")).await.unwrap();
+        let r2 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_first_add = chrono::Utc::now().timestamp_millis();
+        assert!(!r2.content.contains("<invoke"));
+        assert!(r2.content.contains("10分钟"));
+
+        let jobs = cron_service.list_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "drink-water");
+        assert_eq!(jobs[0].timezone.as_deref(), Some("America/Los_Angeles"));
+        let first_at_ms = match jobs[0].schedule {
+            octos_bus::CronSchedule::At { at_ms } => at_ms,
+            _ => panic!("expected one-time reminder"),
+        };
+        assert!(
+            first_at_ms >= before_first_add + 600_000 && first_at_ms <= after_first_add + 603_000,
+            "first at_ms out of expected range: {}",
+            first_at_ms
+        );
+
+        tx.send(make_inbound("列出提醒")).await.unwrap();
+        let r3 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!r3.content.contains("<invoke"));
+        assert!(r3.content.contains("提醒"));
+
+        tx.send(make_inbound("/reset")).await.unwrap();
+        let reset_reply = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reset_reply.content.contains("history cleared"));
+
+        let before_second_add = chrono::Utc::now().timestamp_millis();
+        tx.send(make_inbound("重置后，再过10分钟提醒我站起来活动"))
+            .await
+            .unwrap();
+        let r4 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_second_add = chrono::Utc::now().timestamp_millis();
+        assert!(!r4.content.contains("<invoke"));
+        assert!(r4.content.contains("重置后"));
+
+        let jobs = cron_service.list_jobs();
+        assert_eq!(jobs.len(), 2);
+        let second = jobs.iter().find(|j| j.name == "stand-up").unwrap();
+        let second_at_ms = match second.schedule {
+            octos_bus::CronSchedule::At { at_ms } => at_ms,
+            _ => panic!("expected one-time reminder"),
+        };
+        assert!(second_at_ms > first_at_ms);
+        assert!(
+            second_at_ms >= before_second_add + 600_000
+                && second_at_ms <= after_second_add + 603_000,
+            "second at_ms out of expected range: {}",
+            second_at_ms
+        );
+
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 7);
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     #[tokio::test]
     async fn test_speculative_overflow_concurrent() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -6047,180 +6262,6 @@ mod tests {
                 && message.media == vec![media_path.to_string_lossy().to_string()]
         });
         assert!(persisted, "media notification not found in session history");
-
-        drop(tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    }
-
-    #[tokio::test]
-    async fn test_foreground_files_to_send_persist_as_topic_scoped_assistant_media() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let workspace = dir.path().join("workspace");
-        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
-        let absolute_deck = workspace.join(&relative_deck);
-        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
-        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
-
-        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
-        tools.register(FilesToSendOnlyTool {
-            file_path: relative_deck.clone(),
-        });
-
-        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
-        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
-            calls: AtomicUsize::new(0),
-            tool_name: "emit_deck",
-        });
-
-        let (tx, mut rx, handle, _session_mgr) =
-            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
-                .await;
-
-        tx.send(make_inbound("generate the deck")).await.unwrap();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut saw_terminal_reply = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    if msg.content.contains("done") {
-                        saw_terminal_reply = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(saw_terminal_reply, "terminal reply not observed");
-
-        let session_handle = SessionHandle::open(dir.path(), &session_key);
-        let session = session_handle.session();
-        let persisted = session
-            .messages
-            .iter()
-            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
-        let persisted = persisted.expect("assistant reply should be persisted");
-        let expected_deck = std::fs::canonicalize(&absolute_deck)
-            .unwrap_or_else(|_| absolute_deck.clone())
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(persisted.media, vec![expected_deck]);
-
-        drop(tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    }
-
-    #[tokio::test]
-    async fn test_foreground_slides_file_modified_falls_back_to_assistant_media() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let workspace = dir.path().join("workspace");
-        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
-        let absolute_deck = workspace.join(&relative_deck);
-        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
-        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
-
-        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
-        tools.register(FileModifiedOnlyTool {
-            file_path: relative_deck.clone(),
-        });
-
-        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
-        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
-            calls: AtomicUsize::new(0),
-            tool_name: "emit_deck_file_modified",
-        });
-
-        let (tx, mut rx, handle, _session_mgr) =
-            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
-                .await;
-
-        tx.send(make_inbound("generate the deck")).await.unwrap();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut saw_terminal_reply = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    if msg.content.contains("done") {
-                        saw_terminal_reply = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(saw_terminal_reply, "terminal reply not observed");
-
-        let session_handle = SessionHandle::open(dir.path(), &session_key);
-        let session = session_handle.session();
-        let persisted = session
-            .messages
-            .iter()
-            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
-        let persisted = persisted.expect("assistant reply should be persisted");
-        let expected_deck = std::fs::canonicalize(&absolute_deck)
-            .unwrap_or_else(|_| absolute_deck.clone())
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(persisted.media, vec![expected_deck]);
-
-        drop(tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    }
-
-    #[tokio::test]
-    async fn test_foreground_slides_tool_output_falls_back_to_assistant_media() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let workspace = dir.path().join("workspace");
-        let relative_deck = PathBuf::from("slides/demo/output/deck.pptx");
-        let absolute_deck = workspace.join(&relative_deck);
-        std::fs::create_dir_all(absolute_deck.parent().unwrap()).unwrap();
-        std::fs::write(&absolute_deck, b"fake pptx").unwrap();
-
-        let mut tools = octos_agent::ToolRegistry::with_builtins(dir.path());
-        tools.register(RawGeneratedDeckTool {
-            file_path: absolute_deck.clone(),
-        });
-
-        let session_key = SessionKey::with_topic("cli", "test", "slides demo");
-        let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenEndProvider {
-            calls: AtomicUsize::new(0),
-            tool_name: "emit_deck_raw_output",
-        });
-
-        let (tx, mut rx, handle, _session_mgr) =
-            setup_actor_with_tools_and_session_key(session_key.clone(), provider, tools, &dir)
-                .await;
-
-        tx.send(make_inbound("generate the deck")).await.unwrap();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut saw_terminal_reply = false;
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(msg)) => {
-                    if msg.content.contains("done") {
-                        saw_terminal_reply = true;
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        assert!(saw_terminal_reply, "terminal reply not observed");
-
-        let session_handle = SessionHandle::open(dir.path(), &session_key);
-        let session = session_handle.session();
-        let persisted = session
-            .messages
-            .iter()
-            .find(|message| message.role == MessageRole::Assistant && message.content == "done");
-        let persisted = persisted.expect("assistant reply should be persisted");
-        let expected_deck = std::fs::canonicalize(&absolute_deck)
-            .unwrap_or_else(|_| absolute_deck.clone())
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(persisted.media, vec![expected_deck]);
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
@@ -7311,122 +7352,5 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn pre_activate_fm_tts_detects_direct_voice_request() {
-        let inbound = InboundMessage {
-            channel: "api".to_string(),
-            chat_id: "chat".to_string(),
-            sender_id: "user".to_string(),
-            content: "用杨幂声音说：测试消息".to_string(),
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-        };
-
-        assert!(SessionActor::should_pre_activate_fm_tts(&inbound, &[], &[]));
-    }
-
-    #[test]
-    fn pre_activate_fm_tts_does_not_match_podcast_request() {
-        let inbound = InboundMessage {
-            channel: "api".to_string(),
-            chat_id: "chat".to_string(),
-            sender_id: "user".to_string(),
-            content: "用杨幂和窦文涛的声音做一个播客，播报一下北京今日的热点新闻。".to_string(),
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-        };
-
-        assert!(!SessionActor::should_pre_activate_fm_tts(
-            &inbound,
-            &[],
-            &[]
-        ));
-    }
-
-    #[test]
-    fn pre_activate_fm_tts_requires_plain_text_turn() {
-        let inbound = InboundMessage {
-            channel: "api".to_string(),
-            chat_id: "chat".to_string(),
-            sender_id: "user".to_string(),
-            content: "用杨幂声音说：测试消息".to_string(),
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-        };
-
-        assert!(!SessionActor::should_pre_activate_fm_tts(
-            &inbound,
-            &[],
-            &[String::from("/tmp/voice.txt")]
-        ));
-    }
-
-    #[test]
-    fn force_background_tts_detects_direct_voice_request_for_api_channel() {
-        let inbound = InboundMessage {
-            channel: "api".to_string(),
-            chat_id: "chat".to_string(),
-            sender_id: "user".to_string(),
-            content: "用杨幂声音说：测试消息".to_string(),
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-        };
-
-        assert!(SessionActor::should_force_background_tts(
-            "api",
-            &inbound,
-            &[],
-            &[]
-        ));
-    }
-
-    #[test]
-    fn force_background_tts_skips_system_channel() {
-        let inbound = InboundMessage {
-            channel: "system".to_string(),
-            chat_id: "chat".to_string(),
-            sender_id: "user".to_string(),
-            content: "用杨幂声音说：测试消息".to_string(),
-            timestamp: chrono::Utc::now(),
-            media: vec![],
-            metadata: serde_json::json!({}),
-            message_id: None,
-        };
-
-        assert!(!SessionActor::should_force_background_tts(
-            "system",
-            &inbound,
-            &[],
-            &[]
-        ));
-    }
-
-    #[test]
-    fn forced_background_completion_has_bg_tasks_when_spawn_succeeds_before_snapshot() {
-        assert!(forced_background_completion_has_bg_tasks(true, 0));
-        assert!(forced_background_completion_has_bg_tasks(true, 1));
-        assert!(!forced_background_completion_has_bg_tasks(false, 0));
-        assert!(forced_background_completion_has_bg_tasks(false, 1));
-    }
-
-    #[test]
-    fn completion_has_bg_tasks_when_spawn_only_invoked_without_task_snapshot() {
-        let tools = ToolRegistry::with_builtins("/tmp");
-        let supervisor = tools.supervisor();
-
-        assert!(!completion_has_bg_tasks(&tools, &supervisor));
-
-        tools.mark_spawn_only_invoked();
-        assert!(completion_has_bg_tasks(&tools, &supervisor));
     }
 }
