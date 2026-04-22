@@ -55,6 +55,8 @@ jobs:
 
   check:
     runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: "2"  # Limit parallelism to avoid OOM on 16GB runners (matches check-arm).
     steps:
       - uses: actions/checkout@v6
         with:
@@ -90,7 +92,24 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: |
+          set -e
+          # Run per-package so GHA step output pinpoints the failing/hanging
+          # package when the runner dies mid-suite (prior failures showed
+          # "lost communication" after ~48 min with no useful log upload).
+          # Per-package `timeout` ensures the step fails and logs flush before
+          # the runner is killed.
+          PACKAGES=(
+            octos-core octos-memory octos-llm octos-bus octos-plugin
+            octos-sandbox octos-pipeline octos-dora-mcp octos-agent octos-cli
+            account-manager clock deep-crawl deep-search news_fetch
+            pipeline-guard send-email skill-evolve voice weather wechat-bridge
+          )
+          for pkg in "${PACKAGES[@]}"; do
+            echo "::group::test $pkg"
+            timeout 900 cargo test -p "$pkg" --no-fail-fast
+            echo "::endgroup::"
+          done
 
       - name: QoS adaptive/runtime catalog regressions
         run: |
