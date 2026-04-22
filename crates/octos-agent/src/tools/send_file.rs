@@ -181,11 +181,11 @@ impl Tool for SendFileTool {
 
         // Validate file path is within the allowed base directory (if set).
         // This prevents exfiltrating files from other profiles' data directories.
-        // /tmp/ is always allowed since skills commonly write output there.
+        // Callers that need additional locations (e.g. a data_dir for
+        // pipeline-generated files) must register them via with_extra_allowed_dir.
         if let Some(ref base_dir) = self.base_dir {
             let canonical_base =
                 std::fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.clone());
-            let tmp_dir = std::fs::canonicalize("/tmp").unwrap_or_else(|_| PathBuf::from("/tmp"));
             let extra_canonical: Vec<PathBuf> = self
                 .extra_allowed_dirs
                 .iter()
@@ -194,7 +194,6 @@ impl Tool for SendFileTool {
             match std::fs::canonicalize(&path) {
                 Ok(canonical_path) => {
                     let allowed = canonical_path.starts_with(&canonical_base)
-                        || canonical_path.starts_with(&tmp_dir)
                         || extra_canonical
                             .iter()
                             .any(|d| canonical_path.starts_with(d));
@@ -407,8 +406,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_base_dir_blocks_outside_path() {
-        // Use a path under home dir (not /tmp/) to ensure the test is
-        // platform-independent (tempdir may be under /tmp/ on Linux).
         let root = std::env::temp_dir().join("octos-test-send-file");
         let base = root.join("allowed");
         let outside_dir = root.join("forbidden");
@@ -428,23 +425,11 @@ mod tests {
             .await
             .unwrap();
 
-        // On macOS, temp_dir is /var/folders/... (not under /tmp/), so blocked.
-        // On Linux, temp_dir is /tmp/, so the file IS under /tmp/ and allowed.
-        // Test the correct platform behavior:
-        let canonical_tmp =
-            std::fs::canonicalize("/tmp").unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let canonical_file = std::fs::canonicalize(&outside_file).unwrap();
-        if canonical_file.starts_with(&canonical_tmp) {
-            // Linux: file is under /tmp/ → allowed
-            assert!(result.success, "file under /tmp/ should be allowed");
-        } else {
-            // macOS: file is NOT under /tmp/ → blocked
-            assert!(
-                !result.success,
-                "file outside base_dir and /tmp/ should be blocked"
-            );
-            assert!(result.output.contains("outside the allowed directory"));
-        }
+        // Paths outside base_dir must be blocked on every platform, regardless
+        // of whether the tempdir happens to sit under /tmp/ (Linux) or
+        // /var/folders/... (macOS).
+        assert!(!result.success, "file outside base_dir should be blocked");
+        assert!(result.output.contains("outside the allowed directory"));
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&root);
