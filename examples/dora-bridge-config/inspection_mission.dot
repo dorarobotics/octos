@@ -1,0 +1,48 @@
+// Valve inspection mission pipeline
+// Demonstrates HandlerKind variants, DeadlineAction, Invariant, and MissionCheckpoint
+digraph inspection_mission {
+    rankdir=LR;
+
+    // SensorCheck: verify robot is operational before starting
+    preflight [shape=octagon, label="Preflight\nSensorCheck", handler="SensorCheck",
+               invariant="battery_soc > 20", on_violation="Abort"];
+
+    // Motion: navigate to the valve location
+    navigate [shape=pentagon, label="Navigate\nto Valve P1", handler="Motion",
+              deadline_secs="120", deadline_action="Abort",
+              checkpoint="true"];
+
+    // SensorCheck: confirm arrival at target position
+    arrival_check [shape=octagon, label="Arrival\nSensorCheck", handler="SensorCheck",
+                   invariant="position_error_m < 0.01", on_violation="Abort"];
+
+    // SafetyGate: require force/torque within limits before manipulation
+    safety_gate [shape=doubleoctagon, label="Force/Torque\nSafetyGate", handler="SafetyGate",
+                 invariant="max_force_n < 50.0", on_violation="EmergencyStop"];
+
+    // Codergen: LLM-driven valve inspection with camera tool
+    inspect [shape=box, label="Inspect Valve\nCodergen", handler="Codergen",
+             deadline_secs="60", deadline_action="Skip",
+             checkpoint="true"];
+
+    // Gate: evaluate inspection result
+    result_gate [shape=diamond, label="Anomaly\nDetected?", handler="Gate"];
+
+    // Codergen: LLM plans corrective action if anomaly found
+    corrective [shape=box, label="Corrective\nAction", handler="Codergen",
+                deadline_secs="90", deadline_action="Abort"];
+
+    // Motion: return to home position
+    return_home [shape=pentagon, label="Return\nHome", handler="Motion",
+                 deadline_secs="120", deadline_action="Skip"];
+
+    // Edges
+    preflight -> navigate;
+    navigate -> arrival_check;
+    arrival_check -> safety_gate;
+    safety_gate -> inspect;
+    inspect -> result_gate;
+    result_gate -> corrective [label="yes"];
+    result_gate -> return_home [label="no"];
+    corrective -> return_home;
+}
